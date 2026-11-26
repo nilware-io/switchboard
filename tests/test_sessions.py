@@ -11,7 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from tests.session_fixtures import assistant_text, claude_home, json_line, peer_message, prompt, write_transcript
+from tests.session_fixtures import (
+    assistant_text,
+    claude_home,
+    json_line,
+    peer_message,
+    prompt,
+    write_live_session,
+    write_transcript,
+)
 from voice_coding_mcp import sessions as sessions_module
 from voice_coding_mcp.projects import MatchFailed, MatchOk
 from voice_coding_mcp.sessions import (
@@ -24,6 +32,7 @@ from voice_coding_mcp.sessions import (
     is_session_id,
     list_sessions,
     match_session,
+    read_live_sessions,
     read_transcript_meta,
     relay_input,
     unique_by_name,
@@ -189,9 +198,17 @@ async def test_lists_recent_sessions_inside_the_roots(env: Env) -> None:
     assert by_id[IDS["untitled"]].titled is False
     assert by_id[IDS["relocated"]].project == "beta"
     assert by_id[IDS["big"]].name == "Long one"
-    assert by_id[IDS["live"]].live == LiveSession(
-        pid=os.getpid(), socket_path="/tmp/cc-socks/test.sock", status="idle", name="billing-fix"
+    live = by_id[IDS["live"]].live
+    assert live == LiveSession(
+        pid=os.getpid(),
+        socket_path="/tmp/cc-socks/test.sock",
+        status="idle",
+        name="billing-fix",
+        cwd=live.cwd if live is not None else None,
     )
+    assert live is not None
+    assert live.cwd is not None
+    assert live.cwd.endswith(os.sep + "assistant")
 
 
 async def test_leaves_out_excluded_ids_and_honours_the_day_limit(env: Env) -> None:
@@ -463,3 +480,30 @@ def test_frames_the_relay_input_with_the_owner_request_and_boundary_lines() -> N
     text = relay_input("billing-fix", "line one\nline two", "MESSAGE abc")
     assert 'send the message below, unchanged, to my Claude Code session "billing-fix"' in text
     assert text.endswith("----- MESSAGE abc -----\nline one\nline two\n----- MESSAGE abc -----")
+
+
+def test_reads_linux_registry_fields(tmp_path: Path) -> None:
+    """Linux-shaped entries: `tmux` for a session started inside tmux, `entrypoint`, `cwd`, a
+    `/run/user` socket path and `waiting` with `waitingFor`."""
+    home = claude_home(str(tmp_path))
+    sid = "44444444-0000-4000-8000-000000000001"
+    write_live_session(
+        home,
+        os.getpid(),
+        {
+            "sessionId": sid,
+            "cwd": "/home/USER/projects/alpha",
+            "tmux": "0:@0.%3",
+            "entrypoint": "cli",
+            "status": "waiting",
+            "waitingFor": "permission prompt",
+            "messagingSocketPath": "/run/user/1000/cc-socks/1.sock",
+        },
+    )
+    live = read_live_sessions(home)[sid]
+    assert (live.cwd, live.tmux, live.entrypoint) == ("/home/USER/projects/alpha", "0:@0.%3", "cli")
+    assert (live.status, live.waiting_for, live.socket_path) == (
+        "waiting",
+        "permission prompt",
+        "/run/user/1000/cc-socks/1.sock",
+    )

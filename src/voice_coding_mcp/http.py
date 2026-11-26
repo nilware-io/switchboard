@@ -42,6 +42,9 @@ from .config import Config, config_warnings
 from .idle_close import IdleCloser
 from .log import Logger, fingerprint, strip_query
 from .mcp import McpServerOptions, build_remote_control, create_mcp_server
+from .notify import TextSender
+from .remote.tools import RemoteTools, RemoteToolsOptions
+from .remote.watcher import Watcher, WatcherOptions
 from .tasks.manager import TaskManager
 from .web import NO_STORE, BodyError, client_ip, content_type, json_response, read_json_body
 
@@ -70,6 +73,11 @@ class CreateAppOptions:
     store: OAuthStore
     manager: TaskManager
     auth: AuthRouterOverrides = AuthRouterOverrides()
+    send_text: TextSender | None = None
+    """Plain-text pushes for the notification watcher (`HttpNotifier.send_text`); without it the
+    watcher stays off."""
+    remote_tools: RemoteTools | None = None
+    """Default: built from the config."""
 
 
 def _json_rpc_error(status: int, code: int, message: str, headers: dict[str, str] | None = None) -> Response:
@@ -299,8 +307,30 @@ def create_app(options: CreateAppOptions) -> Starlette:
         idle_minutes=config.remote_control.idle_close_minutes,
         logger=options.logger.child({"component": "idle-close"}),
     )
+    remote_tools = options.remote_tools or RemoteTools(
+        RemoteToolsOptions(config=config, manager=options.manager, logger=options.logger)
+    )
+    watcher = (
+        Watcher(
+            WatcherOptions(
+                watch=config.watch,
+                check=remote_tools.collect_pending,
+                send=options.send_text,
+                state_dir=config.state_dir,
+                logger=options.logger.child({"component": "watch"}),
+            )
+        )
+        if config.watch.interval_seconds > 0 and options.send_text is not None
+        else None
+    )
     server = create_mcp_server(
-        McpServerOptions(manager=options.manager, config=config, logger=options.logger, remote_control=remote)
+        McpServerOptions(
+            manager=options.manager,
+            config=config,
+            logger=options.logger,
+            remote_control=remote,
+            remote_tools=remote_tools,
+        )
     )
     session_manager = StreamableHTTPSessionManager(
         app=server._lowlevel_server,
@@ -314,9 +344,13 @@ def create_app(options: CreateAppOptions) -> Starlette:
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         async with session_manager.run():
             idle_close.start()
+            if watcher is not None:
+                watcher.start()
             try:
                 yield
             finally:
+                if watcher is not None:
+                    await watcher.stop()
                 await idle_close.stop()
                 await remote.aclose()
 

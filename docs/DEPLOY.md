@@ -10,6 +10,8 @@ voice-coding-mcp can run in two ways. Pick one:
 | Your own sessions | Can list, query and message them | Not reachable |
 | Isolation of your own computer | None while on | Your computer is not exposed |
 
+A third way, a Linux or WSL workstation that also reaches your tmux sessions (Switchboard), has its own guide: [SETUP-WSL.md](SETUP-WSL.md).
+
 Pairing the Claude app works the same in both; the steps are in [Part B, section 8](#8-pair-the-claude-app).
 
 ## Part A: Mac on demand with Tailscale Funnel (main)

@@ -114,6 +114,15 @@ class RunOptions:
     """Overrides `claude.max_turns` for this run."""
     access: RunAccess | None = None
     """MCP config, setting sources and `--settings`; default isolated with `mcp_config_path`."""
+    replace_system_prompt: bool = False
+    """`--system-prompt` (replaces Claude Code's own) instead of `--append-system-prompt`."""
+    task_settings: bool = True
+    """False leaves out `claude.model`, `claude.effort` and `claude.extraArgs` (the owner's task
+    settings), for runs that are not tasks (the remote summariser)."""
+    model: str | None = None
+    """`--model` for this run, overriding `claude.model`."""
+    no_session_persistence: bool = False
+    """`--no-session-persistence`: nothing of the run is written to a transcript."""
 
 
 @dataclass
@@ -132,6 +141,8 @@ class RunResult:
     duration_ms: int | None = None
     num_turns: int | None = None
     permission_denials: list[Any] = field(default_factory=list)
+    usage: dict[str, Any] | None = None
+    """The result event's `usage` object (token counts), when it had one."""
     progress: list[str] = field(default_factory=list)
     tool_uses: list[ToolUse] = field(default_factory=list)
     """The first TOOL_USES_KEEP tool calls of the run, with their input (used to verify a relay)."""
@@ -160,12 +171,13 @@ def build_args(options: RunOptions) -> list[str]:
         "--permission-prompts",
         "none",
         *run_access(options).args(),
-        "--append-system-prompt",
+        "--system-prompt" if options.replace_system_prompt else "--append-system-prompt",
         system_prompt if system_prompt is not None else SPOKEN_ANSWER_PROMPT,
     ]
-    if claude.model:
-        args += ["--model", claude.model]
-    if claude.effort:
+    model = options.model or (claude.model if options.task_settings else None)
+    if model:
+        args += ["--model", model]
+    if claude.effort and options.task_settings:
         args += ["--effort", claude.effort]
     turns = options.max_turns if options.max_turns is not None else claude.max_turns
     if turns is not None:
@@ -178,7 +190,10 @@ def build_args(options: RunOptions) -> list[str]:
         args += ["--resume", options.resume_session_id]
         if options.fork_session:
             args.append("--fork-session")
-    args += claude.extra_args
+    if options.no_session_persistence:
+        args.append("--no-session-persistence")
+    if options.task_settings:
+        args += claude.extra_args
     return args
 
 
@@ -394,6 +409,8 @@ class _Run:
             state.num_turns = _number(event.get("num_turns"))
             denials = event.get("permission_denials")
             state.permission_denials = denials if isinstance(denials, list) else []
+            usage = event.get("usage")
+            state.usage = usage if isinstance(usage, dict) else None
 
     def mark_result(self, use_id: object, *, is_error: bool) -> None:
         if not isinstance(use_id, str):

@@ -65,6 +65,12 @@ class LiveSession:
     """When the process started (`startedAt`, ms since the epoch)."""
     status_updated_at_ms: int | None = None
     """When `status` last changed (`statusUpdatedAt`, ms since the epoch); judges idle time."""
+    cwd: str | None = None
+    """The session's working directory (`cwd`)."""
+    tmux: str | None = None
+    """For a session started inside tmux: `session:@window.%pane` (`tmux`, seen on Linux)."""
+    entrypoint: str | None = None
+    """How it was started (`entrypoint`: "cli", "sdk-cli" for headless `claude -p`, ...)."""
 
     @property
     def is_bg(self) -> bool:
@@ -340,6 +346,9 @@ def read_live_sessions(claude_home: str) -> dict[str, LiveSession]:
             waiting_for=_nonblank(data.get("waitingFor")),
             started_at_ms=started,
             status_updated_at_ms=status_updated,
+            cwd=_nonblank(data.get("cwd")),
+            tmux=_nonblank(data.get("tmux")),
+            entrypoint=_nonblank(data.get("entrypoint")),
         )
     return out
 

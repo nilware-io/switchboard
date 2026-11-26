@@ -1,4 +1,5 @@
-"""Entry point: serve, pair, unpair, status, revoke-all (argparse; usage errors exit 2).
+"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher, audit, usage,
+set-public-url (argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -11,6 +12,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import signal
@@ -27,13 +29,24 @@ import uvicorn
 from .auth import OAuthStore, close_pairing, get_pairing, open_pairing
 from .auth.text import strip_control_chars
 from .clock import SECOND_MS, ago, now_ms
-from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
+from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config, parse_config
 from .http import CreateAppOptions, create_app
-from .json_file import ensure_dir
-from .log import Logger, as_log_level, create_logger
+from .json_file import ensure_dir, loads_json, write_json_atomic
+from .log import Logger, as_log_level, create_logger, silent_logger
 from .mcp import SERVER_VERSION
 from .notify import HttpNotifier, create_notifier
+from .remote.audit import audit_path, format_audit_table, read_audit
+from .remote.config import remote_warnings
+from .remote.inventory import Inventory
+from .remote.protocol import VersionResponse
+from .remote.speech import machine_line, unreachable_reason
+from .remote.transport import DISPATCHER_PATH, make_transport
+from .sessions import claude_home_dir
 from .tasks.manager import TaskManager, TaskManagerOptions, load_tasks
+from .usage.cache import HUB
+from .usage.compute import PERIOD_HELP, Grouping, PeriodError, parse_period
+from .usage.report import format_csv, format_table
+from .usage.service import ProjectProblem, UsageService, failure_reason, spoken_source
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -111,6 +124,17 @@ def _minutes(text: str) -> int:
     return minutes
 
 
+def _limit(text: str) -> int:
+    """argparse type of `audit --limit`: a whole number from 1 to 100000."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= 100_000:
+        raise argparse.ArgumentTypeError(f"must be a whole number between 1 and 100000, got {text}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="voice-coding-mcp", description=_DESCRIPTION, epilog=_EPILOG)
     parser.add_argument("-v", "--version", action="version", version=SERVER_VERSION)
@@ -142,6 +166,24 @@ def build_parser() -> argparse.ArgumentParser:
     command("status", "show the pairing window, connected clients and task counts")
     revoke = command("revoke-all", "revoke every client and token; the Claude connector must pair again")
     revoke.add_argument("-y", "--yes", action="store_true", help="confirm")
+    check = command("remote-check", "call the dispatcher of each remote machine (or one) and show what it sees")
+    check.add_argument("machine", nargs="?", help="only this machine (its name in remote.machines)")
+    command("remote-dispatcher", "print the switchboard-remote dispatcher script, for installing it on a machine")
+    audit = command("audit", "print the remote_send audit log (stateDir/audit.jsonl) as a table")
+    audit.add_argument("--limit", type=_limit, metavar="N", help="only the last N lines (default: all)")
+    usage = command("usage", "active hours, billable amount and token cost per project, session or day")
+    usage.add_argument("--period", metavar="P", help=f"{PERIOD_HELP} (default: this month)")
+    usage.add_argument(
+        "--machine", metavar="M", help=f"only this machine ({HUB} for the server's own Claude Code home)"
+    )
+    usage.add_argument("--project", metavar="X", help="only this project (folder name)")
+    usage.add_argument("--by", choices=("project", "session", "day"), default="project", help="rows (default: project)")
+    usage.add_argument("--csv", action="store_true", help="CSV with a header row instead of a table")
+    usage.add_argument("--cached", action="store_true", help="use the cached records, do not read the machines")
+    public_url = command(
+        "set-public-url", "set publicUrl in the config file (deploy/linux/sb-linux on calls it); restart to apply"
+    )
+    public_url.add_argument("url", help="the new publicUrl, an https origin such as https://example-host.ts.net")
     return parser
 
 
@@ -152,6 +194,14 @@ class ParsedArgs:
     minutes: int | None = None
     yes: bool = False
     pid_file: str | None = None
+    machine: str | None = None
+    limit: int | None = None
+    period: str | None = None
+    project: str | None = None
+    by: str = "project"
+    csv: bool = False
+    cached: bool = False
+    url: str | None = None
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -163,6 +213,14 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         minutes=getattr(ns, "minutes", None),
         yes=getattr(ns, "yes", False),
         pid_file=getattr(ns, "pid_file", None),
+        machine=getattr(ns, "machine", None),
+        limit=getattr(ns, "limit", None),
+        period=getattr(ns, "period", None),
+        project=getattr(ns, "project", None),
+        by=getattr(ns, "by", "project"),
+        csv=getattr(ns, "csv", False),
+        cached=getattr(ns, "cached", False),
+        url=getattr(ns, "url", None),
     )
 
 
@@ -416,7 +474,15 @@ async def start_server(config: Config, logger: Logger, env: Mapping[str, str] | 
     except BaseException:
         await _shutdown(manager, notifier, "server failed to start")
         raise
-    app = create_app(CreateAppOptions(config=config, logger=logger, store=store, manager=manager))
+    app = create_app(
+        CreateAppOptions(
+            config=config,
+            logger=logger,
+            store=store,
+            manager=manager,
+            send_text=notifier.send_text if notifier is not None else None,
+        )
+    )
     server = _Server(
         uvicorn.Config(
             app,
@@ -545,6 +611,154 @@ async def _serve(config: Config, io: CliIo) -> int:
             loop.remove_signal_handler(sig)
 
 
+def _settings_hooks(config: Config) -> bool:
+    """True when the server user's Claude Code settings define hooks (the summariser loads them)."""
+    path = os.path.join(claude_home_dir(config.claude.config_dir), "settings.json")
+    try:
+        with open(path, "rb") as handle:
+            data = json.loads(handle.read(1024 * 1024).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and bool(data.get("hooks"))
+
+
+async def _cmd_remote_check(config: Config, args: ParsedArgs, io: CliIo) -> int:
+    machines = list(config.remote.machines)
+    if args.machine is not None:
+        machines = [m for m in machines if m.name == args.machine]
+        if not machines:
+            names = ", ".join(m.name for m in config.remote.machines) or "none"
+            io.err(f"No machine called {args.machine}. Configured: {names}.\n")
+            return EXIT_USAGE
+    if not machines:
+        io.out("No remote machines are configured (remote.machines).\n")
+        return EXIT_OK
+    transports = {m.name: make_transport(m, config.remote, config.state_dir, io.env) for m in machines}
+    inventory = Inventory(config.remote, transports, silent_logger)
+    warnings = remote_warnings(config.remote)
+    failed = False
+    lines: list[str] = []
+    for machine in machines:
+        where = (
+            "local dispatcher"
+            if machine.transport == "local"
+            else f"ssh {machine.user}@{machine.host}:{machine.port}"
+            + ("" if machine.dispatcher == "forced" else f", dispatcher {machine.dispatcher}")
+        )
+        lines.append(f"{machine.name} ({where})")
+        lines += [f"  warning: {w}" for w in warnings if w.startswith(f"remote machine {machine.name}:")]
+        version = await inventory.version(machine.name)
+        if not version.ok:
+            failed = True
+            lines.append(f"  not reachable: {unreachable_reason(version.error, version.detail)}")
+            continue
+        data = version.data
+        if isinstance(data, VersionResponse):
+            lines.append(
+                f"  switchboard-remote {data.version}, verbs {', '.join(data.verbs)}, "
+                f"send {'allowed' if data.allow_send else 'off'}, usage {'allowed' if data.allow_usage else 'off'}"
+            )
+        view = await inventory.view(machine.name)
+        if not view.ok:
+            failed = True
+        lines.append("  " + machine_line(view))
+    if _settings_hooks(config):
+        lines.append(
+            "warning: the server user's Claude Code settings.json defines hooks; the remote summariser loads user settings, so they run for every summary"
+        )
+    io.out("\n".join(lines) + "\n")
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+def _cmd_audit(config: Config, args: ParsedArgs, io: CliIo) -> int:
+    rows, bad = read_audit(config.state_dir, args.limit)
+    if not rows and not bad:
+        io.out("No sends were audited yet.\n")
+        return EXIT_OK
+    io.out(format_audit_table(rows, with_text=any("text" in row for row in rows)))
+    if bad:
+        io.err(f"warning: {bad} unreadable line(s) in {audit_path(config.state_dir)}\n")
+    return EXIT_OK
+
+
+async def _cmd_usage(config: Config, args: ParsedArgs, io: CliIo) -> int:
+    transports = {m.name: make_transport(m, config.remote, config.state_dir, io.env) for m in config.remote.machines}
+    service = UsageService(config, transports, silent_logger, env=io.env)
+    try:
+        period = parse_period(args.period, now_ms())
+    except PeriodError:
+        io.err(f"Unknown period {args.period}. Use {PERIOD_HELP}.\n")
+        return EXIT_USAGE
+    names = service.sources(args.machine)
+    if args.machine is not None and not names:
+        usable = ", ".join(service.sources()) or "none"
+        io.err(f"No machine called {args.machine} with usage reading on. Usable: {usable}.\n")
+        return EXIT_USAGE
+    if not names:
+        io.err("No machine has usage reading on.\n")
+        return EXIT_ERROR
+    outcomes = None
+    if not args.cached:
+        io.err(f"Reading usage records from {', '.join(spoken_source(n) for n in names)} ...\n")
+        outcomes = await service.refresh(names)
+    project = None
+    if args.project is not None:
+        found = service.match_project(names, args.project)
+        if isinstance(found, ProjectProblem):
+            known = ", ".join(found.candidates) or "none"
+            io.err(
+                f"{'Several projects match' if found.ambiguous else 'No project matches'} {args.project}: {known}.\n"
+            )
+            return EXIT_USAGE
+        project = found
+    by: Grouping = "session" if args.by == "session" else "day" if args.by == "day" else "project"
+    report, context = service.report(names, period, project=project, by=by)
+    notes = []
+    if context.skipped:
+        notes.append(f"{context.skipped} transcript(s) larger than usage.maxTranscriptMegabytes were skipped")
+    failed = [o for o in (outcomes or {}).values() if not o.ok]
+    notes += [
+        f"{spoken_source(o.name)} could not be read: {failure_reason(o)}; its cached records are used" for o in failed
+    ]
+    if args.csv:
+        io.out(format_csv(report))
+        for note in notes:
+            io.err(f"warning: {note}\n")
+    else:
+        io.out(format_table(report, notes))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+def _cmd_set_public_url(config_path: str, config: Config, url: str, io: CliIo) -> int:
+    """Rewrites `publicUrl` in the config file (atomically, mode 0600, other keys and their order kept)
+    after checking that the file with the new value is still a valid config. Prints `changed: ...` or
+    `unchanged: ...` as its first word, which `deploy/linux/sb-linux` reads."""
+    want = url.rstrip("/")
+    if want == config.public_url:
+        io.out(f"unchanged: publicUrl is already {want}\n")
+        return EXIT_OK
+    path = os.path.realpath(config_path)
+    with open(path, encoding="utf-8") as handle:
+        data = loads_json(handle.read())
+    if not isinstance(data, dict):
+        raise ConfigError(f"{config_path}: the config is not a JSON object")
+    data = {**data, "publicUrl": want}
+    try:
+        parse_config(data)
+    except ConfigError as err:
+        io.err(f"{err}\n")
+        return EXIT_USAGE
+    write_json_atomic(path, data)
+    io.out(f"changed: publicUrl is now {want} (restart the server to apply it)\n")
+    return EXIT_OK
+
+
+def _cmd_remote_dispatcher(io: CliIo) -> int:
+    with open(DISPATCHER_PATH, encoding="utf-8") as handle:
+        io.out(handle.read())
+    return EXIT_OK
+
+
 async def main(argv: Sequence[str], io: CliIo) -> int:
     """Runs one CLI invocation and returns the exit code."""
     try:
@@ -555,6 +769,14 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
     except UsageError as err:
         io.err(f"{err.usage}{err.prog}: error: {err}\n")
         return EXIT_USAGE
+
+    if args.command == "remote-dispatcher":
+        # Needs no config: it prints the bundled script.
+        try:
+            return _cmd_remote_dispatcher(io)
+        except OSError as err:
+            io.err(f"Error: {err}\n")
+            return EXIT_ERROR
 
     config_path = args.config or io.env.get("VCM_CONFIG") or DEFAULT_CONFIG_PATH
     try:
@@ -578,6 +800,14 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
                 return await _cmd_status(config, io)
             case "revoke-all":
                 return await _cmd_revoke_all(config, args, io)
+            case "remote-check":
+                return await _cmd_remote_check(config, args, io)
+            case "audit":
+                return _cmd_audit(config, args, io)
+            case "usage":
+                return await _cmd_usage(config, args, io)
+            case "set-public-url":
+                return _cmd_set_public_url(config_path, config, args.url or "", io)
     except Exception as err:
         io.err(f"Error: {err}\n")
         return EXIT_ERROR

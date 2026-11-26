@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, cast, get_args
 
 from pydantic import (
@@ -26,7 +26,10 @@ from pydantic.alias_generators import to_camel
 
 from .json_file import loads_json
 from .projects import is_inside
+from .remote.audit import audit_size_warning
+from .remote.config import RemoteConfig, WatchConfig, check_remote, remote_warnings
 from .urls import is_loopback_ip, parse_url
+from .usage.config import UsageConfig
 
 DEFAULT_CONFIG_PATH = "/etc/voice-coding-mcp/config.json"
 
@@ -247,6 +250,9 @@ class _ConfigFile(_Section):
     oauth: OAuthConfig = Field(default_factory=OAuthConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     log_prompts: bool = False
+    remote: RemoteConfig = Field(default_factory=RemoteConfig)
+    watch: WatchConfig = Field(default_factory=WatchConfig)
+    usage: UsageConfig = Field(default_factory=UsageConfig)
 
 
 @dataclass(frozen=True)
@@ -272,6 +278,12 @@ class Config:
     """Canonical MCP resource: `issuer + "/mcp"`."""
     public_host: str
     """Host (with port when not default) that the `Host` header must match."""
+    remote: RemoteConfig = field(default_factory=RemoteConfig)
+    """Machines reached through the Switchboard dispatcher (docs/SWITCHBOARD.md)."""
+    watch: WatchConfig = field(default_factory=WatchConfig)
+    """The Switchboard notification watcher (off unless `intervalSeconds` > 0)."""
+    usage: UsageConfig = field(default_factory=UsageConfig)
+    """Switchboard usage accounting: idle gap, hourly rate, prices (docs/SWITCHBOARD.md)."""
 
 
 # --- checks ----------------------------------------------------------------------------------
@@ -354,6 +366,14 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
             "set listen.allowNonLoopback to true to override"
         )
 
+    remote_problems = check_remote(
+        parsed.remote, allow_non_loopback=parsed.listen.allow_non_loopback, state_dir=parsed.state_dir
+    )
+    if parsed.watch.interval_seconds > 0 and parsed.notify.url is None:
+        remote_problems.append("watch.intervalSeconds: the watcher needs notify.url")
+    if remote_problems:
+        raise ConfigError("Invalid config:\n" + "\n".join(remote_problems))
+
     project_roots = _check_project_roots(
         parsed.project_roots, parsed.state_dir, home_dir if home_dir is not None else os.path.expanduser("~")
     )
@@ -373,6 +393,9 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
         issuer=issuer,
         resource_url=f"{issuer}/mcp",
         public_host=public_host,
+        remote=parsed.remote,
+        watch=parsed.watch,
+        usage=parsed.usage,
     )
 
 
@@ -392,6 +415,10 @@ def config_warnings(config: Config, *, platform: str | None = None) -> list[str]
             "oauth.allowLoopbackRedirects is on: any client can register a http://localhost redirect URI "
             "during a pairing window; turn it off unless you are testing with a local client"
         )
+    warnings += remote_warnings(config.remote)
+    audit = audit_size_warning(config.state_dir)
+    if audit is not None:
+        warnings.append(audit)
     return warnings
 
 
