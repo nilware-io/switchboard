@@ -1,0 +1,4 @@
+# /etc/ssh/switchboard-relay/authorized_keys (root:root 0644): one line per machine key.
+# The machine name after --machine is the only identity the hub trusts; keep this file root-owned.
+# Optionally prefix from="<address>" for a machine with a fixed egress address.
+restrict,command="/opt/voice-coding-mcp/.venv/bin/python -I -m voice_coding_mcp.remote.relay --machine laptop" ssh-ed25519 AAAA... switchboard-connect laptop

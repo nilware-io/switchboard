@@ -108,7 +108,7 @@ exit
 
    Then `sudo sshd -t && sudo systemctl enable --now ssh`. Check with `ss -ltn '( sport = :22 )'`: only `127.0.0.1:22` and `[::1]:22` may be listed. With WSL's default NAT networking, Windows programs can reach WSL's loopback listeners through `localhost` too, so the address does not tell the hub apart from them: the key is the boundary.
 
-2. Install the dispatcher as yourself, from your own copy ([step 3](#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root)), and read it before it goes in place. It is one Python file of about 1350 lines with only the standard library, so a skim is not a review. What to check: the imports at the top (standard library only, no `socket`, `urllib` or `http`), that `subprocess.run` appears only in `run_tmux` and `parent_pid` (argv lists, a fixed environment, no `shell=True`), that files are only opened for reading, and that the policy comes only from the real argv (`resolve_request`, `parse_options`), never from `SSH_ORIGINAL_COMMAND`. If you reviewed that commit on GitHub, the file must be byte-identical to `deploy/remote/switchboard-remote` there (compare the `sha256sum` below with one computed from that commit).
+2. Install the dispatcher as yourself, from your own copy ([step 3](#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root)), and read it before it goes in place. It is one Python file of about 1950 lines with only the standard library, so a skim is not a review. What to check: the imports at the top (standard library only, no `socket`, `urllib` or `http`), that `subprocess.run` appears only in `run_tmux` and `parent_pid` (argv lists, a fixed environment, no `shell=True`), that files are only opened for reading, and that the policy comes only from the real argv (`resolve_request`, `parse_options`, and `serve_policy` for serve mode), never from `SSH_ORIGINAL_COMMAND` or from a request frame. Serve mode (`serve`, `Server`; used only by machines that connect out to the hub) reads only its stdin and writes only its stdout. If you reviewed that commit on GitHub, the file must be byte-identical to `deploy/remote/switchboard-remote` there (compare the `sha256sum` below with one computed from that commit).
 
    ```sh
    cd ~/src/switchboard
@@ -139,7 +139,7 @@ exit
 
 ## 6. Other machines
 
-On each machine you want to reach (named `buildbox` here):
+On each machine you want to reach (named `buildbox` here). A machine the hub cannot reach (behind NAT, or one you would rather not run sshd on) can instead connect out to the hub: see [SETUP-AGENTS.md](SETUP-AGENTS.md); it needs no step below.
 
 1. A user whose tmux sessions you want to reach (for agents, their own user, for example `bot`). Install the dispatcher there as in step 5.2, from your own copy: `scp ~/src/switchboard/deploy/remote/switchboard-remote example-host:` (as yourself, not as `switchboard`), then on that machine `install -D -m 755 ~/switchboard-remote ~/.local/bin/switchboard-remote` and compare its `sha256sum` with the one from step 5.2. It needs Python 3.8 or newer and tmux.
 2. In that user's `~/.ssh/authorized_keys`, the hub's key for this machine with a forced command, and `from=` set to the address the WSL machine connects from (its Tailscale address if you go through the tailnet):

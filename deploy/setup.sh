@@ -7,6 +7,11 @@
 # Idempotent: safe to run again (for example after an update). It never
 # overwrites config.json, the env file or ~/.claude/settings.json once they
 # exist, and it never starts voice-coding-mcp itself. It takes no secrets.
+#
+# With VCM_AGENT_RELAY=1 it also sets up the relay account for machines that
+# connect out to the hub (docs/SWITCHBOARD.md, "Outbound agents"): the system
+# user sbrelay, its root-owned key file, the socket directory and the sshd
+# drop-in. It never adds a key; that stays a manual, checked step.
 
 set -euo pipefail
 
@@ -290,6 +295,47 @@ systemctl daemon-reload
 if systemctl is-active --quiet voice-coding-mcp; then
 	echo "voice-coding-mcp is running, restarting it with the new code"
 	systemctl restart voice-coding-mcp
+fi
+
+# ---------------------------------------------------------------- agent relay (opt-in)
+
+RELAY_USER=sbrelay
+RELAY_KEYS_DIR=/etc/ssh/switchboard-relay
+if [[ ${VCM_AGENT_RELAY:-0} == 1 ]]; then
+	log "Relay account $RELAY_USER for machines that connect out to the hub"
+	if ! id "$RELAY_USER" >/dev/null 2>&1; then
+		# No password; /bin/sh because sshd runs forced commands through the login shell.
+		useradd --system --user-group --shell /bin/sh --home-dir "/var/lib/$RELAY_USER" --no-create-home "$RELAY_USER"
+	fi
+	# '*' (no password can match) instead of useradd's locked '!': with UsePAM no, OpenSSH refuses
+	# even key logins to a locked account.
+	usermod -p '*' "$RELAY_USER"
+	if id -nG "$RELAY_USER" | tr ' ' '\n' | grep -qx "$APP_USER"; then
+		die "$RELAY_USER must not be in group $APP_USER"
+	fi
+	if id -nG "$APP_USER" | tr ' ' '\n' | grep -qx "$RELAY_USER"; then
+		die "$APP_USER must not be in group $RELAY_USER"
+	fi
+	install -d -o root -g root -m 0755 "/var/lib/$RELAY_USER" "$RELAY_KEYS_DIR"
+	if [[ ! -e $RELAY_KEYS_DIR/authorized_keys ]]; then
+		install -o root -g root -m 0644 /dev/null "$RELAY_KEYS_DIR/authorized_keys"
+	fi
+	chown root:root "$RELAY_KEYS_DIR/authorized_keys"
+	chmod 0644 "$RELAY_KEYS_DIR/authorized_keys"
+	install -o root -g root -m 0644 "$APP_DIR/deploy/relay/tmpfiles-switchboard-relay.conf" \
+		/etc/tmpfiles.d/switchboard-relay.conf
+	systemd-tmpfiles --create /etc/tmpfiles.d/switchboard-relay.conf
+	install -o root -g root -m 0644 "$APP_DIR/deploy/relay/sshd-switchboard-relay.conf" \
+		/etc/ssh/sshd_config.d/switchboard-relay.conf
+	sshd -t
+	sshd -T -C "user=$RELAY_USER,host=relay-check,addr=192.0.2.1" | grep -Ex 'disableforwarding yes|permittty no' \
+		| wc -l | grep -qx 2 || die "the sshd drop-in for $RELAY_USER is not in effect"
+	systemctl try-reload-or-restart ssh 2>/dev/null || systemctl try-reload-or-restart sshd 2>/dev/null || true
+	echo "Relay ready. Add one key line per machine to $RELAY_KEYS_DIR/authorized_keys (format in"
+	echo "$APP_DIR/deploy/relay/authorized_keys.example), add the machines to the config, restart the"
+	echo "hub (it binds the relay socket only at start), then run: voice-coding-mcp remote-check"
+	echo "Host key for the machines to pin (compare it on this console):"
+	ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 fi
 
 # ---------------------------------------------------------------- caddy

@@ -32,13 +32,26 @@ UNREACHABLE: dict[str, str] = {
     "bad_response": "it answered something unexpected",
     "refused_by_policy": "switchboard-remote refused the request",
     "other": "something went wrong",
+    "not_connected": "it is not connected right now",
+    "disconnected": "the connection was lost",
 }
 
 
 def unreachable_reason(error: TransportError | None, detail: str | None = None) -> str:
     if error == "refused_by_policy" and detail in ("no_policy", "bad_policy"):
         return "switchboard-remote there has no valid policy"
+    if error == "refused_by_policy" and detail == "busy":
+        # An agent machine still running earlier requests (a timed-out capture keeps its worker).
+        return "it is busy, try again in a moment"
     return UNREACHABLE.get(error or "other", UNREACHABLE["other"])
+
+
+def unreachable_sentence(name: str, error: TransportError | None, detail: str | None = None) -> str:
+    """ "dev is not reachable: <reason>.", or for an agent machine without a connection "laptop is
+    not connected right now." """
+    if error == "not_connected":
+        return f"{name} is not connected right now."
+    return f"{name} is not reachable: {unreachable_reason(error, detail)}."
 
 
 def quote(text: str) -> str:
@@ -87,6 +100,8 @@ def _session_line(session: str, panes: Sequence[PaneInfo]) -> str:
 def machine_line(view: MachineView) -> str:
     name = view.machine.name
     if not view.ok:
+        if view.error == "not_connected":
+            return f"{name}: not connected right now."
         return f"{name}: not reachable, {unreachable_reason(view.error, view.detail)}."
     sessions = view.sessions()
     cut = " It has more panes than I can list, so some are missing." if view.truncated else ""
@@ -299,7 +314,10 @@ def format_pending(report: PendingReport) -> str:
             it = "it" if len(asks) == 1 else "them"
             lines.append(f"Approve {it} at the keyboard or in the Claude app.")
     for view in unreachable:
-        lines.append(f"{view.machine.name} could not be checked: {unreachable_reason(view.error, view.detail)}.")
+        if view.error == "not_connected":
+            lines.append(f"{view.machine.name} is not connected right now.")
+        else:
+            lines.append(f"{view.machine.name} could not be checked: {unreachable_reason(view.error, view.detail)}.")
     for name in report.partial:
         lines.append(f"Some sessions on {name} could not be checked.")
     return "\n".join(lines)
@@ -433,6 +451,8 @@ def format_resize_readback(
 
 
 _NOT_SENT: dict[str, str] = {
+    "not_connected": "Not sent: {machine} is not connected right now.",
+    "busy": "Not sent: switchboard-remote on {machine} was busy. Try again in a moment.",
     "gone": "Not sent: the pane is gone.",
     "changed": "Not sent: that pane now runs a different session.",
     "dialog_changed": "Not sent: the permission question you answered is no longer on that screen.",

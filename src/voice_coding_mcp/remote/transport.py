@@ -3,7 +3,9 @@
 
 `Transport.call` never raises. Every failure maps to a fixed code that the speech layer turns into
 words: `timeout`, `host_key`, `auth`, `refused`, `dispatcher_missing`, `bad_response`,
-`refused_by_policy` (the dispatcher said no; its own code is in `detail`) or `other`. Processes run
+`refused_by_policy` (the dispatcher said no; its own code is in `detail`) or `other`; an `agent`
+machine (`agents.AgentTransport`) adds `not_connected` (nothing was sent) and `disconnected` (the
+connection closed after the request went out). Processes run
 from argv (never a shell) in a new session and are killed as a process group on timeout and when
 the call is cancelled; stdout is capped and stderr is kept only as a short tail for the error
 mapping, never logged.
@@ -21,7 +23,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel
 
@@ -29,8 +31,20 @@ from .config import MachineConfig, RemoteConfig, known_hosts_path
 from .protocol import MAX_RESPONSE_BYTES, ResponseError, build_command, parse_response, request_tokens, response_cap
 from .ssh import build_ssh_argv, ssh_env
 
+if TYPE_CHECKING:
+    from .agents import AgentHub
+
 TransportError = Literal[
-    "timeout", "host_key", "auth", "refused", "dispatcher_missing", "bad_response", "refused_by_policy", "other"
+    "timeout",
+    "host_key",
+    "auth",
+    "refused",
+    "dispatcher_missing",
+    "bad_response",
+    "refused_by_policy",
+    "other",
+    "not_connected",
+    "disconnected",
 ]
 
 DISPATCHER_PATH = str(Path(__file__).resolve().parent / "dispatcher.py")
@@ -300,9 +314,28 @@ class LocalTransport:
         return interpret(verb, result, via_ssh=False, started=started)
 
 
+class OfflineTransport:
+    """An `agent` machine where no hub holds its connection (the CLI runs in another process than
+    the hub): every call is `not_connected`."""
+
+    def __init__(self, machine: MachineConfig) -> None:
+        self.machine = machine
+
+    async def call(
+        self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float, stdin: bytes | None = None
+    ) -> TransportResult:
+        return TransportResult(ok=False, error="not_connected")
+
+
 def make_transport(
-    machine: MachineConfig, remote: RemoteConfig, state_dir: str, base_env: Mapping[str, str]
+    machine: MachineConfig,
+    remote: RemoteConfig,
+    state_dir: str,
+    base_env: Mapping[str, str],
+    agents: AgentHub | None = None,
 ) -> Transport:
     if machine.transport == "local":
         return LocalTransport(machine, base_env, slash_commands=remote.send.slash_commands)
+    if machine.transport == "agent":
+        return agents.transport(machine) if agents is not None else OfflineTransport(machine)
     return SshTransport(machine, remote, known_hosts_path(machine, state_dir), base_env)

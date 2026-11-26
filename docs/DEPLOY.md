@@ -213,6 +213,10 @@ After a successful pairing `/authorize` and `/register` are closed again. To pai
 
 Note what happens while waiting between result checks (does the voice model stay quiet), and how project names are recognized. These are open questions in `docs/DESIGN.md`.
 
+### Machines that connect out to the hub (optional)
+
+Machines behind NAT, or that should not run an sshd for the hub, can connect out to this server instead (transport `agent`): they log in to a dedicated relay account here and the hub sends its requests down that connection. `sudo VCM_AGENT_RELAY=1 /opt/voice-coding-mcp/deploy/setup.sh vcm.example.com` creates the relay account `sbrelay`, its root-owned key file, the socket directory and the sshd drop-in, and prints the host key fingerprint the machines pin. Adding a machine (its key line, the config entry, the user unit on the machine) is in [SETUP-AGENTS.md](SETUP-AGENTS.md).
+
 ### Updates
 
 ```sh
