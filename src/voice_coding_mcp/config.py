@@ -29,6 +29,7 @@ from .projects import is_inside
 from .remote.audit import audit_size_warning
 from .remote.config import RemoteConfig, WatchConfig, check_remote, remote_warnings
 from .urls import is_loopback_ip, parse_url
+from .usage.config import UsageConfig
 
 DEFAULT_CONFIG_PATH = "/etc/voice-coding-mcp/config.json"
 
@@ -251,6 +252,7 @@ class _ConfigFile(_Section):
     log_prompts: bool = False
     remote: RemoteConfig = Field(default_factory=RemoteConfig)
     watch: WatchConfig = Field(default_factory=WatchConfig)
+    usage: UsageConfig = Field(default_factory=UsageConfig)
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,8 @@ class Config:
     """Machines reached through the Switchboard dispatcher (docs/SWITCHBOARD.md)."""
     watch: WatchConfig = field(default_factory=WatchConfig)
     """The Switchboard notification watcher (off unless `intervalSeconds` > 0)."""
+    usage: UsageConfig = field(default_factory=UsageConfig)
+    """Switchboard usage accounting: idle gap, hourly rate, prices (docs/SWITCHBOARD.md)."""
 
 
 # --- checks ----------------------------------------------------------------------------------
@@ -391,6 +395,7 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
         public_host=public_host,
         remote=parsed.remote,
         watch=parsed.watch,
+        usage=parsed.usage,
     )
 
 

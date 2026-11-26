@@ -26,7 +26,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel
 
 from .config import MachineConfig, RemoteConfig, known_hosts_path
-from .protocol import MAX_RESPONSE_BYTES, ResponseError, build_command, parse_response, request_tokens
+from .protocol import MAX_RESPONSE_BYTES, ResponseError, build_command, parse_response, request_tokens, response_cap
 from .ssh import build_ssh_argv, ssh_env
 
 TransportError = Literal[
@@ -244,7 +244,9 @@ class SshTransport:
             argv = self.argv(verb, args)
         except ValueError:
             return TransportResult(ok=False, error="other")
-        result = await run_process(argv, self._env, timeout_seconds=timeout_seconds, stdin=stdin)
+        result = await run_process(
+            argv, self._env, timeout_seconds=timeout_seconds, stdout_cap=response_cap(verb), stdin=stdin
+        )
         return interpret(verb, result, via_ssh=True, started=started)
 
 
@@ -292,7 +294,9 @@ class LocalTransport:
             argv = self.argv(verb, args)
         except ValueError:
             return TransportResult(ok=False, error="other")
-        result = await run_process(argv, self._env, timeout_seconds=timeout_seconds, stdin=stdin)
+        result = await run_process(
+            argv, self._env, timeout_seconds=timeout_seconds, stdout_cap=response_cap(verb), stdin=stdin
+        )
         return interpret(verb, result, via_ssh=False, started=started)
 
 

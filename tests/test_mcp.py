@@ -125,7 +125,7 @@ async def ctx(real_tmp: Path, request: pytest.FixtureRequest) -> AsyncIterator[C
 # --- tool list ------------------------------------------------------------------------------------
 
 
-async def test_has_the_fifteen_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
+async def test_has_the_sixteen_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
     tools = (await ctx.client.list_tools()).tools
     by_name = {t.name: t for t in tools}
     assert sorted(by_name) == [
@@ -144,6 +144,7 @@ async def test_has_the_fifteen_tools_with_the_design_annotations_and_server_inst
         "run_task",
         "run_tasks_parallel",
         "send_message_to_session",
+        "usage_report",
     ]
 
     def annotations(name: str) -> dict[str, Any]:
@@ -159,6 +160,7 @@ async def test_has_the_fifteen_tools_with_the_design_annotations_and_server_inst
         "list_remote_sessions",
         "pending_input",
         "remote_send",
+        "usage_report",
     ]:
         assert annotations(name) == {"readOnlyHint": True}
     assert annotations("remote_send_confirm") == {
@@ -173,6 +175,9 @@ async def test_has_the_fifteen_tools_with_the_design_annotations_and_server_inst
     confirm = by_name["remote_send_confirm"].input_schema
     assert sorted(confirm["properties"]) == ["confirmation_id", "risky_ok"]
     assert confirm.get("required") == ["confirmation_id"]
+    usage = by_name["usage_report"].input_schema
+    assert sorted(usage["properties"]) == ["machine", "period", "project"]
+    assert usage.get("required") is None
     for name in ["ask_session_readonly", "remote_status"]:
         assert annotations(name) == {"readOnlyHint": True, "openWorldHint": True}
     for name in ["run_task", "run_tasks_parallel", "send_message_to_session"]:

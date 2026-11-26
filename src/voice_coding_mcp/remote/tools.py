@@ -134,6 +134,8 @@ class RemoteTools:
         transports = options.transports or {
             m.name: make_transport(m, config.remote, config.state_dir, options.base_env) for m in config.remote.machines
         }
+        self.transports: dict[str, Transport] = dict(transports)
+        """One per machine; `usage_report` calls the same ones."""
         self._now = options.now or now_ms
         self.echo = ScreenEcho(self._now)
         self.inventory = Inventory(config.remote, transports, self._logger, now=options.now, observe=self.echo.observe)

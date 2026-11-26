@@ -25,14 +25,19 @@ Test only (refused unless SWITCHBOARD_REMOTE_TEST=1 is in the environment): --tm
 
 Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none> message`
 or `send <paneId> <panePid> <sessionId|none> answer <dialogHash|none>` (text on stdin, only with
---allow-send; the mode says what the owner confirmed: a message, or the answer to one permission dialog). Every response is one JSON document on stdout,
-`{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`; the exit
-code is 0 also for refusals. Nothing from the request ever reaches a shell: tmux runs from argv with
+--allow-send; the mode says what the owner confirmed: a message, or the answer to one permission
+dialog), `usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
+only with --allow-usage). Every response is one JSON document on stdout,
+`{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`, except a
+successful `usage`, which is JSON lines (a header document, then file headers and token records
+without any text, then `{"done": true, ...}`); the exit code is 0 also for refusals. Nothing from the request ever reaches a shell: tmux runs from argv with
 a fixed environment, and the text of a send reaches tmux only on the stdin of `load-buffer`.
 """
 
 from __future__ import annotations
 
+import calendar
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -45,10 +50,12 @@ import shlex
 import subprocess
 import sys
 import unicodedata
+from collections.abc import Iterator
+from typing import BinaryIO
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PROTOCOL = 1
-VERBS = ("version", "list", "capture", "send")
+VERBS = ("version", "list", "capture", "send", "usage")
 PROGRAM = "switchboard-remote"
 
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}")
@@ -81,6 +88,12 @@ MAX_CAPTURE_BYTES = 64 * 1024
 MAX_REGISTRY_BYTES = 1024 * 1024
 MAX_POLICY_BYTES = 64 * 1024
 MAX_SEND_BYTES = 8 * 1024
+MAX_USAGE_KNOWN_BYTES = 1024 * 1024
+"""The hub's list of known transcripts on the stdin of `usage`."""
+MAX_USAGE_MEGABYTES = 2048
+MAX_USAGE_LINE_BYTES = 1024 * 1024
+"""Transcript lines longer than this are skipped (pasted files, huge tool results)."""
+MAX_TOKENS = 10**12
 SEND_CHECK_LINES = 40
 """Screen lines a send reads for the permission, draft and vim checks (the last 15 non-empty count)."""
 CHECK_TAIL = 15
@@ -452,6 +465,11 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
             if len(args) != 5 or (args[4] != NO_DIALOG and not DIALOG_HASH_RE.fullmatch(args[4])):
                 raise RefusedError("bad_request")
         else:
+            raise RefusedError("bad_request")
+    if verb == "usage":
+        if len(args) != 2 or not NUMBER_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
+            raise RefusedError("bad_request")
+        if not 1 <= int(args[1]) <= MAX_USAGE_MEGABYTES:
             raise RefusedError("bad_request")
     return verb, args
 
@@ -828,9 +846,252 @@ def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: objec
     return {"sent": True, "bytes": len(data), "enter": True}
 
 
-def handle(argv: list[str], env: dict[str, str], stdin: object = None) -> dict[str, object]:
-    """The response document for one invocation. Never raises for a bad request. `stdin` (bytes or a
-    binary file) is read only by `send`."""
+# --- usage -------------------------------------------------------------------------------------
+
+_TIMESTAMP_RE = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:[.]([0-9]{1,9}))?"
+    r"(Z|z|[+-][0-9]{2}:?[0-9]{2})?"
+)
+_RECORD_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_USER_MARK_RE = re.compile(rb'"type"\s*:\s*"user"')
+_USAGE_MARK = b'"usage"'
+
+
+def parse_timestamp(value: object) -> int | None:
+    """Epoch milliseconds of a transcript timestamp (`2026-11-26T15:08:31.121Z`; no zone is UTC)."""
+    if not isinstance(value, str):
+        return None
+    found = _TIMESTAMP_RE.fullmatch(value.strip())
+    if found is None:
+        return None
+    year, month, day, hour, minute, second = (int(part) for part in found.groups()[:6])
+    fraction = found.group(7) or ""
+    zone = found.group(8) or "Z"
+    try:
+        moment = datetime.datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+    millis = int((fraction + "000")[:3])
+    offset = 0
+    if zone not in ("Z", "z"):
+        digits = zone[1:].replace(":", "")
+        offset = (int(digits[:2]) * 60 + int(digits[2:])) * 60_000
+        if zone[0] == "+":
+            offset = -offset
+    return calendar.timegm(moment.timetuple()) * 1000 + millis + offset
+
+
+def _tokens(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return min(max(value, 0), MAX_TOKENS)
+
+
+def _record_id(value: object) -> str | None:
+    return value if isinstance(value, str) and _RECORD_ID_RE.fullmatch(value) else None
+
+
+def is_owner_prompt(entry: dict[str, object]) -> bool:
+    """A prompt line of the session's driver (the owner, or `claude -p`): not meta, not a subagent,
+    not a tool result."""
+    if entry.get("isMeta") is True or entry.get("isSidechain") is True:
+        return False
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    prompt = False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            return False
+        if block.get("type") in ("text", "image"):
+            prompt = True
+    return prompt
+
+
+def usage_record(entry: dict[str, object]) -> dict[str, object] | None:
+    """The compact usage record of one transcript line, or None. No text, tool input or path."""
+    moment = parse_timestamp(entry.get("timestamp"))
+    if moment is None:
+        return None
+    kind = entry.get("type")
+    if kind == "user":
+        return {"t": moment, "k": "u"} if is_owner_prompt(entry) else None
+    if kind != "assistant":
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    cache = usage.get("cache_creation")
+    if isinstance(cache, dict) and ("ephemeral_5m_input_tokens" in cache or "ephemeral_1h_input_tokens" in cache):
+        write_5m = _tokens(cache.get("ephemeral_5m_input_tokens"))
+        write_1h = _tokens(cache.get("ephemeral_1h_input_tokens"))
+    else:
+        write_5m, write_1h = _tokens(usage.get("cache_creation_input_tokens")), 0
+    model = message.get("model")
+    model_name = clean_text(model, NAME_MAX) if isinstance(model, str) else ""
+    return {
+        "t": moment,
+        "k": "a",
+        "m": model_name or None,
+        "id": _record_id(message.get("id")),
+        "rq": _record_id(entry.get("requestId")),
+        "in": _tokens(usage.get("input_tokens")),
+        "out": _tokens(usage.get("output_tokens")),
+        "cw5": write_5m,
+        "cw1": write_1h,
+        "cr": _tokens(usage.get("cache_read_input_tokens")),
+    }
+
+
+def parse_transcript(handle: BinaryIO, limit: int) -> tuple[str, list[dict[str, object]]]:
+    """(project, records) of a transcript opened in binary mode, reading at most `limit` bytes.
+    Lines over MAX_USAGE_LINE_BYTES are skipped; only lines that may carry usage or a prompt are
+    parsed. The project is the basename of the session's latest `cwd`."""
+    project = ""
+    records: list[dict[str, object]] = []
+    left = limit
+    skipping = False
+    while left > 0:
+        line = handle.readline(min(left, MAX_USAGE_LINE_BYTES + 1))
+        if not line:
+            break
+        left -= len(line)
+        if skipping or len(line) > MAX_USAGE_LINE_BYTES:
+            # The rest of an overlong line is skipped up to its newline.
+            skipping = not line.endswith(b"\n")
+            continue
+        if _USAGE_MARK not in line and not _USER_MARK_RE.search(line):
+            continue
+        try:
+            entry = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        cwd = entry.get("cwd")
+        if isinstance(cwd, str) and cwd.strip("/") and entry.get("isSidechain") is not True:
+            project = clean_text(os.path.basename(cwd.rstrip("/")), NAME_MAX)
+        record = usage_record(entry)
+        if record is not None:
+            records.append(record)
+    return project, records
+
+
+def read_usage_known(stdin: object) -> dict[str, tuple[int, int]]:
+    """The hub's known transcripts, `[{"id", "size", "mtime"}]` on stdin: id to (size, mtime ms)."""
+    if isinstance(stdin, bytes):
+        raw = stdin[: MAX_USAGE_KNOWN_BYTES + 1]
+    elif stdin is not None and hasattr(stdin, "read"):
+        try:
+            raw = stdin.read(MAX_USAGE_KNOWN_BYTES + 1)
+        except (OSError, ValueError):
+            raise RefusedError("bad_request") from None
+    else:
+        raw = b""
+    if not isinstance(raw, bytes) or len(raw) > MAX_USAGE_KNOWN_BYTES:
+        raise RefusedError("bad_request")
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise RefusedError("bad_request") from None
+    if not isinstance(data, list):
+        raise RefusedError("bad_request")
+    known: dict[str, tuple[int, int]] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            raise RefusedError("bad_request")
+        file_id, size, mtime = item.get("id"), _number(item.get("size")), _number(item.get("mtime"))
+        if not isinstance(file_id, str) or not UUID_RE.fullmatch(file_id) or size is None or mtime is None:
+            raise RefusedError("bad_request")
+        known[file_id] = (size, mtime)
+    return known
+
+
+def transcript_files(home: str) -> list[tuple[str, str, int, int]]:
+    """(session id, path, size, mtime ms) of `<home>/projects/*/<uuid>.jsonl`: top level of each
+    project directory only, no symlinks, the first file of an id wins."""
+    out: list[tuple[str, str, int, int]] = []
+    seen: set[str] = set()
+    try:
+        projects = sorted(os.scandir(os.path.join(home, "projects")), key=lambda item: item.name)
+    except OSError:
+        return out
+    for directory in projects:
+        try:
+            if not directory.is_dir(follow_symlinks=False):
+                continue
+            files = sorted(os.scandir(directory.path), key=lambda item: item.name)
+        except OSError:
+            continue
+        for item in files:
+            name = item.name
+            if not name.endswith(".jsonl") or not UUID_RE.fullmatch(name[:-6]):
+                continue
+            file_id = name[:-6].lower()
+            try:
+                if file_id in seen or not item.is_file(follow_symlinks=False):
+                    continue
+                info = item.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            seen.add(file_id)
+            out.append((file_id, item.path, info.st_size, info.st_mtime_ns // 1_000_000))
+    return out
+
+
+def usage_documents(
+    home: str, since_ms: int, max_bytes: int, known: dict[str, tuple[int, int]]
+) -> Iterator[dict[str, object]]:
+    """The usage lines for transcripts modified since `since_ms` whose (size, mtime) differs from
+    `known`: per file a header `{"file", "size", "mtime", "project", "records"}` and its records, or
+    `{"file", "size", "mtime", "skipped": true}` when it is larger than `max_bytes`; then
+    `{"done": true, "gone": [known ids that no longer exist]}`."""
+    present: set[str] = set()
+    for file_id, path, size, mtime in transcript_files(home):
+        present.add(file_id)
+        if mtime < since_ms or known.get(file_id) == (size, mtime):
+            continue
+        if size > max_bytes:
+            yield {"file": file_id, "size": size, "mtime": mtime, "skipped": True}
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as handle:
+                project, records = parse_transcript(handle, size)
+        except OSError:
+            continue
+        yield {"file": file_id, "size": size, "mtime": mtime, "project": project, "records": len(records)}
+        yield from records
+    yield {"done": True, "gone": sorted(set(known) - present)}
+
+
+def verb_usage(policy: Policy, env: dict[str, str], args: list[str], stdin: object) -> Iterator[dict[str, object]]:
+    """Checks the request now; the returned iterator reads the transcripts while it is written out."""
+    if not policy.allow_usage:
+        raise RefusedError("not_allowed")
+    known = read_usage_known(stdin)
+    since_ms = int(args[0]) * 1000
+    max_bytes = int(args[1]) * 1024 * 1024
+    return usage_documents(claude_home(policy, env), since_ms, max_bytes, known)
+
+
+def respond(argv: list[str], env: dict[str, str], stdin: object = None) -> Iterator[dict[str, object]]:
+    """The response documents for one invocation: one document, or for a successful `usage` a header
+    document followed by the usage lines. Never raises for a bad request. `stdin` (bytes or a binary
+    file) is read only by `send` and `usage`."""
+    lines: Iterator[dict[str, object]] | None = None
     try:
         policy, tokens = resolve_request(argv, env)
         verb, args = validate_request(tokens)
@@ -840,18 +1101,29 @@ def handle(argv: list[str], env: dict[str, str], stdin: object = None) -> dict[s
             body = verb_list(policy, env)
         elif verb == "send":
             body = verb_send(policy, env, args, stdin)
+        elif verb == "usage":
+            lines = verb_usage(policy, env, args, stdin)
+            body = {"stream": "usage"}
         else:
             body = verb_capture(policy, env, args[0], int(args[1]))
     except RefusedError as refused:
-        return {"protocol": PROTOCOL, "ok": False, "error": refused.code}
+        yield {"protocol": PROTOCOL, "ok": False, "error": refused.code}
+        return
     response: dict[str, object] = {"protocol": PROTOCOL, "ok": True}
     response.update(body)
-    return response
+    yield response
+    if lines is not None:
+        yield from lines
+
+
+def handle(argv: list[str], env: dict[str, str], stdin: object = None) -> dict[str, object]:
+    """The (first) response document for one invocation. Never raises for a bad request."""
+    return next(respond(argv, env, stdin))
 
 
 def main() -> int:
-    response = handle(sys.argv[1:], dict(os.environ), sys.stdin.buffer)
-    sys.stdout.write(json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n")
+    for document in respond(sys.argv[1:], dict(os.environ), sys.stdin.buffer):
+        sys.stdout.write(json.dumps(document, ensure_ascii=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
     return 0
 

@@ -1,5 +1,5 @@
-"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher, audit (argparse;
-usage errors exit 2).
+"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher, audit, usage
+(argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -43,6 +43,10 @@ from .remote.speech import machine_line, unreachable_reason
 from .remote.transport import DISPATCHER_PATH, make_transport
 from .sessions import claude_home_dir
 from .tasks.manager import TaskManager, TaskManagerOptions, load_tasks
+from .usage.cache import HUB
+from .usage.compute import PERIOD_HELP, Grouping, PeriodError, parse_period
+from .usage.report import format_csv, format_table
+from .usage.service import ProjectProblem, UsageService, failure_reason, spoken_source
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -167,6 +171,15 @@ def build_parser() -> argparse.ArgumentParser:
     command("remote-dispatcher", "print the switchboard-remote dispatcher script, for installing it on a machine")
     audit = command("audit", "print the remote_send audit log (stateDir/audit.jsonl) as a table")
     audit.add_argument("--limit", type=_limit, metavar="N", help="only the last N lines (default: all)")
+    usage = command("usage", "active hours, billable amount and token cost per project, session or day")
+    usage.add_argument("--period", metavar="P", help=f"{PERIOD_HELP} (default: this month)")
+    usage.add_argument(
+        "--machine", metavar="M", help=f"only this machine ({HUB} for the server's own Claude Code home)"
+    )
+    usage.add_argument("--project", metavar="X", help="only this project (folder name)")
+    usage.add_argument("--by", choices=("project", "session", "day"), default="project", help="rows (default: project)")
+    usage.add_argument("--csv", action="store_true", help="CSV with a header row instead of a table")
+    usage.add_argument("--cached", action="store_true", help="use the cached records, do not read the machines")
     return parser
 
 
@@ -179,6 +192,11 @@ class ParsedArgs:
     pid_file: str | None = None
     machine: str | None = None
     limit: int | None = None
+    period: str | None = None
+    project: str | None = None
+    by: str = "project"
+    csv: bool = False
+    cached: bool = False
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -192,6 +210,11 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         pid_file=getattr(ns, "pid_file", None),
         machine=getattr(ns, "machine", None),
         limit=getattr(ns, "limit", None),
+        period=getattr(ns, "period", None),
+        project=getattr(ns, "project", None),
+        by=getattr(ns, "by", "project"),
+        csv=getattr(ns, "csv", False),
+        cached=getattr(ns, "cached", False),
     )
 
 
@@ -652,6 +675,54 @@ def _cmd_audit(config: Config, args: ParsedArgs, io: CliIo) -> int:
     return EXIT_OK
 
 
+async def _cmd_usage(config: Config, args: ParsedArgs, io: CliIo) -> int:
+    transports = {m.name: make_transport(m, config.remote, config.state_dir, io.env) for m in config.remote.machines}
+    service = UsageService(config, transports, silent_logger, env=io.env)
+    try:
+        period = parse_period(args.period, now_ms())
+    except PeriodError:
+        io.err(f"Unknown period {args.period}. Use {PERIOD_HELP}.\n")
+        return EXIT_USAGE
+    names = service.sources(args.machine)
+    if args.machine is not None and not names:
+        usable = ", ".join(service.sources()) or "none"
+        io.err(f"No machine called {args.machine} with usage reading on. Usable: {usable}.\n")
+        return EXIT_USAGE
+    if not names:
+        io.err("No machine has usage reading on.\n")
+        return EXIT_ERROR
+    outcomes = None
+    if not args.cached:
+        io.err(f"Reading usage records from {', '.join(spoken_source(n) for n in names)} ...\n")
+        outcomes = await service.refresh(names)
+    project = None
+    if args.project is not None:
+        found = service.match_project(names, args.project)
+        if isinstance(found, ProjectProblem):
+            known = ", ".join(found.candidates) or "none"
+            io.err(
+                f"{'Several projects match' if found.ambiguous else 'No project matches'} {args.project}: {known}.\n"
+            )
+            return EXIT_USAGE
+        project = found
+    by: Grouping = "session" if args.by == "session" else "day" if args.by == "day" else "project"
+    report, context = service.report(names, period, project=project, by=by)
+    notes = []
+    if context.skipped:
+        notes.append(f"{context.skipped} transcript(s) larger than usage.maxTranscriptMegabytes were skipped")
+    failed = [o for o in (outcomes or {}).values() if not o.ok]
+    notes += [
+        f"{spoken_source(o.name)} could not be read: {failure_reason(o)}; its cached records are used" for o in failed
+    ]
+    if args.csv:
+        io.out(format_csv(report))
+        for note in notes:
+            io.err(f"warning: {note}\n")
+    else:
+        io.out(format_table(report, notes))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
 def _cmd_remote_dispatcher(io: CliIo) -> int:
     with open(DISPATCHER_PATH, encoding="utf-8") as handle:
         io.out(handle.read())
@@ -703,6 +774,8 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
                 return await _cmd_remote_check(config, args, io)
             case "audit":
                 return _cmd_audit(config, args, io)
+            case "usage":
+                return await _cmd_usage(config, args, io)
     except Exception as err:
         io.err(f"Error: {err}\n")
         return EXIT_ERROR

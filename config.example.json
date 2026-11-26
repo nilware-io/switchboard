@@ -68,5 +68,13 @@
       "clientApproval": false
     }
   },
-  "watch": { "intervalSeconds": 0, "longTurnMinutes": 10, "notifyUnreachable": false, "includeQuestion": false }
+  "watch": { "intervalSeconds": 0, "longTurnMinutes": 10, "notifyUnreachable": false, "includeQuestion": false },
+  "usage": {
+    "idleGapMinutes": 15,
+    "hourlyRate": 40,
+    "currency": "EUR",
+    "overlap": "union",
+    "maxTranscriptMegabytes": 512,
+    "prices": {}
+  }
 }

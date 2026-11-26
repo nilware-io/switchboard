@@ -15,11 +15,17 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
+from ..usage.records import UsageBatch, UsageStreamError, parse_lines
+
 DISPATCHER_PROGRAM = "switchboard-remote"
-VERBS: tuple[str, ...] = ("version", "list", "capture", "send")
+VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage")
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_USAGE_RESPONSE_BYTES = 64 * 1024 * 1024
+"""The streamed answer of `usage` (JSON lines)."""
+USAGE_TIMEOUT_SECONDS = 120
+"""Wall clock of one `usage` call (background only)."""
 MAX_PANES = 512
 NAME_MAX = 64
 WAITING_MAX = 200
@@ -117,6 +123,17 @@ class SendResponse(_Response):
     """False for a permission answer: the choice number was typed, Enter was not pressed."""
 
 
+class UsageResponse(BaseModel):
+    """The parsed JSON lines of `usage` (built with `model_construct`, already checked)."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+    batch: UsageBatch
+
+
+def response_cap(verb: str) -> int:
+    return MAX_USAGE_RESPONSE_BYTES if verb == "usage" else MAX_RESPONSE_BYTES
+
+
 RESPONSE_MODELS: dict[str, type[_Response]] = {
     "version": VersionResponse,
     "list": ListResponse,
@@ -133,10 +150,14 @@ class ResponseError(ValueError):
         self.code = code
 
 
-def parse_response(verb: str, stdout: bytes) -> _Response | str:
+def parse_response(verb: str, stdout: bytes) -> BaseModel | str:
     """The response model, or the dispatcher's own error code (a refusal). Raises ResponseError."""
-    if len(stdout) > MAX_RESPONSE_BYTES:
+    if len(stdout) > response_cap(verb):
         raise ResponseError("bad_response")
+    rest: list[bytes] = []
+    if verb == "usage":
+        first, _, tail = stdout.lstrip().partition(b"\n")
+        stdout, rest = first, tail.split(b"\n")
     text = stdout.decode("utf-8", "replace").strip()
     try:
         data: Any = json.loads(text)
@@ -147,6 +168,13 @@ def parse_response(verb: str, stdout: bytes) -> _Response | str:
     if not data["ok"]:
         error = data.get("error")
         return error if isinstance(error, str) and ARG_RE.fullmatch(error) else "other"
+    if verb == "usage":
+        if data.get("stream") != "usage":
+            raise ResponseError("bad_response")
+        try:
+            return UsageResponse.model_construct(batch=parse_lines(rest))
+        except UsageStreamError:
+            raise ResponseError("bad_response") from None
     try:
         return RESPONSE_MODELS[verb].model_validate(data)
     except ValidationError:

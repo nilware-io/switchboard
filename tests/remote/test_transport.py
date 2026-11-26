@@ -75,7 +75,7 @@ async def test_capture_and_version(world: RemoteWorld) -> None:
     assert captured.data.text == "world\n"
     version = await t.call("version", timeout_seconds=10)
     assert isinstance(version.data, VersionResponse)
-    assert version.data.verbs == ["version", "list", "capture", "send"]
+    assert version.data.verbs == ["version", "list", "capture", "send", "usage"]
     gone = await t.call("capture", ["%2", "1"], timeout_seconds=10)
     assert (gone.ok, gone.error, gone.detail) == (False, "refused_by_policy", "gone")
 
