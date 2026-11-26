@@ -113,3 +113,53 @@ def numbered_draft(lines: int, *, boxed: bool) -> str:
         rows = ["─" * 32, *body, "─" * 32]
         status = "  ⏵⏵ accept edits on (shift+tab to cycle)"
     return "\n".join(["⏺ Done. All 41 tests pass.", "", *rows, status]) + "\n"
+
+
+DRAFT_EDGES = {
+    "boxed-empty-end": "\n".join(
+        [
+            "⏺ Done. All 41 tests pass.",
+            "",
+            "╭" + "─" * 30 + "╮",
+            f"│ {'> 1. fix the parser'.ljust(28)} │",
+            f"│ {'  2. update tests'.ljust(28)} │",
+            f"│ {''.ljust(28)} │",
+            "╰" + "─" * 30 + "╯",
+            "  ? for shortcuts",
+        ]
+    )
+    + "\n",
+    "rules-empty-end": "\n".join(
+        [
+            "⏺ Done. All 41 tests pass.",
+            "",
+            "─" * 32,
+            "> 1. fix the parser",
+            "  2. update tests",
+            "",
+            "─" * 32,
+            "  ⏵⏵ accept edits on (shift+tab to cycle)",
+        ]
+    )
+    + "\n",
+    "quote-line": "\n".join(
+        [
+            "⏺ Done. All 41 tests pass.",
+            "",
+            "─" * 32,
+            "> notes",
+            "> 1. fix the parser",
+            "  2. update tests",
+            "─" * 32,
+            "  ? for shortcuts",
+        ]
+    )
+    + "\n",
+}
+"""Numbered drafts in Claude Code's input box that an older `_input_box` missed: one ending in an
+empty line (shift+enter at the end) in a rounded box and between two rules, and one whose options
+follow a markdown quote line (`> notes`)."""
+
+SHELL_MENU = "$ ./deploy.sh\nWhere should it go?\n  1. Staging\n❯ 2. Production\nuser@box:~/proj$ "
+"""Untrusted shell output that looks like a menu, with the shell prompt under it (read as option 2's
+description)."""

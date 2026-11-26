@@ -39,8 +39,10 @@ from .dispatcher import (
     SEND_ANSWER,
     SEND_CHECK_LINES,
     SEND_MESSAGE,
+    bound_menu_hash,
     dialog_bound,
     keys_problem,
+    shows_draft,
     shows_picker,
 )
 from .inventory import Inventory, resolve_machine
@@ -66,7 +68,6 @@ from .send import (
     chosen_option,
     dialog_hash,
     key_words,
-    menu_hash,
     normalize_text,
     parse_keys,
     shows_dialog,
@@ -114,6 +115,10 @@ _SPOKEN_KEYS = key_words(
 KEYS_ORDER_REFUSAL = (
     "I press a number, enter, escape, y or n only as the last key: anything after it would land on "
     "the next screen, which I have not read. Ask for the rest once I have read that screen."
+)
+KEYS_ANSWER_ORDER_REFUSAL = (
+    "In a permission question, tab and shift tab can choose an answer themselves, so I press them only "
+    "as the last key: anything after them would land on the next screen, which I have not read."
 )
 KEYS_REFUSAL = {
     "empty": f"Which keys should I press? I can press {_SPOKEN_KEYS}.",
@@ -631,11 +636,27 @@ class RemoteTools:
                     "dialog_not_visible",
                 )
             # Prose that looks like a dialog ("Do you want to ...?" above an idle input box) has no
-            # answer options at the bottom: the dispatcher applies the unbound rules there too.
-            unbound = not dialog_bound(captured.text)
+            # answer options at the bottom, and shell output may print any dialog: the dispatcher
+            # applies the unbound rules there too.
+            unbound = not dialog_bound(captured.text, claude_pane=claude is not None)
+            if not unbound and keys_problem(parsed, menu_bound=True, answer=True) == "key_order":
+                # Shift+Tab is itself a choice in Claude Code's edit dialog (allow all edits this
+                # session) and closes it; a key after it would answer a queued dialog nobody heard.
+                # The dispatcher refuses the same (`key_order`). Unbound, `mode_keys` refuses them.
+                return refuse(KEYS_ANSWER_ORDER_REFUSAL, "key_order")
         else:
-            bound = menu_hash(captured.text)
+            # In a shell pane only a menu under a picker footer binds: shell output can print a fake
+            # menu above its prompt, where Up Enter reruns the previous command.
+            bound = bound_menu_hash(captured.text, claude_pane=claude is not None)
             unbound = bound is None
+            if bound is not None and shows_draft(captured.text) and not shows_picker(captured.text):
+                # A "menu" over a draft without a picker footer may be the draft's own lines. The
+                # dispatcher refuses the same (`draft_present`).
+                return refuse(
+                    f"Something is already typed in the input of {place}, so I will not press keys there. "
+                    "Send or clear it at the keyboard first.",
+                    "draft_present",
+                )
             question = (menu.question if menu is not None else None) or (
                 ask.text if ask is not None and ask.kind == "question" else None
             )
@@ -677,6 +698,10 @@ class RemoteTools:
                     "press them. Tell me the message instead.",
                     "history_submit",
                 )
+        if unbound:
+            # The keys land at an input, not at the menu find_menu may still read there (shell
+            # output, prose above the input): no option is read back as chosen.
+            menu = None
         # Also for a permission dialog: find_menu reads its options, so the owner hears which one.
         chosen = chosen_option(menu, parsed)
         context = question

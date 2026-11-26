@@ -393,17 +393,24 @@ def _input_line(lines: list[str], index: int) -> bool:
 
 
 def _input_box(lines: list[str], first: int, last: int) -> bool:
-    """Options `lines[first]`..`lines[last]` enclosed by a border right above and right below, the
-    first of them starting with an input prompt (`❯`, `>`): a multi-line Claude Code input draft such
-    as `> 1. fix the parser` / `2. update tests`, never a menu (no picker footer is under an input
-    box, only its status line)."""
-    return (
-        first > 0
-        and last + 1 < len(lines)
-        and lines[first].startswith(_INPUT_PROMPTS)
-        and _BORDER_RE.fullmatch(lines[first - 1]) is not None
-        and _BORDER_RE.fullmatch(lines[last + 1]) is not None
-    )
+    """Options `lines[first]`..`lines[last]` (`last` the last option or description line) inside a
+    box: a border under `last` with only empty lines between (a draft ending in an empty line), and
+    a border above `first` whose first non-empty line under it starts with an input prompt (`❯`,
+    `>`). That is a multi-line Claude Code input draft such as `> 1. fix the parser` / `2. update
+    tests`, or one whose options follow a prompt line (`> notes` / `> 1. fix the parser` / `2. update
+    tests`), never a menu (no picker footer is under an input box, only its status line)."""
+    below = last + 1
+    while below < len(lines) and not lines[below]:
+        below += 1
+    if below >= len(lines) or _BORDER_RE.fullmatch(lines[below]) is None:
+        return False
+    top = first - 1
+    while top >= 0 and _BORDER_RE.fullmatch(lines[top]) is None:
+        top -= 1
+    if top < 0:
+        return False
+    opening = next(line for line in lines[top + 1 : first + 1] if line)
+    return opening.startswith(_INPUT_PROMPTS)
 
 
 def _numbered_options(
@@ -533,9 +540,10 @@ def find_menu(screen: str) -> dict[str, object] | None:
     between options, MENU_GAP_LINES_PICKER under a picker footer) with only borders, empty lines,
     Claude Code's input status line (INPUT_STATUS_RE, skipped) and key hints (MENU_FOOTER_RE) below
     it, and either a selection marker or key hints; a marked line alone between two borders is an
-    input box (a draft such as `❯ 2. fix it`), never an option, and so are options between two
-    borders whose first line starts with an input prompt without a picker footer (a multi-line draft
-    `> 1. fix the parser` / `2. update tests`, `_input_box`); or, under a
+    input box (a draft such as `❯ 2. fix it`), never an option, and so are options inside a box
+    whose first line starts with an input prompt without a picker footer (a multi-line draft
+    `> 1. fix the parser` / `2. update tests`, also ending in an empty line or under a `> notes`
+    line, `_input_box`); or, under a
     picker footer (up/down plus enter or esc hints), a block of up to MENU_PLAIN_OPTIONS lines
     without numbers, exactly one of them selection-marked (`numbered` False; the options are then
     numbered by position and a digit key does not choose them). Prose with a numbered list above an
@@ -555,14 +563,17 @@ def shows_picker(screen: str) -> bool:
     return _picker_footer(_menu_footer(_menu_lines(screen))[0])
 
 
-def dialog_bound(screen: str) -> bool:
+def dialog_bound(screen: str, claude_pane: bool = True) -> bool:
     """A permission dialog's answer options are at the bottom of the screen: `dialog_hash` sees a
     dialog, `find_menu` reads a menu there (numbered options with nothing but borders, the input
     status line and key hints under them), and the line `shows_dialog` recognised is part of that
     menu (its question or an option). Assistant prose that starts a line with "Do you want to ...?"
     or lists "1. Yes ... 2. No" above an idle input box is no bound dialog: in `answer` mode keys
     then follow the rules without a bound menu (`keys_problem` with `menu_bound` False, no picker
-    footer, no draft, no vim normal mode)."""
+    footer, no draft, no vim normal mode). In a pane without Claude Code (`claude_pane` False) only
+    a dialog under a picker footer binds: shell output can print any dialog text."""
+    if not claude_pane and not shows_picker(screen):
+        return False
     tail = _screen_tail(screen)
     anchor = _dialog_anchor(tail)
     if anchor is None:
@@ -577,14 +588,16 @@ def dialog_bound(screen: str) -> bool:
     return tail[anchor] in lines[first : last + 1]
 
 
-def keys_problem(keys: list[str], menu_bound: bool) -> str | None:
+def keys_problem(keys: list[str], menu_bound: bool, answer: bool = False) -> str | None:
     """Why a `keys` request may not be pressed as it is, or None; the hub runs the same function
     before it reads back. A FINAL_KEYS key (a choice, Enter, Escape, y, n) may only be the last key
     (`key_order`): what follows it would land on whatever screen the choice opens, which nobody
-    checked. Without a bound menu or permission dialog (`menu_bound` False), no MODE_KEYS
+    checked. In a permission dialog (`answer` True) the MODE_KEYS are final too: Shift+Tab is itself
+    a choice in Claude Code's edit dialog ("allow all edits during this session") and closes it, so
+    a key after it would answer a queued dialog nobody heard or submit a draft. Without a bound menu or permission dialog (`menu_bound` False), no MODE_KEYS
     (`mode_keys`) and no HISTORY_KEYS before Enter (`history_submit`: that recalls and submits an
     earlier prompt or shell command nobody heard)."""
-    if any(key in FINAL_KEYS for key in keys[:-1]):
+    if any(key in FINAL_KEYS or (answer and key in MODE_KEYS) for key in keys[:-1]):
         return "key_order"
     if not menu_bound:
         if any(key in MODE_KEYS for key in keys):
@@ -608,6 +621,16 @@ def menu_hash(screen: str) -> str | None:
     assert isinstance(last, int)
     block = "\n".join(" ".join(clean_text(line, 400).split()) for line in lines[first : last + 1] if line)
     return hashlib.sha256(block.encode("utf-8")).hexdigest()[:24]
+
+
+def bound_menu_hash(screen: str, claude_pane: bool) -> str | None:
+    """`menu_hash` as `keys` binds to it: in a pane without Claude Code (`claude_pane` False) only a
+    menu under a picker footer (`shows_picker`) binds, None otherwise. Shell output ending in
+    `1. Yes` / `❯ 2. No` above the shell prompt (read as an option's description) is no menu: Up
+    Enter there reruns the previous command. Hub and dispatcher run this same function."""
+    if not claude_pane and not shows_picker(screen):
+        return None
+    return menu_hash(screen)
 
 
 # --- options and policy ----------------------------------------------------------------------
@@ -1203,8 +1226,12 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
     (`dialog_bound` False: prose that looks like a dialog) the unbound rules apply as in `menu none`; `answer none` (a permission wait only the registry shows, no dialog
     on the screen to bind to) is refused whatever the keys (`dialog_not_visible`). Without a bound
     menu, a screen with a picker footer is refused (`menu_unreadable`). `keys_problem` limits the
-    order of the keys (`key_order`, `mode_keys`, `history_submit`), and every check runs before the
-    one `send-keys`, so a key that ends the selection is the last one pressed."""
+    order of the keys (`key_order`, `mode_keys`, `history_submit`; in `answer` mode Tab and Shift+Tab
+    count as final keys too), and every check runs before the one `send-keys`, so a key that ends the
+    selection is the last one pressed. In `menu` mode a bound menu with a draft on the screen and no
+    picker footer is refused (`draft_present`: the options may be the draft's own lines), and in a
+    pane without Claude Code only a menu under a picker footer binds (`bound_menu_hash`), so shell
+    output that looks like a menu gets the unbound rules."""
     if not policy.allow_send:
         raise RefusedError("not_allowed")
     pane_id, pane_pid, session_id, mode, bound = args[:5]
@@ -1214,7 +1241,7 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
         # entry, or a dialog shows_dialog cannot see) may show an input box, where Enter submits a
         # draft, Up Enter an earlier prompt and Shift+Tab cycles the permission mode: nothing goes in.
         raise RefusedError("dialog_not_visible")
-    problem = keys_problem(keys, menu_bound=bound != NO_MENU)
+    problem = keys_problem(keys, menu_bound=bound != NO_MENU, answer=mode == SEND_ANSWER)
     if problem is not None:
         raise RefusedError(problem)
     pane, entry, screen = _send_state(policy, env, pane_id)
@@ -1230,7 +1257,7 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
             raise RefusedError("permission_prompt")
         if not asks or (dialog_hash(screen) or NO_DIALOG) != bound:
             raise RefusedError("dialog_changed")
-        if not dialog_bound(screen):
+        if not dialog_bound(screen, claude_pane=entry is not None):
             # The dialog hash matched prose ("Do you want to ...?" above an idle input box), not
             # answer options at the bottom: the keys land at an input, so the unbound rules apply.
             problem = keys_problem(keys, menu_bound=False)
@@ -1245,9 +1272,13 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
     elif asks:
         raise RefusedError("permission_prompt")
     else:
-        current = menu_hash(screen)
+        current = bound_menu_hash(screen, claude_pane=entry is not None)
         if (current or NO_MENU) != bound:
             raise RefusedError("menu_changed")
+        if current is not None and shows_draft(screen) and not shows_picker(screen):
+            # Defence in depth: a "menu" without a picker footer over a draft in the input box may be
+            # the draft's own numbered lines, where Enter submits it and Shift+Tab cycles the mode.
+            raise RefusedError("draft_present")
         if current is None and shows_picker(screen):
             raise RefusedError("menu_unreadable")
         if current is None and entry is not None:

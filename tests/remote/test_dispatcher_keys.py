@@ -16,8 +16,11 @@ import pytest
 
 from tests.remote.helpers import DISPATCHER, SESSION_A, SESSION_B, RemoteWorld, pane
 from tests.remote.menu_fixtures import (
+    DRAFT_EDGES,
+    FOOTER,
     PROSE_DIALOG,
     PROSE_YES_NO,
+    SHELL_MENU,
     capture,
     described_menu_lines,
     menu_lines,
@@ -309,7 +312,7 @@ def test_answer_mode_presses_only_into_the_dialog_on_the_screen(world: RemoteWor
     world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
     world.register("2001", os.getpid(), sessionId=SESSION_A, status="waiting", waitingFor="permission", tmux="0:@0.%1")
     allowed = [*FORCED, "--allow-permission-answers"]
-    for names in ("Up Enter", "BTab BTab BTab", "Enter"):
+    for names in ("Up Enter", "Down BTab", "Enter"):
         assert keys(world, *names.split(), bound=f"answer {DIALOG_HASH}", forced=allowed)["error"] == "dialog_changed"
     assert pressed(world) == []
 
@@ -518,7 +521,7 @@ def test_answer_mode_on_prose_that_looks_like_a_dialog_follows_the_unbound_rules
     world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
     answer = f"answer {bound}"
     assert keys(world, "Up", "Enter", bound=answer, forced=allowed)["error"] == "history_submit"
-    assert keys(world, "BTab", "BTab", bound=answer, forced=allowed)["error"] == "mode_keys"
+    assert keys(world, "Down", "BTab", bound=answer, forced=allowed)["error"] == "mode_keys"
     assert keys(world, "Tab", bound=answer, forced=allowed)["error"] == "mode_keys"
     assert pressed(world) == []
     # A draft or vim normal mode in the input box under the prose: refused as without a menu.
@@ -583,3 +586,99 @@ def test_a_menu_taller_than_a_24_row_alternate_pane_is_unreadable() -> None:
     menu = d.find_menu(whole)
     assert menu is not None
     assert len(menu["options"]) == 12  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("case", list(DRAFT_EDGES))
+def test_numbered_drafts_with_an_empty_last_line_or_a_quote_line_are_no_menu(world: RemoteWorld, case: str) -> None:
+    """A draft ending in an empty line (the box border is not directly under the last option) or one
+    whose options follow a `> notes` line (no border directly above option 1): still the input box,
+    so Shift+Tab, Enter and Up Enter get the unbound rules."""
+    screen = DRAFT_EDGES[case]
+    assert d.shows_draft(screen) is True
+    assert d.find_menu(screen) is None
+    assert d.menu_hash(screen) is None
+    assert d.keys_problem(["BTab", "BTab", "BTab"], menu_bound=False) == "mode_keys"
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
+    assert keys(world, "BTab", "BTab", "BTab", bound="menu none")["error"] == "mode_keys"
+    assert keys(world, "Enter", bound="menu none")["error"] == "draft_present"
+    assert keys(world, "Up", "Enter", bound="menu none")["error"] == "history_submit"
+    assert keys(world, "Enter", bound=f"menu {'0' * 24}")["error"] == "menu_changed"
+    assert pressed(world) == []
+
+
+def test_a_menu_without_a_picker_footer_over_a_draft_is_refused(world: RemoteWorld) -> None:
+    """Defence in depth: whatever `find_menu` reads, a bound menu without a picker footer while
+    `shows_draft` sees a draft is refused (`draft_present`); under a picker footer it is pressed."""
+    lines = menu_lines()
+    assert lines[-1] == FOOTER
+    bare = capture(lines[:-1], rows=30, alternate=True)
+    assert d.find_menu(bare) is not None
+    assert d.shows_draft(bare) is True
+    assert d.shows_picker(bare) is False
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": bare})
+    assert keys(world, "Enter", bound=f"menu {d.menu_hash(bare)}")["error"] == "draft_present"
+    assert pressed(world) == []
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": MENU})
+    assert keys(world, "Enter")["ok"] is True
+
+
+@pytest.mark.parametrize("names", ["BTab Enter", "BTab 1", "Tab Enter", "BTab BTab", "Tab y", "Down BTab Enter"])
+def test_tab_and_shift_tab_end_a_permission_answer(world: RemoteWorld, names: str) -> None:
+    """Shift+Tab is a choice in Claude Code's edit dialog ("allow all edits during this session") and
+    closes it: a key after it would answer a queued dialog nobody heard or submit a draft."""
+    forced = [*FORCED, "--allow-permission-answers"]
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})
+    assert d.keys_problem(names.split(), menu_bound=True, answer=True) == "key_order"
+    assert d.keys_problem(names.split(), menu_bound=True) in (None, "key_order")
+    assert keys(world, *names.split(), bound=f"answer {DIALOG_HASH}", forced=forced)["error"] == "key_order"
+    assert pressed(world) == []
+    # As the last key it still goes.
+    assert keys(world, "Down", "BTab", bound=f"answer {DIALOG_HASH}", forced=forced)["ok"] is True
+    assert pressed(world) == [["send-keys", "-t", "%1", "Down", "BTab"]]
+
+
+def test_shell_output_that_looks_like_a_menu_does_not_bind(world: RemoteWorld) -> None:
+    """In a pane without Claude Code only a menu under a picker footer binds: shell output ending in
+    a numbered list above the prompt is read by `find_menu`, but Up Enter there reruns the previous
+    command, so the unbound rules hold."""
+    forced = [*FORCED, "--send-to-any-pane"]
+    assert d.find_menu(SHELL_MENU) is not None
+    assert d.menu_hash(SHELL_MENU) is not None
+    assert d.bound_menu_hash(SHELL_MENU, claude_pane=False) is None
+    assert d.bound_menu_hash(SHELL_MENU, claude_pane=True) == d.menu_hash(SHELL_MENU)
+    world.set_panes(
+        [pane("fpga", "%2", SHELL_PID, window_index=1, window_name="shell", command="bash")], {"%2": SHELL_MENU}
+    )
+    base = f"keys %2 {SHELL_PID} none menu"
+    assert call(world, f"{base} {d.menu_hash(SHELL_MENU)} Up Enter", forced)["error"] == "menu_changed"
+    assert call(world, f"{base} {d.menu_hash(SHELL_MENU)} Enter", forced)["error"] == "menu_changed"
+    assert call(world, f"{base} none Up Enter", forced)["error"] == "history_submit"
+    assert call(world, f"{base} none BTab", forced)["error"] == "mode_keys"
+    assert pressed(world) == []
+    # A real picker in a shell pane (a TUI) still binds.
+    picker = SHELL_MENU.replace("user@box:~/proj$ ", "  ↑/↓ choose · enter confirm · esc cancel\n")
+    bound = d.bound_menu_hash(picker, claude_pane=False)
+    assert bound is not None
+    world.set_panes(
+        [pane("fpga", "%2", SHELL_PID, window_index=1, window_name="shell", command="bash")], {"%2": picker}
+    )
+    assert call(world, f"{base} {bound} Up Enter", forced)["ok"] is True
+
+
+def test_shell_output_that_looks_like_a_dialog_is_not_bound(world: RemoteWorld) -> None:
+    """The same for a permission answer: shell output `Should I continue?` / `1. Yes` / `❯ 2. No`
+    above the prompt is no bound dialog, so Up Enter is refused as without a menu."""
+    screen = "$ ./deploy.sh\nShould I continue?\n  1. Yes\n❯ 2. No\nuser@box:~/proj$ "
+    bound = d.dialog_hash(screen)
+    assert bound is not None
+    assert d.dialog_bound(screen) is True
+    assert d.dialog_bound(screen, claude_pane=False) is False
+    forced = [*FORCED, "--send-to-any-pane", "--allow-permission-answers"]
+    world.set_panes(
+        [pane("fpga", "%2", SHELL_PID, window_index=1, window_name="shell", command="bash")], {"%2": screen}
+    )
+    base = f"keys %2 {SHELL_PID} none answer {bound}"
+    assert call(world, f"{base} Up Enter", forced)["error"] == "history_submit"
+    assert call(world, f"{base} Down BTab", forced)["error"] == "mode_keys"
+    assert pressed(world) == []

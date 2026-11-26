@@ -15,11 +15,13 @@ import pytest
 from tests.helpers import read_records
 from tests.remote.helpers import SESSION_A, RemoteWorld, pane
 from tests.remote.menu_fixtures import (
+    DRAFT_EDGES,
     FOOTER,
     OPTIONS,
     PROSE_DIALOG,
     PROSE_YES_NO,
     QUESTION,
+    SHELL_MENU,
     TALL_QUESTION,
     capture,
     described_menu_lines,
@@ -929,3 +931,110 @@ async def test_a_cut_menu_offers_a_resize_and_its_keys_refusal_names_it(make: Ma
             "Ask me what its screen says, or answer it at the keyboard."
         )
     assert len(ctx.tools.confirmations) == 0
+
+
+@pytest.mark.parametrize("case", list(DRAFT_EDGES))
+async def test_numbered_drafts_with_an_empty_last_line_or_a_quote_line_are_no_menu_to_the_hub(
+    make: Make, case: str
+) -> None:
+    ctx = await make()
+    show(ctx, DRAFT_EDGES[case], status="idle")
+    text, error = await prepare(ctx, ["BTab", "BTab", "BTab"])
+    assert error
+    assert text.startswith("There is no menu on the screen of fpga on dev; tab and shift tab")
+    text, error = await prepare(ctx, ["Up", "Enter"])
+    assert error
+    assert "up or down and then enter" in text
+    readback, error = await prepare(ctx, ["Enter"])
+    assert not error
+    assert "I see no menu on its screen." in readback
+    assert "fix the parser" not in readback
+    assert "That should choose" not in readback
+    ctx.later()
+    assert await ctx.confirm("4172") == ("Not pressed: something is already typed in that session's input.", True)
+    assert pressed(ctx) == []
+
+
+async def test_a_menu_without_a_picker_footer_over_a_draft_is_refused_by_the_hub(make: Make) -> None:
+    lines = menu_lines()
+    assert lines[-1] == FOOTER
+    show(ctx := await make(), capture(lines[:-1], rows=30, alternate=True))
+    assert await prepare(ctx, ["Enter"]) == (
+        "Something is already typed in the input of fpga on dev, so I will not press keys there. "
+        "Send or clear it at the keyboard first.",
+        True,
+    )
+    assert len(ctx.tools.confirmations) == 0
+    assert keys_calls(ctx) == []
+
+
+EDIT_DIALOG = (
+    "╭──────────────────────────────────────────────────────────╮\n"
+    "│ Edit file                                                │\n"
+    "│   src/parser.py                                          │\n"
+    "│ Do you want to make this edit to parser.py?              │\n"
+    "│ ❯ 1. Yes                                                 │\n"
+    "│   2. Yes, allow all edits during this session (shift+tab) │\n"
+    "│   3. No, and tell Claude what to do differently (esc)    │\n"
+    "╰──────────────────────────────────────────────────────────╯\n"
+)
+
+
+@pytest.mark.parametrize("names", [["BTab", "Enter"], ["BTab", "1"], ["Tab", "Enter"], ["Down", "BTab", "y"]])
+async def test_tab_and_shift_tab_end_a_permission_answer_on_the_hub(make: Make, names: list[str]) -> None:
+    """Shift+Tab chooses "allow all edits during this session" in Claude Code's edit dialog and
+    closes it: the Enter or 1 after it would answer a queued dialog nobody heard."""
+    ctx = await make(dev={"allowPermissionAnswers": True})
+    ctx.world.configure(forced=[*FORCED, "--allow-permission-answers"])
+    show(ctx, EDIT_DIALOG, waiting_for="permission prompt")
+    text, error = await prepare(ctx, names)
+    assert error
+    assert text.startswith("In a permission question, tab and shift tab can choose an answer themselves")
+    assert len(ctx.tools.confirmations) == 0
+    assert keys_calls(ctx) == []
+    # As the last key it is read back.
+    _, error = await prepare(ctx, ["Down", "BTab"])
+    assert not error
+
+
+def show_shell(ctx: Ctx, text: str) -> None:
+    ctx.world.set_panes(
+        [
+            pane("fpga", "%1", CLAUDE_PID, command="claude"),
+            pane("fpga", "%2", 9_200_002, window_index=1, window_name="shell", command="bash"),
+        ],
+        {"%1": EMPTY_BOX, "%2": text},
+    )
+
+
+async def test_shell_output_that_looks_like_a_menu_does_not_bind_on_the_hub(make: Make) -> None:
+    """Shell output ending in a numbered list above the prompt: no bound menu (the prompt would be
+    read as option 2's description), so Up Enter is refused and no option is read back as chosen."""
+    ctx = await make(dev={"sendToAnyPane": True})
+    ctx.world.configure(forced=[*FORCED, "--send-to-any-pane"])
+    show_shell(ctx, SHELL_MENU)
+    text, error = await prepare(ctx, ["Up", "Enter"], target="fpga:1")
+    assert error
+    assert "up or down and then enter" in text
+    text, error = await prepare(ctx, ["BTab"], target="fpga:1")
+    assert error
+    assert "tab and shift tab" in text
+    readback, error = await prepare(ctx, ["1"], target="fpga:1")
+    assert not error
+    assert "That should choose" not in readback
+    assert "Staging" not in readback
+    ctx.later()
+    assert await ctx.confirm("4172", risky_ok=True) == ("Pressed 1 in fpga window 1 on dev.", False)
+    assert keys_calls(ctx) == ["switchboard-remote keys %2 9200002 none menu none 1"]
+
+
+async def test_shell_output_that_looks_like_a_dialog_does_not_bind_on_the_hub(make: Make) -> None:
+    ctx = await make(dev={"sendToAnyPane": True, "allowPermissionAnswers": True})
+    ctx.world.configure(forced=[*FORCED, "--send-to-any-pane", "--allow-permission-answers"])
+    show_shell(ctx, "$ ./deploy.sh\nShould I continue?\n  1. Yes\n❯ 2. No\nuser@box:~/proj$ ")
+    text, error = await prepare(ctx, ["Up", "Enter"], target="fpga:1")
+    assert error
+    assert "up or down and then enter" in text
+    readback, error = await prepare(ctx, ["Enter"], target="fpga:1")
+    assert not error
+    assert "That should choose" not in readback
