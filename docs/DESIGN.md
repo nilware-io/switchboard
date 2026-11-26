@@ -20,6 +20,8 @@ VPS mode: phone, Claude app (voice) -> Anthropic -> HTTPS (Caddy, Let's Encrypt)
 
 Single owner, single process, state in JSON files under `stateDir`.
 
+The Switchboard additions of this fork (Linux workstation mode, remote tmux sessions over SSH, notification watcher, usage) are designed in [SWITCHBOARD.md](SWITCHBOARD.md); their behavior moves into this file milestone by milestone as it is implemented.
+
 ## Stack
 
 - Python 3.12 (`.python-version`), managed with uv. Exact versions in `pyproject.toml` and `uv.lock`; `[tool.uv] exclude-newer = "14 days"` keeps resolution to releases at least two weeks old (the same cooldown as Dependabot). Dependabot relocks with uv and so cannot propose security fixes younger than 14 days either (dependabot-core#16984); an urgent fix gets a per-package `exclude-newer-package` override and a manual `uv lock --upgrade-package`, see [REFERENCE.md](REFERENCE.md#dependency-updates). Build backend `uv_build`.

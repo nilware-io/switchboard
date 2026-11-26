@@ -30,3 +30,6 @@ state/
 CLAUDE.local.md
 /config.json
 .claude/settings.local.json
+
+# Agent scratch and notes
+agents/
