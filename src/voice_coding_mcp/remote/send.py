@@ -102,8 +102,11 @@ class RiskClassifier:
         self._custom = [re.compile(pattern, re.I) for pattern in extra_patterns]
 
     def _matches(self, text: str) -> list[str]:
-        codes = [rule.code for rule in RISKY if rule.pattern.search(text)]
-        if any(pattern.search(text) for pattern in self._custom):
+        # Also the NFKC form: fullwidth or other compatibility letters ("ｐｕｓｈ") read as the plain
+        # word to Claude Code, so they must not slip past the English patterns.
+        forms = (text, unicodedata.normalize("NFKC", text))
+        codes = [rule.code for rule in RISKY if any(rule.pattern.search(form) for form in forms)]
+        if any(pattern.search(form) for pattern in self._custom for form in forms):
             codes.append(CUSTOM)
         return codes
 

@@ -162,6 +162,7 @@ def test_malformed_and_overlong_lines_are_skipped(home: Path) -> None:
         [
             "{not json",
             "[1, 2]",
+            '{"usage": ' + "[" * 200_000 + "]" * 200_000 + "}",
             long_line,
             json.dumps(assistant(T0 + MIN, "msg_ok")),
             json.dumps({**user(T0 + 2 * MIN), "timestamp": "yesterday"}),

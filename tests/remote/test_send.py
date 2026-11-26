@@ -112,6 +112,23 @@ def test_custom_patterns_add_to_the_builtin_list() -> None:
     assert risk.classify("push it", question=None, echoed=False, permission_answer=False, shell=False) == ["push"]
 
 
+def test_compatibility_letters_do_not_hide_a_risky_word() -> None:
+    risk = RiskClassifier([r"\bnasadit\b"])
+    assert risk.classify(
+        "git \uff50\uff55\uff53\uff48 now", question=None, echoed=False, permission_answer=False, shell=False
+    ) == ["push"], "fullwidth letters: NFKC turns them into the plain word"
+    assert risk.classify(
+        "\uff4e\uff41\uff53\uff41\uff44\uff49\uff54", question=None, echoed=False, permission_answer=False, shell=False
+    ) == ["custom"]
+    assert risk.classify(
+        "ok",
+        question="Should I \uff44\uff45\uff50\uff4c\uff4f\uff59?",
+        echoed=False,
+        permission_answer=False,
+        shell=False,
+    ) == ["question:deploy"]
+
+
 def test_context_makes_harmless_words_risky() -> None:
     risk = RiskClassifier()
     reasons = risk.classify("yes", question="Should I push to main?", echoed=True, permission_answer=True, shell=True)
