@@ -51,6 +51,8 @@ RESET_AFTER_SECONDS = 60.0
 """A connection that stayed up this long starts the backoff from INITIAL_DELAY again."""
 KILL_GRACE_SECONDS = 2.0
 POLL_SECONDS = 0.1
+DISPATCHER_GRACE_SECONDS = 1.0
+"""How long the dispatcher may take to exit on its own after ssh ended."""
 STDERR_TAIL_BYTES = 2048
 EXIT_REPLACED = 75
 """The dispatcher's exit code after the hub replaced this connection with a newer one."""
@@ -373,6 +375,11 @@ class Connector:
         reader.start()
         while ssh.poll() is None and dispatcher.poll() is None and not self.stopping.is_set():
             time.sleep(POLL_SECONDS)
+        if ssh.poll() is not None and not self.stopping.is_set():
+            # The relay exits right after forwarding a bye, so ssh can end before the dispatcher has
+            # read it: give the dispatcher a moment to exit with its own code (75 or 76).
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                dispatcher.wait(DISPATCHER_GRACE_SECONDS)
         stop_process(ssh)
         stop_process(dispatcher)
         reader.join(KILL_GRACE_SECONDS)

@@ -295,3 +295,25 @@ async def test_cli_usage_argument_errors(tmp_path: Path) -> None:
     assert "No machine called quiet with usage reading on" in io.stderr
     code, io = await run_cli("usage", "--config", path, "--by", "week", env=env)
     assert code == 2
+
+
+async def test_cli_usage_leaves_agent_machines_to_the_hub(tmp_path: Path) -> None:
+    # The CLI holds no agent connection: an agent machine is reported from its cache, with a note
+    # that is not a failure (the exit code stays 0).
+    world = RemoteWorld.create(tmp_path, forced=FORCED)
+    data = config_data(tmp_path, world)
+    data["remote"]["machines"] = [
+        machine("dev", world=world, sessions=["fpga"]),
+        {"name": "laptop", "transport": "agent", "sessions": ["fpga"], "allowUsage": True},
+    ]
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+    code, io = await run_cli("usage", "--config", str(path), "--period", "this month", "--csv", env=env)
+    assert code == 0, io.stderr
+    assert "Reading usage records from dev, this machine ..." in io.stderr
+    assert "warning: laptop connects to the hub, so only the hub reads it; its cached records are used" in io.stderr
+    assert "not connected" not in io.stderr
+    code, io = await run_cli("usage", "--config", str(path), "--machine", "laptop", env=env)
+    assert code == 0, io.stderr
+    assert "Reading" not in io.stderr

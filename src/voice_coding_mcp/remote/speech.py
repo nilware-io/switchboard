@@ -40,6 +40,9 @@ UNREACHABLE: dict[str, str] = {
 def unreachable_reason(error: TransportError | None, detail: str | None = None) -> str:
     if error == "refused_by_policy" and detail in ("no_policy", "bad_policy"):
         return "switchboard-remote there has no valid policy"
+    if error == "refused_by_policy" and detail == "busy":
+        # An agent machine still running earlier requests (a timed-out capture keeps its worker).
+        return "it is busy, try again in a moment"
     return UNREACHABLE.get(error or "other", UNREACHABLE["other"])
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import stat
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -21,6 +22,7 @@ from tests.remote.agent_helpers import (
     FakeMachine,
     agent_machine,
     agents_section,
+    frame,
     hello_frame,
     ok_doc,
     socket_dir,
@@ -30,6 +32,7 @@ from voice_coding_mcp.remote import agents as agents_module
 from voice_coding_mcp.remote.agents import AgentHub, control_request, lint_authorized_keys
 from voice_coding_mcp.remote.config import RemoteConfig
 from voice_coding_mcp.remote.protocol import CaptureResponse, ListResponse, VersionResponse
+from voice_coding_mcp.remote.speech import unreachable_reason, unreachable_sentence
 
 T0 = 1_764_160_000_000
 
@@ -42,6 +45,7 @@ class Env:
         self.clock = clock
         self.socket = str(directory / "hub.sock")
         self.machines: list[FakeMachine] = []
+        self.sockets: list[socket.socket] = []
 
     async def connect(self, machine: str = "laptop", **kwargs: Any) -> FakeMachine:
         fake = await FakeMachine.connect(self.socket, machine, **kwargs)
@@ -86,6 +90,8 @@ async def env() -> AsyncIterator[Env]:
         finally:
             for fake in context.machines:
                 fake.close()
+            for sock in context.sockets:
+                sock.close()
             await hub.stop()
 
 
@@ -379,6 +385,14 @@ async def test_frame_errors(env: Env, code: str, error: str) -> None:
     assert (result.error, result.detail) == (error, code)
 
 
+def test_a_busy_dispatcher_is_spoken_as_busy_not_refused() -> None:
+    # After timeouts the dispatcher may still run earlier requests and answer `busy`.
+    assert unreachable_sentence("laptop", "refused_by_policy", "busy") == (
+        "laptop is not reachable: it is busy, try again in a moment."
+    )
+    assert unreachable_reason("refused_by_policy", "gone") == "switchboard-remote refused the request"
+
+
 async def test_a_bad_document_is_bad_response(env: Env) -> None:
     fake = await env.connected()
     call = asyncio.create_task(env.transport().call("capture", ["%1", "10"], timeout_seconds=10))
@@ -523,6 +537,105 @@ async def test_pings_and_a_missed_pong_closes_the_connection(env: Env, monkeypat
     # No answer now: the hub gives up.
     await wait_until(lambda: env.hub.live("laptop") is None, seconds=5)
     assert "agent heartbeat missed" in env.messages()
+
+
+# --- a machine that stops reading ------------------------------------------------------------------
+
+BIG_INPUT = b"k" * 900_000
+"""More than the socket buffers between the hub and a FakeMachine that never reads hold."""
+
+
+async def stops_reading(env: Env, machine: str = "laptop") -> socket.socket:
+    """A machine that completes the handshake and then never reads its channel again (a plain
+    socket: a FakeMachine's StreamReader would keep reading into its buffer)."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.setblocking(False)
+    loop = asyncio.get_running_loop()
+    await loop.sock_connect(sock, env.socket)
+    await loop.sock_sendall(sock, frame({"t": "relay", "protocol": 1, "machine": machine, "peer": None}))
+    await loop.sock_sendall(sock, frame(hello_frame()))
+    welcome = b""
+    while not welcome.endswith(b"\n"):
+        welcome += await loop.sock_recv(sock, 1)
+    assert json.loads(welcome) == {"t": "welcome", "protocol": 1}
+    await wait_until(lambda: env.hub.live(machine) is not None)
+    env.sockets.append(sock)
+    return sock
+
+
+def last_close_reason(env: Env, machine: str = "laptop") -> str | None:
+    entry = next(m for m in env.hub.status()["machines"] if m["name"] == machine)
+    reason = entry["lastDisconnectReason"]
+    return reason if isinstance(reason, str) else None
+
+
+async def test_a_machine_that_stops_reading_is_closed_not_waited_for(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agents_module, "WRITE_STALL_SECONDS", 0.3)
+    await stops_reading(env)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await env.transport().call("usage", timeout_seconds=60, stdin=BIG_INPUT)
+    assert result.error == "disconnected"  # the request may have gone out in part
+    assert loop.time() - started < 5
+    await wait_until(lambda: last_close_reason(env) == "write_stalled", seconds=5)
+    assert "agent connection stopped reading" in env.messages()
+    assert (await env.transport().call("list", timeout_seconds=10)).error == "not_connected"
+
+
+async def test_a_stalled_write_still_ends_the_call_at_its_deadline(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The cancel after the deadline goes out in the background, so the caller is not held up.
+    monkeypatch.setattr(agents_module, "WRITE_STALL_SECONDS", 2.0)
+    await stops_reading(env)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await env.transport().call("usage", timeout_seconds=0.3, stdin=BIG_INPUT)
+    assert result.error == "timeout"
+    assert loop.time() - started < 1.5
+    await wait_until(lambda: last_close_reason(env) == "write_stalled", seconds=10)
+
+
+async def test_a_heartbeat_that_cannot_be_written_closes_the_connection(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(agents_module, "WRITE_STALL_SECONDS", 0.3)
+    monkeypatch.setattr(agents_module, "PONG_SECONDS", 60.0)
+    monkeypatch.setattr(agents_module.AgentConnection, "send_later", lambda self, frame: None)
+    env.hub.settings = env.hub.settings.model_copy(update={"heartbeat_seconds": 0.2})
+    await stops_reading(env)
+    # Fill the buffers with a request that times out; no cancel goes out (send_later is off), so
+    # only the heartbeat's ping can notice that the machine stopped reading.
+    assert (await env.transport().call("usage", timeout_seconds=0.2, stdin=BIG_INPUT)).error == "timeout"
+    await wait_until(lambda: last_close_reason(env) == "write_stalled", seconds=10)
+
+
+# --- unfinished handshakes ---------------------------------------------------------------------------
+
+
+async def test_unfinished_handshakes_are_limited_per_machine(env: Env) -> None:
+    waiting = [await env.connect("laptop", send_hello=False) for _ in range(2)]
+    await wait_until(lambda: env.hub._handshaking.get("laptop") == 2)
+    third = await env.connect("laptop", send_hello=False)
+    assert await third.closed() == [{"t": "bye", "reason": "protocol"}]
+    assert "agent connection refused: too many unfinished handshakes" in env.messages()
+    # Another machine still connects, and so does laptop once a waiting handshake finishes.
+    await env.connected("desk")
+    await waiting[0].send(hello_frame())
+    assert await waiting[0].read() == {"t": "welcome", "protocol": 1}
+    await wait_until(lambda: env.hub._handshaking.get("laptop") == 1)
+    await env.connected("laptop")
+
+
+async def test_binding_the_sockets_leaves_the_umask_alone(tmp_path: Path) -> None:
+    with socket_dir() as directory:
+        hub = AgentHub(remote_config(directory), str(directory), LogCapture().logger)
+        before = os.umask(0o022)
+        try:
+            await hub.start()
+            assert os.umask(0o022) == 0o022
+        finally:
+            os.umask(before)
+            await hub.stop()
+        assert hub.problem is None
 
 
 # --- control socket ------------------------------------------------------------------------------

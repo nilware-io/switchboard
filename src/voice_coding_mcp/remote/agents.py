@@ -47,6 +47,13 @@ MAX_IN_FLIGHT = 4
 PREAMBLE_SECONDS = 5.0
 HELLO_SECONDS = 10.0
 PONG_SECONDS = 10.0
+WRITE_STALL_SECONDS = 5.0
+"""Longest wait for the write lock and the drain of one frame. A machine that stops reading its
+channel fills the socket, relay and SSH buffers; the hub then closes the connection
+(`write_stalled`) instead of waiting forever. SSH keepalives cannot see this: they pass even when
+the channel window is never adjusted."""
+MAX_UNFINISHED_HANDSHAKES = 2
+"""Connections per machine still waiting for their hello, so one machine key cannot hold every slot."""
 FLAP_WINDOW_MS = 60_000
 FLAP_LIMIT = 3
 """More replacements of one machine than this within FLAP_WINDOW_MS log a warning."""
@@ -205,22 +212,37 @@ class AgentConnection:
         self._semaphore = asyncio.Semaphore(MAX_IN_FLIGHT)
         self._next_id = 0
         self._write_lock = asyncio.Lock()
+        self._background: set[asyncio.Task[bool]] = set()
 
     def new_id(self) -> int:
         self._next_id += 1
         return self._next_id
 
     async def send(self, frame: dict[str, Any]) -> bool:
+        """Writes one frame; False (and the connection closed) when it fails or does not drain
+        within WRITE_STALL_SECONDS."""
         if self.closed.is_set():
             return False
         try:
-            async with self._write_lock:
+            async with asyncio.timeout(WRITE_STALL_SECONDS), self._write_lock:
+                if self.closed.is_set():
+                    return False
                 self.writer.write(encode_frame(frame))
                 await self.writer.drain()
+        except TimeoutError:
+            self.hub.logger.warn("agent connection stopped reading", {"machine": self.machine})
+            await self.close("write_stalled")
+            return False
         except (ConnectionError, OSError, RuntimeError):
             await self.close("write_failed")
             return False
         return True
+
+    def send_later(self, frame: dict[str, Any]) -> None:
+        """`send` in the background, for frames sent after the caller's deadline (cancel)."""
+        task = asyncio.get_running_loop().create_task(self.send(frame))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     async def close(self, reason: str, *, bye: str | None = None) -> None:
         """Closes once: optionally a `bye` first, then every waiting request fails."""
@@ -235,6 +257,9 @@ class AgentConnection:
         self.closed.set()
         with contextlib.suppress(ConnectionError, OSError, RuntimeError):
             self.writer.close()
+            if self.writer.transport.get_write_buffer_size():
+                # close() would wait to flush buffers the machine never reads (write_stalled).
+                self.writer.transport.abort()
         for request in self._pending.values():
             request.queue.put_nowait(None)
 
@@ -332,14 +357,15 @@ class AgentConnection:
                         return failed("refused_by_policy" if code in NOT_RUN_ERRORS else "other", code)
                     size += length
                     if size > cap:
-                        await self.send({"t": "cancel", "id": request_id})
+                        self.send_later({"t": "cancel", "id": request_id})
                         return failed("bad_response")
                     docs.append(answer["doc"])
                     if not answer.get("more"):
                         return docs
         except TimeoutError:
             if written and request_id is not None and not self.closed.is_set():
-                await self.send({"t": "cancel", "id": request_id})
+                # The deadline has passed: the cancel must not hold up the caller.
+                self.send_later({"t": "cancel", "id": request_id})
             return failed("timeout")
         finally:
             if request_id is not None:
@@ -395,6 +421,7 @@ class AgentHub:
         self._relay_uid: int | None = None
         self._servers: list[asyncio.AbstractServer] = []
         self._open = 0
+        self._handshaking: dict[str, int] = {}
         self._handlers: set[asyncio.Task[None]] = set()
         self.started_ms = self.now()
 
@@ -448,14 +475,16 @@ class AgentHub:
         problem = self._remove_stale(path)
         if problem:
             return problem
-        old = os.umask(0o177)
+        # The socket is bound and chmod-ed before it listens, so nobody connects while it still has
+        # the umask's mode (and the process-wide umask is never changed).
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            server = await asyncio.start_unix_server(handler, path=path, limit=MAX_MACHINE_FRAME_BYTES + 1)
+            sock.bind(path)
+            os.chmod(path, mode)
+            server = await asyncio.start_unix_server(handler, sock=sock, limit=MAX_MACHINE_FRAME_BYTES + 1)
         except OSError as err:
+            sock.close()
             return f"{path}: {err.strerror}"
-        finally:
-            os.umask(old)
-        os.chmod(path, mode)
         self._servers.append(server)
         return None
 
@@ -568,7 +597,15 @@ class AgentHub:
             self.logger.warn("agent connection for an unknown machine", {"machine": name})
             await bye("unknown_machine")
             return None
-        raw = await line_within(HELLO_SECONDS)
+        if self._handshaking.get(name, 0) >= MAX_UNFINISHED_HANDSHAKES:
+            self.logger.warn("agent connection refused: too many unfinished handshakes", {"machine": name})
+            await bye("protocol")
+            return None
+        self._handshaking[name] = self._handshaking.get(name, 0) + 1
+        try:
+            raw = await line_within(HELLO_SECONDS)
+        finally:
+            self._handshaking[name] -= 1
         hello = parse_hello(raw) if raw is not None else None
         if hello is None:
             self.logger.warn("agent connection without a valid hello", {"machine": name})

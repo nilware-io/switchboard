@@ -776,9 +776,14 @@ async def _cmd_usage(config: Config, args: ParsedArgs, io: CliIo) -> int:
         io.err("No machine has usage reading on.\n")
         return EXIT_ERROR
     outcomes = None
-    if not args.cached:
-        io.err(f"Reading usage records from {', '.join(spoken_source(n) for n in names)} ...\n")
-        outcomes = await service.refresh(names)
+    # An agent machine's connection is held by the hub's process, so only the hub reads it; this
+    # process reports its cached records (refreshed by the hub's own usage reads).
+    agent_names = {m.name for m in config.remote.machines if m.transport == "agent"}
+    hub_only = [n for n in names if n in agent_names]
+    readable = [n for n in names if n not in agent_names]
+    if not args.cached and readable:
+        io.err(f"Reading usage records from {', '.join(spoken_source(n) for n in readable)} ...\n")
+        outcomes = await service.refresh(readable)
     project = None
     if args.project is not None:
         found = service.match_project(names, args.project)
@@ -798,6 +803,11 @@ async def _cmd_usage(config: Config, args: ParsedArgs, io: CliIo) -> int:
     notes += [
         f"{spoken_source(o.name)} could not be read: {failure_reason(o)}; its cached records are used" for o in failed
     ]
+    if not args.cached:
+        notes += [
+            f"{spoken_source(n)} connects to the hub, so only the hub reads it; its cached records are used"
+            for n in hub_only
+        ]
     if args.csv:
         io.out(format_csv(report))
         for note in notes:

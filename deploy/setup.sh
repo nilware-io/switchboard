@@ -307,6 +307,9 @@ if [[ ${VCM_AGENT_RELAY:-0} == 1 ]]; then
 		# No password; /bin/sh because sshd runs forced commands through the login shell.
 		useradd --system --user-group --shell /bin/sh --home-dir "/var/lib/$RELAY_USER" --no-create-home "$RELAY_USER"
 	fi
+	# '*' (no password can match) instead of useradd's locked '!': with UsePAM no, OpenSSH refuses
+	# even key logins to a locked account.
+	usermod -p '*' "$RELAY_USER"
 	if id -nG "$RELAY_USER" | tr ' ' '\n' | grep -qx "$APP_USER"; then
 		die "$RELAY_USER must not be in group $APP_USER"
 	fi
@@ -329,7 +332,8 @@ if [[ ${VCM_AGENT_RELAY:-0} == 1 ]]; then
 		| wc -l | grep -qx 2 || die "the sshd drop-in for $RELAY_USER is not in effect"
 	systemctl reload ssh 2>/dev/null || systemctl reload sshd
 	echo "Relay ready. Add one key line per machine to $RELAY_KEYS_DIR/authorized_keys (format in"
-	echo "$APP_DIR/deploy/relay/authorized_keys.example), then run: voice-coding-mcp remote-check"
+	echo "$APP_DIR/deploy/relay/authorized_keys.example), add the machines to the config, restart the"
+	echo "hub (it binds the relay socket only at start), then run: voice-coding-mcp remote-check"
 	echo "Host key for the machines to pin (compare it on this console):"
 	ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 fi

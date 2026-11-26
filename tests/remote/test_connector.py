@@ -336,6 +336,17 @@ def test_the_hubs_bye_decides_the_reason(machine: Machine, bye: str, reason: str
     assert machine.connector().attempt().reason == reason
 
 
+@pytest.mark.parametrize(("bye", "reason"), [("replaced", "replaced"), ("unknown_machine", "refused_by_hub")])
+def test_the_bye_wins_when_ssh_ends_right_after_it(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch, bye: str, reason: str
+) -> None:
+    # The relay exits right after forwarding a bye; the dispatcher gets a moment to exit with the
+    # bye's code instead of being stopped at the next poll.
+    monkeypatch.setattr(c, "POLL_SECONDS", 0.001)
+    machine.configure(mode="hub", bye=bye, exit_after_bye=True)
+    assert machine.connector().attempt().reason == reason
+
+
 @pytest.mark.parametrize(("mode", "reason"), [("auth", "auth"), ("hostkey", "host_key"), ("refused", "refused")])
 def test_ssh_failures(machine: Machine, mode: str, reason: str) -> None:
     machine.configure(mode=mode)

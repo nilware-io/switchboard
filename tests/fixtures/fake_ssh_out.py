@@ -8,7 +8,8 @@ OpenSSH refusing an option set. Modes (`mode`):
 
 - `hub`: plays the hub on stdin/stdout (the dispatcher's stdout and stdin): reads the hello, sends
   each request of `requests`, records hello and answers in `out`, then sends `bye` (if set) and waits
-  for the end of input; exits `exit` (default 0).
+  for the end of input (or, with `exit_after_bye`, exits at once, as the relay does); exits `exit`
+  (default 0).
 - `hold`: reads the hello, records it, then waits for the end of input (or a signal).
 - `relay`: runs the real relay in this process with `socket` and `machine` (and an own uid that is
   not the test user's, since the test's hub socket is the test user's own).
@@ -113,6 +114,9 @@ def main() -> int:
         out.flush()
     if config.get("bye"):
         send({"t": "bye", "reason": config["bye"]})
+        if config.get("exit_after_bye"):
+            # As the relay does: it exits right after forwarding the hub's bye.
+            return int(config.get("exit", 0))
     wait_for_eof(buffer)
     time.sleep(float(config.get("linger", 0)))
     return int(config.get("exit", 0))

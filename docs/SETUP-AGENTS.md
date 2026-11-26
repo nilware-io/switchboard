@@ -2,7 +2,9 @@
 
 With the `agent` transport a machine opens the connection itself: it dials out to the hub over SSH and keeps that connection open, and the hub sends its requests down it. Use it for a WSL box behind NAT, a laptop on changing networks or a LAN machine behind a home router: the machine needs no sshd, no `authorized_keys` line for the hub and no open port, and it is reachable exactly while its connection runs. The design and the threat model are in [SWITCHBOARD.md](SWITCHBOARD.md#outbound-agents-machines-connect-to-the-hub); the configuration keys and commands are in [REFERENCE.md](REFERENCE.md).
 
-Placeholders: `hub.example.org` is the hub's SSH address as the machines reach it; `vcm` is the hub's user (the server layout of [DEPLOY.md](DEPLOY.md); on the WSL layout of [SETUP-WSL.md](SETUP-WSL.md) it is `switchboard`); `laptop` is the machine's name in the hub config; `USER` is your own user on that machine.
+Placeholders: `hub.example.org` is the hub's SSH address as the machines reach it; `vcm` is the hub's user (the server layout of [DEPLOY.md](DEPLOY.md)); `laptop` is the machine's name in the hub config; `USER` is your own user on that machine.
+
+The hub side needs the server layout of [DEPLOY.md](DEPLOY.md): the relay runs from the root-owned install in `/opt/voice-coding-mcp`, which `sbrelay` can read, and the hub's sshd is reachable from the machines. A hub on the WSL layout of [SETUP-WSL.md](SETUP-WSL.md) cannot serve agent machines as that guide sets it up: its venv lies in `/home/switchboard` (mode 700, so sshd running as `sbrelay` cannot start its Python; and nothing the hub user can write may run as another account), and its sshd listens on loopback only, so no other machine reaches the relay login. A WSL box is a machine here (part 2), connecting out to a server hub.
 
 ## How it works
 
@@ -26,7 +28,7 @@ On a server hub installed with `deploy/setup.sh`, run it again with the relay pa
 sudo VCM_AGENT_RELAY=1 /opt/voice-coding-mcp/deploy/setup.sh vcm.example.com
 ```
 
-By hand (and on the WSL layout, with the files from your own copy, `~/src/switchboard`, as in [SETUP-WSL.md](SETUP-WSL.md#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root)):
+By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-owned):
 
 1. The relay account and its key file. No password; the shell is `/bin/sh` because sshd runs forced commands through the login shell. Its home is root-owned and empty, so the account can write nothing.
 
@@ -34,30 +36,31 @@ By hand (and on the WSL layout, with the files from your own copy, `~/src/switch
    sudo useradd --system --user-group --shell /bin/sh --home-dir /var/lib/sbrelay --no-create-home sbrelay
    sudo install -d -o root -g root -m 755 /var/lib/sbrelay /etc/ssh/switchboard-relay
    sudo install -o root -g root -m 644 /dev/null /etc/ssh/switchboard-relay/authorized_keys
+   sudo usermod -p '*' sbrelay       # no password can match; a locked '!' account is refused by sshd with UsePAM no
    ```
 
    `sbrelay` must not be in the hub user's group, and the hub user not in `sbrelay`.
 
-2. The socket directory, owned by the hub user with the group `sbrelay` and mode 2750. `deploy/relay/tmpfiles-switchboard-relay.conf` names `vcm` as the owner; on the WSL layout change it to `switchboard`.
+2. The socket directory, owned by the hub user with the group `sbrelay` and mode 2750. `deploy/relay/tmpfiles-switchboard-relay.conf` names `vcm` as the owner.
 
    ```sh
-   sudo install -o root -g root -m 644 deploy/relay/tmpfiles-switchboard-relay.conf /etc/tmpfiles.d/switchboard-relay.conf
+   sudo install -o root -g root -m 644 /opt/voice-coding-mcp/deploy/relay/tmpfiles-switchboard-relay.conf /etc/tmpfiles.d/switchboard-relay.conf
    sudo systemd-tmpfiles --create /etc/tmpfiles.d/switchboard-relay.conf
    ls -ld /run/switchboard-relay        # drwxr-s--- vcm sbrelay
    ```
 
-   The hub's unit (`deploy/voice-coding-mcp.service`, `deploy/linux/switchboard.service`) has `ReadWritePaths=-/run/switchboard-relay`; a unit installed before this change needs to be installed again.
+   The hub's unit (`deploy/voice-coding-mcp.service`) has `ReadWritePaths=-/run/switchboard-relay`; a unit installed before this change needs to be installed again. The hub binds the relay socket once, at start, and a directory that is missing then is skipped (the `-`), so restart the hub after the directory exists (step 2.5 restarts it anyway when you add the first machine).
 
 3. The sshd drop-in: key only, no forwarding, no terminal, one session, keepalives.
 
    ```sh
-   sudo install -o root -g root -m 644 deploy/relay/sshd-switchboard-relay.conf /etc/ssh/sshd_config.d/switchboard-relay.conf
+   sudo install -o root -g root -m 644 /opt/voice-coding-mcp/deploy/relay/sshd-switchboard-relay.conf /etc/ssh/sshd_config.d/switchboard-relay.conf
    sudo sshd -t
-   sudo sshd -T -C user=sbrelay,host=x,addr=192.0.2.1 | grep -E 'disableforwarding|permittty|authorizedkeysfile|maxsessions'
+   sudo sshd -T -C user=sbrelay,host=x,addr=192.0.2.1 | grep -E 'disableforwarding|permittty|authorizedkeysfile|maxsessions|acceptenv'
    sudo systemctl reload ssh
    ```
 
-   The check must show `disableforwarding yes`, `permittty no`, `maxsessions 1` and the key file `/etc/ssh/switchboard-relay/authorized_keys`. If your `sshd_config` has `AllowUsers` or `AllowGroups`, add `sbrelay` there. The machines must reach the hub's SSH port (a cloud firewall or security list may need it opened for them).
+   The check must show `disableforwarding yes`, `permittty no`, `maxsessions 1` and the key file `/etc/ssh/switchboard-relay/authorized_keys`, and preferably no `acceptenv` line: a global `AcceptEnv` (Debian and Ubuntu ship `AcceptEnv LANG LC_*`) lets the machine set those variables for the relay. The relay runs `python -I`, which ignores `PYTHON*` variables, so locale variables are harmless; anything wider does not belong there. If your `sshd_config` has `AllowUsers` or `AllowGroups`, add `sbrelay` there. The machines must reach the hub's SSH port (a cloud firewall or security list may need it opened for them).
 
 4. Tell the hub. Add the machines with `"transport": "agent"` (step 2.5) and, only when you use other paths or another account name, a `remote.agents` section:
 
@@ -110,7 +113,7 @@ By hand (and on the WSL layout, with the files from your own copy, `~/src/switch
 
    There is no trust on first use: a hub with another key is refused, and the connector never updates this file.
 
-5. On the hub, as root, add one line for this key to `/etc/ssh/switchboard-relay/authorized_keys` (the format is in `deploy/relay/authorized_keys.example`; on the WSL layout the venv is `/home/switchboard/switchboard/.venv`):
+5. On the hub, as root, add one line for this key to `/etc/ssh/switchboard-relay/authorized_keys` (the format is in `deploy/relay/authorized_keys.example`):
 
    ```
    restrict,command="/opt/voice-coding-mcp/.venv/bin/python -I -m voice_coding_mcp.remote.relay --machine laptop" ssh-ed25519 AAAA... switchboard-connect laptop
@@ -148,6 +151,8 @@ By hand (and on the WSL layout, with the files from your own copy, `~/src/switch
 
    Then by voice: "what is my session on laptop doing".
 
+   `voice-coding-mcp usage` on the hub (the CLI) runs in its own process and holds no machine's connection, so it does not read agent machines: it reports them from the records the hub's own `usage_report` cached, with a note, and that is not counted as a failure. Ask by voice for fresh numbers, or use `--cached` to say so plainly.
+
 8. Off: `systemctl --user stop switchboard-connect` (and `disable` to keep it off after a reboot). The hub then says "laptop is not connected right now." You decide when the machine can be reached.
 
 ## 3. Moving a machine from the ssh transport
@@ -166,9 +171,11 @@ By hand (and on the WSL layout, with the files from your own copy, `~/src/switch
 | Journal: `connection ended: refused_by_hub` | The hub does not know the machine name in the key's line: add the machine to the config with `"transport": "agent"` and restart the hub |
 | `status`: `bad_policy` warning | The unit's dispatcher flags are broken; every request is refused until they are fixed |
 | `status`: replaced many times in the last hour | Two connectors use the same key (a second machine or a manual run next to the unit), or the key was copied. One key per machine |
+| Journal: `connection ended: auth`, and the hub's auth log says `account is locked` | `sbrelay` has a locked password (`!`) and sshd runs with `UsePAM no`: `sudo usermod -p '*' sbrelay` (part 1.1) |
+| Journal: `connection ended: closed` every few seconds, `status` shows `write_stalled` | The dispatcher stopped reading what the hub sends (a hung dispatcher, or a full channel): the hub closes such a connection after 5 s and the connector reconnects. If it repeats, check the dispatcher's stderr in the journal |
 | `status`: the hub is not running | `status` and `remote-check` ask the running hub over `stateDir/agents-control.sock`; start it first |
 
 ## If something is compromised
 
 - A machine's relay key (`~/.ssh/switchboard_relay`) leaked: delete its line from `/etc/ssh/switchboard-relay/authorized_keys` on the hub, check `audit.jsonl` and `status` (replacements, addresses), then make a new key on the machine (part 2.3 and 2.5). Whoever held the key could pose as that machine and receive what the hub sent to it, including the text of confirmed sends.
-- The hub: stop the units on the machines (`systemctl --user disable --now switchboard-connect`), then follow the hub's own steps ([SETUP-WSL.md](SETUP-WSL.md#if-something-is-compromised), [DEPLOY.md](DEPLOY.md)). The machines hold no key that the hub could misuse, and the hub holds none that opens a machine; but while connected, a compromised hub can do on each machine what its dispatcher allows. If the hub's host key may have leaked, make a new one and pin it again on every machine.
+- The hub: stop the units on the machines (`systemctl --user disable --now switchboard-connect`), then follow the hub's own steps ([DEPLOY.md](DEPLOY.md)). The machines hold no key that the hub could misuse, and the hub holds none that opens a machine; but while connected, a compromised hub can do on each machine what its dispatcher allows. If the hub's host key may have leaked, make a new one and pin it again on every machine.

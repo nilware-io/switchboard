@@ -87,9 +87,18 @@ def test_the_key_file_example_passes_the_lint() -> None:
     assert lint_authorized_keys(text, ["laptop"]) == []
 
 
-@pytest.mark.parametrize("unit", ["deploy/voice-coding-mcp.service", "deploy/linux/switchboard.service"])
-def test_the_hub_units_may_write_the_relay_socket(unit: str) -> None:
-    assert unit_values(REPO / unit)["ReadWritePaths"] == ["-/run/switchboard-relay"]
+def test_the_server_hub_unit_may_write_the_relay_socket() -> None:
+    assert unit_values(REPO / "deploy/voice-coding-mcp.service")["ReadWritePaths"] == ["-/run/switchboard-relay"]
+
+
+def test_the_wsl_hub_layout_does_not_claim_the_relay() -> None:
+    # Its venv is in a mode 700 home the hub user can write and its sshd listens on loopback only:
+    # the guide says the hub side needs the server layout.
+    assert "ReadWritePaths" not in unit_values(REPO / "deploy/linux/switchboard.service")
+    guide = (REPO / "docs" / "SETUP-AGENTS.md").read_text(encoding="utf-8")
+    assert "/home/switchboard/switchboard/.venv" not in guide
+    assert "cannot serve agent machines" in guide
+    assert "WSL" not in TMPFILES.read_text(encoding="utf-8")
 
 
 def test_setup_sets_the_relay_up_only_when_asked() -> None:
@@ -100,6 +109,7 @@ def test_setup_sets_the_relay_up_only_when_asked() -> None:
         )
     ]
     assert "--shell /bin/sh" in block
+    assert "usermod -p '*' \"$RELAY_USER\"" in block  # not locked: sshd with UsePAM no refuses locked accounts
     assert "deploy/relay/tmpfiles-switchboard-relay.conf" in block
     assert "deploy/relay/sshd-switchboard-relay.conf" in block
     assert "sshd -t" in block
