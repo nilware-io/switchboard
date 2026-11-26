@@ -53,12 +53,18 @@ class Inventory:
         transports: Mapping[str, Transport],
         logger: Logger,
         now: Callable[[], int] | None = None,
+        observe: Callable[[str], None] | None = None,
     ) -> None:
         self._remote = remote
         self._transports = dict(transports)
         self._logger = logger
         self._now = now or now_ms
         self._cache: dict[str, MachineView] = {}
+        self._observe = observe
+        """Gets every screen text, `waitingFor` and name a machine reports (`send.ScreenEcho`)."""
+
+    def transport(self, name: str) -> Transport:
+        return self._transports[name]
 
     @property
     def machines(self) -> list[MachineConfig]:
@@ -94,6 +100,13 @@ class Inventory:
             return MachineView(machine=machine, error=result.error or "bad_response", detail=result.detail)
         # The dispatcher filtered with its own globs; the hub filters with the config's too.
         panes = tuple(pane for pane in result.data.panes if allowed(machine, pane.session))
+        if self._observe is not None:
+            for pane in panes:
+                for text in (pane.window_name, pane.claude.name if pane.claude else None):
+                    if text:
+                        self._observe(text)
+                if pane.claude and pane.claude.waiting_for:
+                    self._observe(pane.claude.waiting_for)
         view = MachineView(machine=machine, panes=panes, fetched_ms=self._now(), truncated=result.data.truncated)
         self._cache[name] = view
         return view
@@ -112,6 +125,8 @@ class Inventory:
         self._log(name, "capture", result)
         if result.ok and isinstance(result.data, CaptureResponse):
             if allowed(self._transports[name].machine, result.data.session):
+                if self._observe is not None:
+                    self._observe(result.data.text)
                 return result.data
             # The pane moved (join-pane, rename) to a session only the dispatcher allows: for the
             # hub it is gone, and its text is dropped unread.

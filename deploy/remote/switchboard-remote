@@ -23,10 +23,11 @@ Policy options: --sessions <globs> (comma separated, required), --allow-usage, -
 --allow-permission-answers, --send-to-any-pane, --slash-commands <names>, --claude-home <path>.
 Test only (refused unless SWITCHBOARD_REMOTE_TEST=1 is in the environment): --tmux-socket-name.
 
-Verbs: `version`, `list`, `capture <paneId> <lines>`. Every response is one JSON document on stdout,
+Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none>` (text
+on stdin, only with --allow-send). Every response is one JSON document on stdout,
 `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`; the exit
 code is 0 also for refusals. Nothing from the request ever reaches a shell: tmux runs from argv with
-a fixed environment.
+a fixed environment, and the text of a send reaches tmux only on the stdin of `load-buffer`.
 """
 
 from __future__ import annotations
@@ -37,14 +38,15 @@ import math
 import os
 import pwd
 import re
+import secrets
 import shlex
 import subprocess
 import sys
 import unicodedata
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PROTOCOL = 1
-VERBS = ("version", "list", "capture")
+VERBS = ("version", "list", "capture", "send")
 PROGRAM = "switchboard-remote"
 
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}")
@@ -58,6 +60,10 @@ PATH_RE = re.compile(r"/[A-Za-z0-9._/-]{1,255}")
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 REGISTRY_FILE_RE = re.compile(r"[0-9]+\.json")
 TMUX_SOCKET_RE = re.compile(r"sb-test-[A-Za-z0-9]{1,32}")
+SEND_NO_SESSION = "none"
+"""The `sessionId` argument of a send to a pane that runs no Claude Code (`-` would read as an option)."""
+PERMISSION_ANSWER_RE = re.compile(r"[1-9]")
+"""The only text accepted for a pane that shows a permission dialog (a choice number)."""
 
 MAX_SESSION_GLOBS = 64
 MAX_LINES = 500
@@ -65,6 +71,10 @@ MAX_PANES = 512
 MAX_CAPTURE_BYTES = 64 * 1024
 MAX_REGISTRY_BYTES = 1024 * 1024
 MAX_POLICY_BYTES = 64 * 1024
+MAX_SEND_BYTES = 8 * 1024
+SEND_CHECK_LINES = 40
+"""Screen lines a send reads for the permission, draft and vim checks (the last 15 non-empty count)."""
+CHECK_TAIL = 15
 NAME_MAX = 64
 WAITING_MAX = 200
 ANCESTOR_STEPS = 32
@@ -140,6 +150,95 @@ def clean_text(value: object, limit: int) -> str:
         if len(out) >= limit:
             break
     return "".join(out)
+
+
+def text_problem(text: str, *, claude_pane: bool, slash_commands: list[str]) -> str | None:
+    """Why `text` may not be typed into a pane, or None. The same rules run on the hub (which turns the
+    reason into words) and here (any reason is `bad_text`):
+
+    - `empty`: nothing but whitespace; `not_nfc`: not in Unicode NFC;
+    - `tab`: a tab (completes or switches modes in Claude Code and in shells);
+    - `newline`: a newline into a pane that runs no Claude Code (a shell runs every line);
+    - `control`: other C0 or C1 controls (escape sequences could end the bracketed paste), U+2028,
+      U+2029, surrogates and private-use characters; `format`: Unicode format characters (bidi
+      controls, zero-width characters);
+    - `bang`, `hash`: starts (after leading whitespace) with `!` (Claude Code's bash mode runs it
+      outside its permission checks) or `#` (memory shortcut);
+    - `slash`: starts with `/` and is not one of `slash_commands`.
+    """
+    if not text.strip():
+        return "empty"
+    if unicodedata.normalize("NFC", text) != text:
+        return "not_nfc"
+    for char in text:
+        if char == "\t":
+            return "tab"
+        if char == "\n":
+            if not claude_pane:
+                return "newline"
+            continue
+        category = unicodedata.category(char)
+        if category in ("Cc", "Cs", "Co", "Zl", "Zp"):
+            return "control"
+        if category == "Cf" or ord(char) in _INVISIBLE:
+            return "format"
+    start = text.lstrip()
+    if start.startswith("!"):
+        return "bang"
+    if start.startswith("#"):
+        return "hash"
+    if start.startswith("/"):
+        found = re.match(r"/([a-z][a-z0-9:-]{0,31})(?=\s|$)", start)
+        if found is None or found.group(1) not in slash_commands:
+            return "slash"
+    return None
+
+
+_BOX_EDGES = "│┃║|"
+_DIALOG_QUESTION_RE = re.compile(r"do you want to\b[^?]{0,200}\?", re.I)
+_YES_OPTION_RE = re.compile(r"(?:[❯>›▶]\s*)?1[.)]\s*yes\b", re.I)
+_NO_OPTION_RE = re.compile(r"(?:[❯>›▶]\s*)?[2-9][.)]\s*no\b", re.I)
+_INPUT_PROMPTS = ("❯", ">")
+_PLACEHOLDER_RE = re.compile(r'try "', re.I)
+"""Claude Code's empty input box shows a hint such as `> Try "fix lint errors"` (dim, which a plain
+capture loses); it is not a draft."""
+_VIM_NORMAL_RE = re.compile(r"-- NORMAL --")
+
+
+def _screen_tail(screen: str) -> list[str]:
+    """The last CHECK_TAIL non-empty lines, without surrounding whitespace and box edges."""
+    lines = [line.strip().strip(_BOX_EDGES).strip() for line in screen.split("\n")]
+    return [line for line in lines if line][-CHECK_TAIL:]
+
+
+def shows_dialog(screen: str) -> bool:
+    """A permission dialog may be on the screen: a line that starts with "Do you want to ...?", or a
+    `1. Yes` option followed within 6 lines by a `2.`..`9.` `No` option. Broader than the hub's
+    heuristic on purpose: a missed dialog would let Enter select its highlighted option."""
+    tail = _screen_tail(screen)
+    for index, line in enumerate(tail):
+        if _DIALOG_QUESTION_RE.match(line):
+            return True
+        if _YES_OPTION_RE.match(line) and any(_NO_OPTION_RE.match(other) for other in tail[index + 1 : index + 7]):
+            return True
+    return False
+
+
+def shows_draft(screen: str) -> bool:
+    """Text is already typed in Claude Code's input box: the last input line (`>` or `❯`) has text
+    after the prompt that is not the empty box's hint. A heuristic; it refuses rather than submit the
+    owner's unsent draft together with the send."""
+    tail = _screen_tail(screen)
+    for line in reversed(tail):
+        if line.startswith(_INPUT_PROMPTS):
+            typed = line[1:].strip()
+            return bool(typed) and not _PLACEHOLDER_RE.match(typed)
+    return False
+
+
+def shows_vim_normal(screen: str) -> bool:
+    """Claude Code's vim mode in NORMAL state: pasted text would be read as commands."""
+    return any(_VIM_NORMAL_RE.search(line) for line in _screen_tail(screen))
 
 
 # --- options and policy ----------------------------------------------------------------------
@@ -298,6 +397,11 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
             raise RefusedError("bad_request")
         if not 1 <= int(args[1]) <= MAX_LINES:
             raise RefusedError("bad_request")
+    if verb == "send":
+        if len(args) != 3 or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
+            raise RefusedError("bad_request")
+        if args[2] != SEND_NO_SESSION and not UUID_RE.fullmatch(args[2]):
+            raise RefusedError("bad_request")
     return verb, args
 
 
@@ -316,8 +420,9 @@ def tmux_env(env: dict[str, str]) -> dict[str, str]:
     return out
 
 
-def run_tmux(args: list[str], policy: Policy, env: dict[str, str]) -> tuple[int, str, str]:
-    """(exit code, stdout, stderr) of one tmux call; argv only, no shell, stdin closed."""
+def run_tmux(args: list[str], policy: Policy, env: dict[str, str], stdin: bytes | None = None) -> tuple[int, str, str]:
+    """(exit code, stdout, stderr) of one tmux call; argv only, no shell, stdin closed unless `stdin`
+    is given (the text of a send, for `load-buffer -`)."""
     binary = "tmux"
     if env.get(TEST_FLAG) == "1" and env.get(TEST_TMUX_BIN):
         binary = env[TEST_TMUX_BIN]
@@ -328,7 +433,7 @@ def run_tmux(args: list[str], policy: Policy, env: dict[str, str]) -> tuple[int,
         done = subprocess.run(
             argv + args,
             env=tmux_env(env),
-            stdin=subprocess.DEVNULL,
+            input=stdin if stdin is not None else b"",
             capture_output=True,
             timeout=TMUX_TIMEOUT_SECONDS,
             check=False,
@@ -559,8 +664,104 @@ def verb_capture(policy: Policy, env: dict[str, str], pane_id: str, lines: int) 
     }
 
 
-def handle(argv: list[str], env: dict[str, str]) -> dict[str, object]:
-    """The response document for one invocation. Never raises for a bad request."""
+def read_send_text(stdin: object) -> str:
+    """The text of a send: at most MAX_SEND_BYTES of UTF-8 from `stdin` (bytes or a binary file)."""
+    if isinstance(stdin, bytes):
+        raw = stdin[: MAX_SEND_BYTES + 1]
+    elif stdin is not None and hasattr(stdin, "read"):
+        try:
+            raw = stdin.read(MAX_SEND_BYTES + 1)
+        except (OSError, ValueError):
+            raise RefusedError("bad_text") from None
+    else:
+        raw = b""
+    if not isinstance(raw, bytes) or len(raw) > MAX_SEND_BYTES:
+        raise RefusedError("bad_text")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise RefusedError("bad_text") from None
+
+
+def _send_state(
+    policy: Policy, env: dict[str, str], pane_id: str
+) -> tuple[dict[str, str] | None, dict[str, object] | None, str]:
+    """(the pane if it exists in an allowed session, its registry entry, its screen) right now."""
+    panes = [p for p in list_panes(policy, env) if policy.allows(p["session_name"])]
+    pane = next((p for p in panes if p["pane_id"] == pane_id), None)
+    if pane is None:
+        return None, None, ""
+    entry = join_registry(panes, read_registry(claude_home(policy, env)), env).get(pane_id)
+    code, out, _ = run_tmux(["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{SEND_CHECK_LINES}"], policy, env)
+    if code != 0:
+        raise RefusedError("tmux_failed")
+    return pane, entry, out
+
+
+def _asks_permission(entry: dict[str, object] | None, screen: str) -> bool:
+    if entry is not None and entry.get("status") == "waiting":
+        waiting_for = entry.get("waitingFor")
+        if isinstance(waiting_for, str) and "permission" in waiting_for.lower():
+            return True
+    return shows_dialog(screen)
+
+
+def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: object) -> dict[str, object]:
+    """Types the text from stdin into a pane and presses Enter, after rechecking everything the hub
+    checked when it prepared the send. See docs/SWITCHBOARD.md, "The dispatcher"."""
+    if not policy.allow_send:
+        raise RefusedError("not_allowed")
+    pane_id, pane_pid, session_id = args
+    text = read_send_text(stdin)
+    pane, entry, screen = _send_state(policy, env, pane_id)
+    if pane is None:
+        raise RefusedError("gone")
+    if pane["pane_pid"] != pane_pid:
+        raise RefusedError("changed")
+    if session_id == SEND_NO_SESSION:
+        if entry is not None:
+            raise RefusedError("changed")
+        if not policy.send_to_any_pane:
+            raise RefusedError("not_claude")
+    elif entry is None or entry.get("sessionId") != session_id:
+        raise RefusedError("changed")
+    if text_problem(text, claude_pane=entry is not None, slash_commands=policy.slash_commands) is not None:
+        raise RefusedError("bad_text")
+    permission_answer = False
+    if _asks_permission(entry, screen):
+        if not policy.allow_permission_answers or not PERMISSION_ANSWER_RE.fullmatch(text):
+            raise RefusedError("permission_prompt")
+        permission_answer = True
+    elif entry is not None:
+        if shows_draft(screen):
+            raise RefusedError("draft_present")
+        if shows_vim_normal(screen):
+            raise RefusedError("vim_normal")
+    buffer = "sb-" + secrets.token_hex(8)
+    data = text.encode("utf-8")
+    code, _, _ = run_tmux(["load-buffer", "-b", buffer, "-"], policy, env, stdin=data)
+    if code != 0:
+        raise RefusedError("tmux_failed")
+    code, _, _ = run_tmux(["paste-buffer", "-p", "-d", "-b", buffer, "-t", pane_id], policy, env)
+    if code != 0:
+        run_tmux(["delete-buffer", "-b", buffer], policy, env)
+        raise RefusedError("tmux_failed")
+    if permission_answer:
+        # A choice number selects in Claude Code's dialog; Enter could answer the next one.
+        return {"sent": True, "bytes": len(data), "enter": False}
+    # Race guard: a dialog that opened since the first check would take the Enter as "Yes".
+    pane, entry, screen = _send_state(policy, env, pane_id)
+    if pane is None or pane["pane_pid"] != pane_pid or _asks_permission(entry, screen):
+        raise RefusedError("pasted_no_enter")
+    code, _, _ = run_tmux(["send-keys", "-t", pane_id, "Enter"], policy, env)
+    if code != 0:
+        raise RefusedError("pasted_no_enter")
+    return {"sent": True, "bytes": len(data), "enter": True}
+
+
+def handle(argv: list[str], env: dict[str, str], stdin: object = None) -> dict[str, object]:
+    """The response document for one invocation. Never raises for a bad request. `stdin` (bytes or a
+    binary file) is read only by `send`."""
     try:
         policy, tokens = resolve_request(argv, env)
         verb, args = validate_request(tokens)
@@ -568,6 +769,8 @@ def handle(argv: list[str], env: dict[str, str]) -> dict[str, object]:
             body = verb_version(policy)
         elif verb == "list":
             body = verb_list(policy, env)
+        elif verb == "send":
+            body = verb_send(policy, env, args, stdin)
         else:
             body = verb_capture(policy, env, args[0], int(args[1]))
     except RefusedError as refused:
@@ -578,7 +781,7 @@ def handle(argv: list[str], env: dict[str, str]) -> dict[str, object]:
 
 
 def main() -> int:
-    response = handle(sys.argv[1:], dict(os.environ))
+    response = handle(sys.argv[1:], dict(os.environ), sys.stdin.buffer)
     sys.stdout.write(json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
     return 0

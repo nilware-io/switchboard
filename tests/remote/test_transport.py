@@ -12,9 +12,9 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import is_alive, until
-from tests.remote.helpers import RemoteWorld, pane
+from tests.remote.helpers import SESSION_A, RemoteWorld, pane
 from voice_coding_mcp.remote.config import MachineConfig, RemoteConfig, SshConfig
-from voice_coding_mcp.remote.protocol import CaptureResponse, ListResponse, VersionResponse
+from voice_coding_mcp.remote.protocol import CaptureResponse, ListResponse, SendResponse, VersionResponse
 from voice_coding_mcp.remote.transport import (
     LocalTransport,
     ProcessResult,
@@ -75,7 +75,7 @@ async def test_capture_and_version(world: RemoteWorld) -> None:
     assert captured.data.text == "world\n"
     version = await t.call("version", timeout_seconds=10)
     assert isinstance(version.data, VersionResponse)
-    assert version.data.verbs == ["version", "list", "capture"]
+    assert version.data.verbs == ["version", "list", "capture", "send"]
     gone = await t.call("capture", ["%2", "1"], timeout_seconds=10)
     assert (gone.ok, gone.error, gone.detail) == (False, "refused_by_policy", "gone")
 
@@ -244,3 +244,37 @@ async def test_local_transport_missing_python(world: RemoteWorld, tmp_path: Path
     local = LocalTransport(machine, {}, python=str(tmp_path / "no-python"))
     result = await local.call("version", timeout_seconds=5)
     assert (result.ok, result.error) == (False, "dispatcher_missing")
+
+
+async def test_local_transport_sends_with_the_hub_policy_and_stdin(world: RemoteWorld) -> None:
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
+    machine = MachineConfig(name="dev", transport="local", sessions=["fpga"], allow_send=True)
+    remote = RemoteConfig.model_validate({"machines": [machine.model_dump()], "send": {"slashCommands": ["compact"]}})
+    local = make_transport(machine, remote, str(world.root / "state"), {**world.tmux_env(), "PATH": "/usr/bin:/bin"})
+    assert isinstance(local, LocalTransport)
+    assert local.policy_args()[-4:] == ["--allow-usage", "--allow-send", "--slash-commands", "compact"]
+    result = await local.call("send", ["%1", "1", SESSION_A], timeout_seconds=10, stdin=b"/compact now")
+    assert isinstance(result.data, SendResponse), result
+    assert result.data.sent is True
+    assert result.data.bytes == 12
+    loads = [c for c in world.tmux_calls() if c["argv"][:1] == ["load-buffer"]]
+    assert [c["stdin"] for c in loads] == ["/compact now"]
+
+
+async def test_ssh_send_passes_the_text_on_stdin_only(world: RemoteWorld) -> None:
+    world.configure(forced=["--sessions", "fpga", "--allow-send"])
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
+    text = 'it\'s "quoted" $(and) `this`; rm -rf ~\nsecond line'
+    ssh = transport(world)
+    argv = ssh.argv("send", ["%1", "1", SESSION_A])
+    assert argv[-1] == f"switchboard-remote send %1 1 {SESSION_A}"
+    result = await ssh.call("send", ["%1", "1", SESSION_A], timeout_seconds=10, stdin=text.encode())
+    assert isinstance(result.data, SendResponse), result
+    (call,) = world.ssh_calls()
+    assert call["stdin"] == text
+    assert not any("quoted" in arg for arg in call["argv"])
+
+
+async def test_a_refusal_before_reading_stdin_does_not_break_the_call(world: RemoteWorld) -> None:
+    result = await transport(world).call("send", ["%1", "1", SESSION_A], timeout_seconds=10, stdin=b"x" * 9000)
+    assert (result.error, result.detail) == ("refused_by_policy", "not_allowed")

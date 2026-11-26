@@ -6,6 +6,7 @@ JSON file named by FAKE_SSH_CONFIG, which a per-test wrapper script sets (tests/
 
   log         file that gets one JSON line {"argv": [...], "env": {...}} per call
   modes       {"<host>": mode}; default mode "ok"
+  verbModes   {"<verb>": mode}: overrides `modes` for one dispatcher verb (for example "send")
   forced      the forced-command argv of the dispatcher (the authorized_keys line under test)
   explicit    instead of a forced command: the dispatcher path on the "remote" machine; the hub's
               command is then run like a login shell would (path, then the request tokens)
@@ -17,7 +18,10 @@ The argv must carry every hardening option of docs/SWITCHBOARD.md "SSH" with the
 no other `-o`; otherwise it exits 255 like a refused connection, so a dropped flag fails the tests.
 
 Modes: ok, slow (sleep, then ok), timeout (sleep 60), hostkey, auth, refused, connect_timeout,
-no_dispatcher (exit 127 like a shell that has no such command), garbage (exit 0, not JSON).
+no_dispatcher (exit 127 like a shell that has no such command), garbage (exit 0, not JSON),
+hang_after (runs the dispatcher, then hangs without answering: a connection lost after a send).
+
+stdin is passed on to the dispatcher (the text of a send) and logged as `stdin`.
 """
 
 from __future__ import annotations
@@ -105,10 +109,18 @@ def main() -> None:
     with open(os.environ["FAKE_SSH_CONFIG"], encoding="utf-8") as handle:
         config = json.load(handle)
     argv = sys.argv[1:]
+    stdin = sys.stdin.buffer.read() if not sys.stdin.closed else b""
     with open(config["log"], "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"argv": argv, "env": dict(os.environ)}) + "\n")
+        entry = {"argv": argv, "env": dict(os.environ), "stdin": stdin.decode("utf-8", "replace")}
+        handle.write(json.dumps(entry) + "\n")
     host, command, flags = parse(argv)
     mode = config.get("modes", {}).get(host, "ok")
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = []
+    verb = tokens[1] if len(tokens) > 1 else ""
+    mode = config.get("verbModes", {}).get(verb, mode)
     user, port = flags["-l"], flags["-p"]
     if mode == "timeout":
         time.sleep(60)
@@ -151,10 +163,12 @@ def main() -> None:
     done = subprocess.run(
         [sys.executable, "-I", os.path.normpath(DISPATCHER), *dispatcher_argv],
         env=env,
-        stdin=subprocess.DEVNULL,
+        input=stdin,
         capture_output=True,
         check=False,
     )
+    if mode == "hang_after":
+        time.sleep(60)
     sys.stdout.buffer.write(done.stdout)
     sys.stderr.buffer.write(done.stderr)
     sys.exit(done.returncode)

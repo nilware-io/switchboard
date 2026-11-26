@@ -155,7 +155,18 @@ def test_a_state_dir_ssh_cannot_quote_needs_an_explicit_known_hosts_file(tmp_pat
         ({"summary": {"model": "haiku; rm"}}, "remote.summary.model"),
         ({"summary": {"timeoutSeconds": 4}}, "remote.summary.timeoutSeconds"),
         ({"summary": {"timeoutSeconds": 121}}, "remote.summary.timeoutSeconds"),
-        ({"send": {}}, "remote.send"),
+        ({"send": {"confirmSeconds": 29}}, "remote.send.confirmSeconds"),
+        ({"send": {"confirmSeconds": 601}}, "remote.send.confirmSeconds"),
+        ({"send": {"maxChars": 0}}, "remote.send.maxChars"),
+        ({"send": {"maxChars": 2001}}, "remote.send.maxChars"),
+        ({"send": {"maxPending": 6}}, "remote.send.maxPending"),
+        ({"send": {"minConfirmSeconds": 31}}, "remote.send.minConfirmSeconds"),
+        ({"send": {"slashCommands": ["/compact"]}}, "remote.send.slashCommands"),
+        ({"send": {"slashCommands": ["compact", "compact"]}}, "remote.send.slashCommands"),
+        ({"send": {"riskyPatterns": ["(unclosed"]}}, "remote.send.riskyPatterns"),
+        ({"send": {"riskyPatterns": [""]}}, "remote.send.riskyPatterns"),
+        ({"send": {"clientApproval": "yes"}}, "remote.send.clientApproval"),
+        ({"send": {"unknown": 1}}, "remote.send.unknown"),
     ],
 )
 def test_other_remote_keys(tmp_path: Path, section: dict[str, Any], message: str) -> None:
@@ -167,7 +178,9 @@ def test_warnings(tmp_path: Path) -> None:
     key.write_text("k", encoding="utf-8")
     os.chmod(key, 0o644)
     machines = [
-        machine("dev", identity=str(key), sessions=["*"], allowSend=True, sendToAnyPane=True),
+        machine(
+            "dev", identity=str(key), sessions=["*"], allowSend=True, sendToAnyPane=True, allowPermissionAnswers=True
+        ),
         machine("explicit", identity=str(tmp_path / "missing"), dispatcher="/home/USER/bin/switchboard-remote"),
         {"name": "same-user", "transport": "local", "sessions": ["fpga"]},
     ]
@@ -176,6 +189,7 @@ def test_warnings(tmp_path: Path) -> None:
     joined = "\n".join(warnings)
     assert "remote machine dev: sessions allows every tmux session (*)" in joined
     assert "remote machine dev: sendToAnyPane allows typing into plain shells" in joined
+    assert "remote machine dev: allowPermissionAnswers lets a voice send answer" in joined
     assert f"remote machine dev: identityFile {key} is readable by others; use mode 600" in joined
     assert "remote machine explicit: dispatcher is an explicit path" in joined
     assert f"identityFile {tmp_path / 'missing'} does not exist yet" in joined

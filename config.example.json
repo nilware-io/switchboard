@@ -41,7 +41,9 @@
         "dispatcher": "forced",
         "sessions": ["fpga", "notes", "work-*"],
         "allowUsage": true,
-        "allowSend": false
+        "allowSend": false,
+        "allowPermissionAnswers": false,
+        "sendToAnyPane": false
       },
       {
         "name": "buildbox",
@@ -55,7 +57,16 @@
     ],
     "ssh": { "bin": "ssh", "connectTimeoutSeconds": 5, "commandTimeoutSeconds": 10 },
     "captureLines": 60,
-    "summary": { "enabled": true, "model": "haiku", "timeoutSeconds": 15 }
+    "summary": { "enabled": true, "model": "haiku", "timeoutSeconds": 15 },
+    "send": {
+      "confirmSeconds": 120,
+      "maxChars": 2000,
+      "maxPending": 1,
+      "minConfirmSeconds": 4,
+      "slashCommands": [],
+      "riskyPatterns": [],
+      "clientApproval": false
+    }
   },
   "watch": { "intervalSeconds": 0, "longTurnMinutes": 10, "notifyUnreachable": false, "includeQuestion": false }
 }

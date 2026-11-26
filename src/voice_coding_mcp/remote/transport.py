@@ -57,7 +57,9 @@ class TransportResult:
 class Transport(Protocol):
     machine: MachineConfig
 
-    async def call(self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float) -> TransportResult: ...
+    async def call(
+        self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float, stdin: bytes | None = None
+    ) -> TransportResult: ...
 
 
 @dataclass(frozen=True)
@@ -71,14 +73,20 @@ class ProcessResult:
 
 
 async def run_process(
-    argv: Sequence[str], env: Mapping[str, str], *, timeout_seconds: float, stdout_cap: int = MAX_RESPONSE_BYTES
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    timeout_seconds: float,
+    stdout_cap: int = MAX_RESPONSE_BYTES,
+    stdin: bytes | None = None,
 ) -> ProcessResult:
-    """Runs argv with stdin from /dev/null, stdout capped, in its own process group. Never raises."""
+    """Runs argv with stdin from /dev/null (or the `stdin` bytes, then closed), stdout capped, in its
+    own process group. Never raises."""
     try:
         process = await asyncio.create_subprocess_exec(
             *argv,
             env=dict(env),
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -109,10 +117,20 @@ async def run_process(
             if len(err) > STDERR_TAIL_BYTES * 2:
                 del err[: len(err) - STDERR_TAIL_BYTES]
 
+    async def write_in() -> None:
+        if stdin is None or process.stdin is None:
+            return
+        # A peer that exits without reading (a refusal before the text) closes the pipe early.
+        with contextlib.suppress(ConnectionError, OSError):
+            process.stdin.write(stdin)
+            await process.stdin.drain()
+        with contextlib.suppress(ConnectionError, OSError):
+            process.stdin.close()
+
     timed_out = False
     try:
         async with asyncio.timeout(timeout_seconds):
-            await asyncio.gather(read_out(), read_err())
+            await asyncio.gather(read_out(), read_err(), write_in())
             if not overflow:
                 await process.wait()
     except TimeoutError:
@@ -218,21 +236,32 @@ class SshTransport:
         command = build_command(self.machine.dispatcher, verb, args)
         return build_ssh_argv(self._remote.ssh, self.machine, self._known_hosts, command)
 
-    async def call(self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float) -> TransportResult:
+    async def call(
+        self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float, stdin: bytes | None = None
+    ) -> TransportResult:
         started = time.monotonic()
         try:
             argv = self.argv(verb, args)
         except ValueError:
             return TransportResult(ok=False, error="other")
-        result = await run_process(argv, self._env, timeout_seconds=timeout_seconds)
+        result = await run_process(argv, self._env, timeout_seconds=timeout_seconds, stdin=stdin)
         return interpret(verb, result, via_ssh=True, started=started)
 
 
 class LocalTransport:
     """The bundled dispatcher as a child process of the server, with the machine's settings as policy."""
 
-    def __init__(self, machine: MachineConfig, base_env: Mapping[str, str], *, python: str | None = None):
+    def __init__(
+        self,
+        machine: MachineConfig,
+        base_env: Mapping[str, str],
+        *,
+        python: str | None = None,
+        slash_commands: Sequence[str] = (),
+    ):
         self.machine = machine
+        self.slash_commands = list(slash_commands)
+        """`remote.send.slashCommands`: the hub's list is the dispatcher's policy too."""
         self._python = python or sys.executable
         self._env = {k: v for k, v in base_env.items() if k in LOCAL_ENV_KEYS or TEST_ENV_RE.fullmatch(k)}
 
@@ -246,6 +275,8 @@ class LocalTransport:
             (machine.send_to_any_pane, "--send-to-any-pane"),
         )
         args += [flag for enabled, flag in flags if enabled]
+        if self.slash_commands:
+            args += ["--slash-commands", ",".join(self.slash_commands)]
         if machine.claude_home:
             args += ["--claude-home", machine.claude_home]
         return args
@@ -253,13 +284,15 @@ class LocalTransport:
     def argv(self, verb: str, args: Sequence[str] = ()) -> list[str]:
         return [self._python, "-I", DISPATCHER_PATH, *self.policy_args(), "--", *request_tokens(verb, args)]
 
-    async def call(self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float) -> TransportResult:
+    async def call(
+        self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float, stdin: bytes | None = None
+    ) -> TransportResult:
         started = time.monotonic()
         try:
             argv = self.argv(verb, args)
         except ValueError:
             return TransportResult(ok=False, error="other")
-        result = await run_process(argv, self._env, timeout_seconds=timeout_seconds)
+        result = await run_process(argv, self._env, timeout_seconds=timeout_seconds, stdin=stdin)
         return interpret(verb, result, via_ssh=False, started=started)
 
 
@@ -267,5 +300,5 @@ def make_transport(
     machine: MachineConfig, remote: RemoteConfig, state_dir: str, base_env: Mapping[str, str]
 ) -> Transport:
     if machine.transport == "local":
-        return LocalTransport(machine, base_env)
+        return LocalTransport(machine, base_env, slash_commands=remote.send.slash_commands)
     return SshTransport(machine, remote, known_hosts_path(machine, state_dir), base_env)

@@ -52,6 +52,7 @@ async def start_app(
     oauth: dict[str, Any] | None = None,
     http_client: httpx2.AsyncClient | None = None,
     projects: list[str] | None = None,
+    remote: dict[str, Any] | None = None,
 ) -> AsyncIterator[AppCtx]:
     state_dir = str(root / "state")
     projects_dir = root / "projects"
@@ -77,6 +78,7 @@ async def start_app(
             },
             tasks={"syncWaitSeconds": 2, **(tasks or {})},
             oauth=oauth or {},
+            **({"remote": remote} if remote is not None else {}),
         ),
         home_dir="/nonexistent-home-dir",
     )

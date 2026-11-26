@@ -16,7 +16,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
 DISPATCHER_PROGRAM = "switchboard-remote"
-VERBS: tuple[str, ...] = ("version", "list", "capture")
+VERBS: tuple[str, ...] = ("version", "list", "capture", "send")
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -110,10 +110,18 @@ class VersionResponse(_Response):
     allow_usage: bool = Field(default=False, alias="allowUsage")
 
 
+class SendResponse(_Response):
+    sent: bool
+    bytes: int = Field(ge=0)
+    enter: bool = True
+    """False for a permission answer: the choice number was typed, Enter was not pressed."""
+
+
 RESPONSE_MODELS: dict[str, type[_Response]] = {
     "version": VersionResponse,
     "list": ListResponse,
     "capture": CaptureResponse,
+    "send": SendResponse,
 }
 
 

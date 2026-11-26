@@ -55,7 +55,7 @@ def test_version_reports_verbs_and_policy(world: RemoteWorld) -> None:
         "protocol": 1,
         "ok": True,
         "version": d.VERSION,
-        "verbs": ["version", "list", "capture"],
+        "verbs": ["version", "list", "capture", "send"],
         "allowSend": False,
         "allowUsage": True,
     }
@@ -69,7 +69,12 @@ def test_version_reports_verbs_and_policy(world: RemoteWorld) -> None:
         "ls -la",
         "switchboard-remote",
         "switchboard-remote unknown",
-        "switchboard-remote send %1 123 -",  # not a verb of this version
+        "switchboard-remote send %1 123 -",  # "-" is not a session id ("none" is)
+        "switchboard-remote send %1 123",
+        "switchboard-remote send %1 abc none",
+        "switchboard-remote send 1 123 none",
+        "switchboard-remote send %1 123 not-a-uuid",
+        "switchboard-remote send %1 123 none extra",
         "switchboard-remote list extra",
         "switchboard-remote capture %1",
         "switchboard-remote capture 1 10",

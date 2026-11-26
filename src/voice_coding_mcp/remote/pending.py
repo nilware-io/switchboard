@@ -82,8 +82,9 @@ def _question_text(value: str | None) -> str | None:
     return clip(text, QUESTION_MAX) if text else None
 
 
-def _waiting_for_text(value: str | None) -> str | None:
-    """`waitingFor` as a quotable question, or None when it is empty or only a status label."""
+def waiting_for_text(value: str | None) -> str | None:
+    """`waitingFor` as a quotable question (cleaned, redacted, clipped), or None when it is empty or
+    only a status label."""
     text = _question_text(value)
     return None if text is None or is_status_label(text) else text
 
@@ -390,7 +391,7 @@ class PendingChecker:
                             session=tracked,
                             label=label,
                             kind=kind,
-                            question=text or _waiting_for_text(claude.waiting_for),
+                            question=text or waiting_for_text(claude.waiting_for),
                             source="registry",
                             permission_answers=machine.allow_permission_answers,
                         )
@@ -462,7 +463,7 @@ class PendingChecker:
             session=tracked,
             label=label,
             kind=kind,
-            question=_waiting_for_text(session.waiting_for),
+            question=waiting_for_text(session.waiting_for),
             source="registry",
             permission_answers=False,
         )

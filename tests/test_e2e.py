@@ -173,7 +173,7 @@ async def test_dcr_pairing_pkce_mcp_tools_refresh_rotation_and_a_closed_window(r
         async with mcp_client(base, tokens["access_token"]) as mcp:
             assert "get_task_result" in (mcp.instructions or "")
             tools = (await mcp.list_tools()).tools
-            assert len(tools) == 13
+            assert len(tools) == 15
             assert await tool_text(mcp, "list_projects") == "Projects: alpha-app, beta-site."
             assert (
                 await tool_text(mcp, "run_task", {"project": "Alpha App", "prompt": "RESULT Hotovo."})

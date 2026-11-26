@@ -15,6 +15,7 @@ from .inventory import MachineView
 from .pending import PendingEntry, PendingReport, waits_for_permission
 from .protocol import ClaudeInfo, PaneInfo
 from .redact import clean_name, redact
+from .send import Confirmation, risk_words, yes_phrase
 from .targets import Ambiguous, NoTarget, NotFound
 from .transport import TransportError
 
@@ -205,3 +206,97 @@ def format_pending(report: PendingReport) -> str:
     for name in report.partial:
         lines.append(f"Some sessions on {name} could not be checked.")
     return "\n".join(lines)
+
+
+# --- remote_send ----------------------------------------------------------------------------------
+
+
+def send_place(machine: str, pane: PaneInfo, name_window: bool) -> str:
+    """ "fpga on dev", or "fpga window 2 on dev" when `name_window`."""
+    name = clean_name(pane.session) or "unnamed"
+    if name_window and pane.window_index is not None:
+        name += f" window {pane.window_index}"
+    return f"{name} on {machine}"
+
+
+def text_refusal(problem: str, slash_commands: Sequence[str]) -> str:
+    """Why a text is not sent, for a `dispatcher.text_problem` reason."""
+    match problem:
+        case "empty":
+            return "There is nothing to send."
+        case "bang":
+            return "I will not send text starting with an exclamation mark, it would run as a shell command."
+        case "hash":
+            return "I will not send text starting with a hash sign, Claude Code would save it as a memory."
+        case "slash":
+            if not slash_commands:
+                return "Sending slash commands is turned off."
+            return f"I can only send these slash commands: {', '.join(slash_commands)}."
+        case "newline":
+            return "That pane runs no Claude Code, so I only send it a single line."
+        case _:
+            return "That message has characters I will not type, such as tabs or control characters."
+
+
+def _message(text: str) -> str:
+    """The owner's own words, quoted exactly as they will be typed."""
+    return f'"{text}"'
+
+
+def format_readback(item: Confirmation, *, question: str | None, dropped: Sequence[Confirmation]) -> str:
+    """What `remote_send` returns: the target, the question being answered (labelled as the screen's),
+    the exact message, the risk and the yes phrase, then the confirmation id for the model."""
+    parts: list[str] = []
+    if dropped:
+        places = ", ".join(sorted({d.place for d in dropped}))
+        parts.append(f"I dropped the earlier message for {places}.")
+    if question:
+        asks = "asks for permission" if item.permission_answer else "asks"
+        parts.append(
+            f"Ready to send to {item.place}, which {asks}: {quote(question)}. Your message: {_message(item.text)}."
+        )
+    elif item.permission_answer:
+        parts.append(f"Ready to answer the permission question of {item.place} with {_message(item.text)}.")
+    else:
+        parts.append(f"Ready to send to {item.place}: {_message(item.text)}.")
+    if item.risky:
+        parts.append(f"Careful, {risk_words(item.risky)}. To send it anyway, say {yes_phrase(item.risky)}.")
+    else:
+        parts.append("Say yes to send it.")
+    parts.append(f"(confirmation {item.id}, do not read this number aloud)")
+    return " ".join(parts)
+
+
+_NOT_SENT: dict[str, str] = {
+    "gone": "Not sent: the pane is gone.",
+    "changed": "Not sent: that pane now runs a different session.",
+    "draft_present": "Not sent: something is already typed in that session's input.",
+    "vim_normal": "Not sent: that session's input is in vim normal mode, so the text would be read as commands.",
+    "not_claude": "Not sent: switchboard-remote on {machine} does not allow typing into panes without Claude Code.",
+    "not_allowed": "Not sent: switchboard-remote on {machine} does not allow sending.",
+    "not_enabled": "Not sent: sending is not enabled for {machine}.",
+    "bad_text": "Not sent: switchboard-remote on {machine} refused the text.",
+    "bad_request": "Not sent: switchboard-remote on {machine} is too old for sending. Update it there.",
+    "bad_policy": "Not sent: switchboard-remote on {machine} has no valid policy.",
+    "no_policy": "Not sent: switchboard-remote on {machine} has no valid policy.",
+    "tmux_failed": "Not sent: tmux failed on {machine}.",
+    "slow": "Not sent: {machine} answered too slowly. Try again in a moment.",
+}
+
+
+def format_confirm_outcome(item: Confirmation, outcome: str, detail: str | None) -> str:
+    """The spoken result of `remote_send_confirm` for an audit outcome."""
+    machine = item.machine
+    if outcome == "sent":
+        return f"Sent to {item.place}."
+    if outcome == "pasted_no_enter":
+        return "I typed it but did not press Enter, because a permission question just opened. Check that session at the keyboard."
+    if outcome == "unknown":
+        session = item.place.removesuffix(f" on {machine}")
+        return f"I do not know whether it arrived, {machine} stopped answering. Ask me what {session} is doing before sending again."
+    code = outcome.removeprefix("not_sent:")
+    if code == "permission_prompt":
+        return "Not sent: that session is now waiting for a permission decision. Approve it at the keyboard or in the Claude app."
+    if code in _NOT_SENT:
+        return _NOT_SENT[code].format(machine=machine)
+    return f"Not sent: {machine} could not be reached."

@@ -28,6 +28,9 @@ USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]{1,255}")
 SESSION_GLOB_RE = re.compile(r"[A-Za-z0-9_.*?-]{1,64}")
 MODEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+SLASH_COMMAND_RE = re.compile(r"[a-z][a-z0-9:-]{0,31}")
+MAX_RISKY_PATTERNS = 64
+MAX_RISKY_PATTERN_CHARS = 200
 
 Transport = Literal["ssh", "local"]
 
@@ -135,11 +138,45 @@ class SummaryConfig(_Section):
     timeout_seconds: Annotated[Int, Field(ge=5, le=120)] = 15
 
 
+def _risky_pattern(value: str) -> str:
+    if not 1 <= len(value) <= MAX_RISKY_PATTERN_CHARS:
+        raise ValueError(f"must be 1 to {MAX_RISKY_PATTERN_CHARS} characters")
+    try:
+        re.compile(value, re.I)
+    except re.error as err:
+        raise ValueError(f"is not a valid regular expression: {err}") from None
+    return value
+
+
+SlashCommand = Annotated[
+    str, AfterValidator(_matching(SLASH_COMMAND_RE, "a slash command name without the / (a-z, 0-9, : and -)"))
+]
+
+
+class SendConfig(_Section):
+    """`remote_send` and `remote_send_confirm` (docs/SWITCHBOARD.md, "remote_send and remote_send_confirm")."""
+
+    confirm_seconds: Annotated[Int, Field(ge=30, le=600)] = 120
+    max_chars: Annotated[Int, Field(ge=1, le=2000)] = 2000
+    max_pending: Annotated[Int, Field(ge=1, le=5)] = 1
+    min_confirm_seconds: Annotated[Int, Field(ge=0, le=30)] = 4
+    slash_commands: Annotated[list[SlashCommand], Field(max_length=32), AfterValidator(_globs)] = Field(
+        default_factory=list
+    )
+    risky_patterns: Annotated[
+        list[Annotated[str, AfterValidator(_risky_pattern)]], Field(max_length=MAX_RISKY_PATTERNS)
+    ] = Field(default_factory=list)
+    """Case-insensitive regexes added to the built-in risky list (`send.RISKY`), never replacing it."""
+    client_approval: bool = False
+    """`destructiveHint: true` on `remote_send_confirm`, so the Claude app asks on screen each time."""
+
+
 class RemoteConfig(_Section):
     machines: Annotated[list[MachineConfig], Field(max_length=32)] = Field(default_factory=list)
     ssh: SshConfig = Field(default_factory=SshConfig)
     capture_lines: Annotated[Int, Field(ge=10, le=500)] = 60
     summary: SummaryConfig = Field(default_factory=SummaryConfig)
+    send: SendConfig = Field(default_factory=SendConfig)
 
 
 def _interval(value: int) -> int:
@@ -268,6 +305,11 @@ def remote_warnings(
             )
         if machine.send_to_any_pane:
             warnings.append(f"remote machine {machine.name}: sendToAnyPane allows typing into plain shells")
+        if machine.allow_permission_answers:
+            warnings.append(
+                f"remote machine {machine.name}: allowPermissionAnswers lets a voice send answer Claude Code's "
+                "permission questions (a choice number, always risky)"
+            )
         if machine.transport == "ssh":
             warnings += _identity_warnings(
                 machine,

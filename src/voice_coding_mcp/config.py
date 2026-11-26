@@ -26,6 +26,7 @@ from pydantic.alias_generators import to_camel
 
 from .json_file import loads_json
 from .projects import is_inside
+from .remote.audit import audit_size_warning
 from .remote.config import RemoteConfig, WatchConfig, check_remote, remote_warnings
 from .urls import is_loopback_ip, parse_url
 
@@ -410,6 +411,9 @@ def config_warnings(config: Config, *, platform: str | None = None) -> list[str]
             "during a pairing window; turn it off unless you are testing with a local client"
         )
     warnings += remote_warnings(config.remote)
+    audit = audit_size_warning(config.state_dir)
+    if audit is not None:
+        warnings.append(audit)
     return warnings
 
 

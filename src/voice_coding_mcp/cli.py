@@ -1,4 +1,4 @@
-"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher (argparse;
+"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher, audit (argparse;
 usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
@@ -35,6 +35,7 @@ from .json_file import ensure_dir
 from .log import Logger, as_log_level, create_logger, silent_logger
 from .mcp import SERVER_VERSION
 from .notify import HttpNotifier, create_notifier
+from .remote.audit import audit_path, format_audit_table, read_audit
 from .remote.config import remote_warnings
 from .remote.inventory import Inventory
 from .remote.protocol import VersionResponse
@@ -119,6 +120,17 @@ def _minutes(text: str) -> int:
     return minutes
 
 
+def _limit(text: str) -> int:
+    """argparse type of `audit --limit`: a whole number from 1 to 100000."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= 100_000:
+        raise argparse.ArgumentTypeError(f"must be a whole number between 1 and 100000, got {text}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="voice-coding-mcp", description=_DESCRIPTION, epilog=_EPILOG)
     parser.add_argument("-v", "--version", action="version", version=SERVER_VERSION)
@@ -153,6 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     check = command("remote-check", "call the dispatcher of each remote machine (or one) and show what it sees")
     check.add_argument("machine", nargs="?", help="only this machine (its name in remote.machines)")
     command("remote-dispatcher", "print the switchboard-remote dispatcher script, for installing it on a machine")
+    audit = command("audit", "print the remote_send audit log (stateDir/audit.jsonl) as a table")
+    audit.add_argument("--limit", type=_limit, metavar="N", help="only the last N lines (default: all)")
     return parser
 
 
@@ -164,6 +178,7 @@ class ParsedArgs:
     yes: bool = False
     pid_file: str | None = None
     machine: str | None = None
+    limit: int | None = None
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -176,6 +191,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         yes=getattr(ns, "yes", False),
         pid_file=getattr(ns, "pid_file", None),
         machine=getattr(ns, "machine", None),
+        limit=getattr(ns, "limit", None),
     )
 
 
@@ -625,6 +641,17 @@ async def _cmd_remote_check(config: Config, args: ParsedArgs, io: CliIo) -> int:
     return EXIT_ERROR if failed else EXIT_OK
 
 
+def _cmd_audit(config: Config, args: ParsedArgs, io: CliIo) -> int:
+    rows, bad = read_audit(config.state_dir, args.limit)
+    if not rows and not bad:
+        io.out("No sends were audited yet.\n")
+        return EXIT_OK
+    io.out(format_audit_table(rows, with_text=any("text" in row for row in rows)))
+    if bad:
+        io.err(f"warning: {bad} unreadable line(s) in {audit_path(config.state_dir)}\n")
+    return EXIT_OK
+
+
 def _cmd_remote_dispatcher(io: CliIo) -> int:
     with open(DISPATCHER_PATH, encoding="utf-8") as handle:
         io.out(handle.read())
@@ -674,6 +701,8 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
                 return await _cmd_revoke_all(config, args, io)
             case "remote-check":
                 return await _cmd_remote_check(config, args, io)
+            case "audit":
+                return _cmd_audit(config, args, io)
     except Exception as err:
         io.err(f"Error: {err}\n")
         return EXIT_ERROR

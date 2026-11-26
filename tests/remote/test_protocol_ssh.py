@@ -62,7 +62,7 @@ def test_hostile_arguments_never_reach_a_command_string(arg: str) -> None:
         build_command("forced", "capture", [arg, "10"])
 
 
-@pytest.mark.parametrize("verb", ["send", "usage", "LIST", "list;id", "", "list "])
+@pytest.mark.parametrize("verb", ["usage", "SEND", "LIST", "list;id", "", "list "])
 def test_only_known_verbs(verb: str) -> None:
     with pytest.raises(BadRequestError):
         build_command("forced", verb, [])
