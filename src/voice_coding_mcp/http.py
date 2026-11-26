@@ -343,6 +343,7 @@ def create_app(options: CreateAppOptions) -> Starlette:
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         async with session_manager.run():
+            await remote_tools.start()
             idle_close.start()
             if watcher is not None:
                 watcher.start()
@@ -352,6 +353,7 @@ def create_app(options: CreateAppOptions) -> Starlette:
                 if watcher is not None:
                     await watcher.stop()
                 await idle_close.stop()
+                await remote_tools.stop()
                 await remote.aclose()
 
     return Starlette(

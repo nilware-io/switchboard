@@ -26,8 +26,10 @@ from ..log import Logger
 from ..projects import MatchOk
 from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
+from .agents import AgentHub
 from .audit import AuditLog
-from .config import MachineConfig
+from .check import check_machine
+from .config import MachineConfig, command_timeout_seconds
 from .dispatcher import (
     KEY_NAMES,
     KEYS_MENU,
@@ -88,7 +90,7 @@ from .speech import (
     pane_label,
     send_place,
     text_refusal,
-    unreachable_reason,
+    unreachable_sentence,
 )
 from .summarize import Summarizer, SummarizerOptions, last_meaningful_line, screen_hash
 from .targets import Resolved, resolve_target
@@ -125,8 +127,8 @@ KEYS_REFUSAL = {
     "too_many": f"That is too many keys at once; I press at most {MAX_KEYS}.",
     "unknown": f"I can only press {_SPOKEN_KEYS}.",
 }
-UNREACHED_ERRORS = ("refused", "host_key", "auth")
-"""ssh failed before it connected: nothing was typed. Every other failure after the request was
+UNREACHED_ERRORS = ("refused", "host_key", "auth", "not_connected")
+"""ssh failed before it connected, or an agent machine had no connection: nothing was typed. Every other failure after the request was
 handed over (also `dispatcher_missing`, which an unexpected banner can cause) is an unknown outcome."""
 
 
@@ -160,6 +162,9 @@ class RemoteToolsOptions:
     `claude.configDir`, else `~/.claude` (as the upstream session tools)."""
     new_confirmation_id: Callable[[], str] | None = None
     """Test hook: how confirmation ids are made (default: random 4-digit numbers)."""
+    agents: AgentHub | None = None
+    """The relay socket server for `agent` machines. Default: one when an agent machine is
+    configured (started by `start`, stopped by `stop`)."""
 
 
 class _Deadline:
@@ -177,8 +182,12 @@ class RemoteTools:
         self._remote = config.remote
         self._manager = options.manager
         self._logger = options.logger.child({"component": "remote"})
+        self.agents = options.agents
+        if self.agents is None and any(m.transport == "agent" for m in config.remote.machines):
+            self.agents = AgentHub(config.remote, config.state_dir, options.logger)
         transports = options.transports or {
-            m.name: make_transport(m, config.remote, config.state_dir, options.base_env) for m in config.remote.machines
+            m.name: make_transport(m, config.remote, config.state_dir, options.base_env, self.agents)
+            for m in config.remote.machines
         }
         self.transports: dict[str, Transport] = dict(transports)
         """One per machine; `usage_report` calls the same ones."""
@@ -215,6 +224,20 @@ class RemoteTools:
                 claude_home=options.claude_home or claude_home_dir(config.claude.config_dir),
             )
         )
+
+    async def start(self) -> None:
+        """Starts serving agent machines (the app's lifespan)."""
+        if self.agents is not None:
+            self.agents.check = self._agent_check
+            await self.agents.start()
+
+    async def stop(self) -> None:
+        if self.agents is not None:
+            await self.agents.stop()
+
+    async def _agent_check(self, name: str) -> tuple[list[str], bool]:
+        """`remote-check <machine>` for an agent machine, asked through the control socket."""
+        return await check_machine(self.inventory, name)
 
     def _deadline(self) -> _Deadline:
         wait = self._config.tasks.sync_wait_seconds
@@ -286,7 +309,7 @@ class RemoteTools:
         name = found.item.name
         view = await self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left())
         if not view.ok:
-            return ToolAnswer(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", True)
+            return ToolAnswer(unreachable_sentence(name, view.error, view.detail), True)
         resolved = resolve_target(view, target)
         if not isinstance(resolved, Resolved):
             return ToolAnswer(format_target_problem(name, resolved), True)
@@ -297,7 +320,7 @@ class RemoteTools:
         if not isinstance(captured, CaptureResponse):
             if captured.detail == "gone":
                 return ToolAnswer(f"{label}: that pane is gone. Ask me to list the sessions again.", True)
-            return ToolAnswer(f"{name} is not reachable: {unreachable_reason(captured.error, captured.detail)}.", True)
+            return ToolAnswer(unreachable_sentence(name, captured.error, captured.detail), True)
         screen = clean_screen(captured.text).rstrip("\n ")
         self._logger.info(
             "tool call",
@@ -432,7 +455,7 @@ class RemoteTools:
             return refuse(f"That message is too long: {len(text)} characters, at most {limit}.", "too_long")
         view = await self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left())
         if not view.ok:
-            return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
+            return refuse(unreachable_sentence(name, view.error, view.detail), "unreachable")
         resolved = resolve_target(view, target)
         if not isinstance(resolved, Resolved):
             return refuse(format_target_problem(name, resolved), "target")
@@ -450,9 +473,7 @@ class RemoteTools:
         if not isinstance(captured, CaptureResponse):
             if captured.detail == "gone":
                 return refuse(f"{place}: that pane is gone. Ask me to list the sessions again.", "gone")
-            return refuse(
-                f"{name} is not reachable: {unreachable_reason(captured.error, captured.detail)}.", "unreachable"
-            )
+            return refuse(unreachable_sentence(name, captured.error, captured.detail), "unreachable")
         screen = clean_screen(captured.text)
         ask = screen_ask(screen) if claude is not None else None
         # At least as broad as the dispatcher's own check (the same `shows_dialog` on the same lines),
@@ -583,7 +604,7 @@ class RemoteTools:
             self._lacks_verb(name, "keys", deadline),
         )
         if not view.ok:
-            return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
+            return refuse(unreachable_sentence(name, view.error, view.detail), "unreachable")
         resolved = resolve_target(view, target)
         if not isinstance(resolved, Resolved):
             return refuse(format_target_problem(name, resolved), "target")
@@ -598,9 +619,7 @@ class RemoteTools:
         if not isinstance(captured, CaptureResponse):
             if captured.detail == "gone":
                 return refuse(f"{place}: that pane is gone. Ask me to list the sessions again.", "gone")
-            return refuse(
-                f"{name} is not reachable: {unreachable_reason(captured.error, captured.detail)}.", "unreachable"
-            )
+            return refuse(unreachable_sentence(name, captured.error, captured.detail), "unreachable")
         screen = clean_screen(captured.text)
         ask = screen_ask(screen) if claude is not None else None
         menu = screen_menu(screen)
@@ -791,7 +810,7 @@ class RemoteTools:
             self._lacks_verb(name, "resize", deadline),
         )
         if not view.ok:
-            return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
+            return refuse(unreachable_sentence(name, view.error, view.detail), "unreachable")
         resolved = resolve_target(view, target)
         if not isinstance(resolved, Resolved):
             return refuse(format_target_problem(name, resolved), "target")
@@ -887,7 +906,8 @@ class RemoteTools:
         session_id = pane.claude.session_id if pane.claude else None
         if session_id != item.session_id:
             return "not_sent:changed", None
-        left = min(float(self._remote.ssh.command_timeout_seconds), deadline.left())
+        machine_config = self.inventory.transport(item.machine).machine
+        left = min(float(command_timeout_seconds(self._remote, machine_config)), deadline.left())
         if left < MIN_SEND_SECONDS:
             return "not_sent:slow", None
         verb = "send"

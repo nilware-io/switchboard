@@ -240,11 +240,15 @@ class Watcher:
                 if name in self._down:
                     self._down.discard(name)
                     if self._watch.notify_unreachable:
-                        pushes.append(f"Machine {name} answers again.")
+                        agent = view.machine.transport == "agent"
+                        pushes.append(
+                            f"Machine {name} is connected again." if agent else f"Machine {name} answers again."
+                        )
                 continue
             self._fails[name] = self._fails.get(name, 0) + 1
             if self._watch.notify_unreachable and self._fails[name] >= UNREACHABLE_TICKS and name not in self._down:
                 self._down.add(name)
-                pushes.append(f"Machine {name} cannot be reached.")
+                agent = view.machine.transport == "agent"
+                pushes.append(f"Machine {name} is not connected." if agent else f"Machine {name} cannot be reached.")
                 self._opts.logger.info("watch push", {"event": "unreachable", "machine": name})
         return pushes

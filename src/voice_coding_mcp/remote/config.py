@@ -13,6 +13,7 @@ import os
 import pwd
 import re
 import stat
+import sys
 from collections.abc import Callable, Iterable
 from typing import Annotated, Literal
 
@@ -29,10 +30,23 @@ REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]{1,255}")
 SESSION_GLOB_RE = re.compile(r"[A-Za-z0-9_.*?-]{1,64}")
 MODEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 SLASH_COMMAND_RE = re.compile(r"[a-z][a-z0-9:-]{0,31}")
+AGENT_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
+"""Paths of the agent sockets and key file (a Unix socket path has at most 108 bytes)."""
 MAX_RISKY_PATTERNS = 64
 MAX_RISKY_PATTERN_CHARS = 200
 
-Transport = Literal["ssh", "local"]
+Transport = Literal["ssh", "local", "agent"]
+AGENT_ONLY_KEYS = (
+    "name",
+    "transport",
+    "sessions",
+    "allow_usage",
+    "allow_send",
+    "allow_permission_answers",
+    "send_to_any_pane",
+)
+"""The keys an `agent` machine may set: there is no connection for the hub to open and no
+explicit-path mode."""
 
 
 def _integral(value: object) -> object:
@@ -69,6 +83,12 @@ def _host(value: str) -> str:
 def _remote_path(value: str) -> str:
     if not REMOTE_PATH_RE.fullmatch(value) or ".." in value.split("/"):
         raise ValueError("must be an absolute path of letters, digits and ._/- only")
+    return value
+
+
+def _agent_path(value: str) -> str:
+    if not AGENT_PATH_RE.fullmatch(value) or ".." in value.split("/"):
+        raise ValueError("must be an absolute path of at most 100 letters, digits and ._/-")
     return value
 
 
@@ -171,12 +191,29 @@ class SendConfig(_Section):
     """`destructiveHint: true` on `remote_send_confirm`, so the Claude app asks on screen each time."""
 
 
+AgentPath = Annotated[str, AfterValidator(_agent_path)]
+
+
+class AgentsConfig(_Section):
+    """Machines that connect out to the hub (docs/SWITCHBOARD.md, "Outbound agents")."""
+
+    socket_path: AgentPath = "/run/switchboard-relay/hub.sock"
+    """Where the hub listens for relay connections."""
+    relay_user: UserName = "sbrelay"
+    """The relay account: only its uid may connect to the socket."""
+    heartbeat_seconds: Annotated[Int, Field(ge=5, le=60)] = 20
+    command_timeout_seconds: Annotated[Int, Field(ge=1, le=60)] = 10
+    authorized_keys_file: AgentPath = "/etc/ssh/switchboard-relay/authorized_keys"
+    """Read only by `remote-check`, for its lint."""
+
+
 class RemoteConfig(_Section):
     machines: Annotated[list[MachineConfig], Field(max_length=32)] = Field(default_factory=list)
     ssh: SshConfig = Field(default_factory=SshConfig)
     capture_lines: Annotated[Int, Field(ge=10, le=500)] = 60
     summary: SummaryConfig = Field(default_factory=SummaryConfig)
     send: SendConfig = Field(default_factory=SendConfig)
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
 
 
 def _interval(value: int) -> int:
@@ -195,9 +232,12 @@ class WatchConfig(_Section):
     include_question: bool = False
 
 
-def check_remote(remote: RemoteConfig, *, allow_non_loopback: bool, state_dir: str) -> list[str]:
+def check_remote(
+    remote: RemoteConfig, *, allow_non_loopback: bool, state_dir: str, platform: str | None = None
+) -> list[str]:
     """Rules across fields and sections, as `path: message` lines (empty when valid)."""
     problems: list[str] = []
+    on = platform or sys.platform
     seen: set[str] = set()
     local = 0
     for index, machine in enumerate(remote.machines):
@@ -219,6 +259,14 @@ def check_remote(remote: RemoteConfig, *, allow_non_loopback: bool, state_dir: s
                 problems.append(
                     f"{path}.claudeHome: only for a local machine; on an ssh machine the dispatcher's --claude-home decides"
                 )
+        elif machine.transport == "agent":
+            for key in sorted(machine.model_fields_set - set(AGENT_ONLY_KEYS)):
+                problems.append(
+                    f"{path}.{to_camel(key)}: not for an agent machine (it connects to the hub; its "
+                    "dispatcher's own command line is its policy)"
+                )
+            if not on.startswith("linux"):
+                problems.append(f"{path}.transport: agent machines need a hub on Linux (SO_PEERCRED)")
         else:
             local += 1
             for key, value in (
@@ -240,6 +288,13 @@ def check_remote(remote: RemoteConfig, *, allow_non_loopback: bool, state_dir: s
     if local > 1:
         problems.append("remote.machines: at most one machine may use transport local")
     return problems
+
+
+def command_timeout_seconds(remote: RemoteConfig, machine: MachineConfig) -> int:
+    """Wall clock per dispatcher call (except usage) on this machine's transport."""
+    if machine.transport == "agent":
+        return remote.agents.command_timeout_seconds
+    return remote.ssh.command_timeout_seconds
 
 
 def known_hosts_path(machine: MachineConfig, state_dir: str) -> str:
@@ -288,6 +343,8 @@ def remote_warnings(
     """Settings that are valid but weaken isolation, as startup warnings. `other_homes` (default: the
     home directories of the passwd database) are where a key of another user would live."""
     warnings: list[str] = []
+    if "agents" in remote.model_fields_set and not any(m.transport == "agent" for m in remote.machines):
+        warnings.append("remote.agents is set but no machine uses transport agent; it is ignored")
     for machine in remote.machines:
         if "*" in machine.sessions:
             warnings.append(

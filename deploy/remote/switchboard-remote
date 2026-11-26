@@ -18,6 +18,10 @@ Invocation, one of:
   security boundary: a key without `command=` opens a shell.
 - Local transport: `python3 -I <this file> --policy-from-hub <policy options> -- <verb> [args]`,
   started by the hub as a child process (refused under sshd).
+- Serve mode (outbound agents): `python3 -I <this file> --serve <policy options>`, started by
+  `switchboard-connect` on the machine with its stdin and stdout wired to an SSH connection out to
+  the hub. It reads request frames (newline-delimited JSON) and answers each with the documents the
+  forced command would write; the policy comes only from this real argv (refused under sshd).
 
 Policy options: --sessions <globs> (comma separated, required), --allow-usage, --allow-send,
 --allow-permission-answers, --send-to-any-pane, --slash-commands <names>, --claude-home <path>.
@@ -51,14 +55,17 @@ import os
 import pwd
 import re
 import secrets
+import select
 import shlex
 import subprocess
 import sys
+import threading
+import traceback
 import unicodedata
 from collections.abc import Iterator
 from typing import BinaryIO
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 PROTOCOL = 1
 VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize")
 PROGRAM = "switchboard-remote"
@@ -152,6 +159,7 @@ LIST_FIELDS = (
 )
 LIST_FORMAT = "\t".join("#{" + name + "}" for name in LIST_FIELDS)
 
+SERVE_OPTION = "--serve"
 FLAG_OPTIONS = ("--allow-usage", "--allow-send", "--allow-permission-answers", "--send-to-any-pane")
 VALUE_OPTIONS = ("--sessions", "--slash-commands", "--claude-home", "--tmux-socket-name")
 
@@ -669,7 +677,7 @@ def parse_options(argv: list[str], env: dict[str, str]) -> tuple[dict[str, objec
             break
         if token == "--policy-from-hub":
             from_hub = True
-        elif token in FLAG_OPTIONS:
+        elif token == SERVE_OPTION or token in FLAG_OPTIONS:
             options[token] = True
         elif token in VALUE_OPTIONS:
             if index + 1 >= len(argv) or token in options:
@@ -754,6 +762,9 @@ def policy_from_file(path: str) -> Policy:
 def resolve_request(argv: list[str], env: dict[str, str]) -> tuple[Policy, list[str]]:
     """The policy and the request tokens (`<verb> [args]`) for this invocation."""
     options, from_hub, rest = parse_options(argv, env)
+    if SERVE_OPTION in options:
+        # Serve mode has its own entry point (`serve`); here it can only be a broken command line.
+        raise RefusedError("bad_policy")
     if from_hub:
         if "SSH_ORIGINAL_COMMAND" in env or "SSH_CONNECTION" in env:
             raise RefusedError("bad_policy")
@@ -1560,9 +1571,25 @@ def respond(argv: list[str], env: dict[str, str], stdin: object = None) -> Itera
     """The response documents for one invocation: one document, or for a successful `usage` a header
     document followed by the usage lines. Never raises for a bad request. `stdin` (bytes or a binary
     file) is read only by `send` and `usage`."""
-    lines: Iterator[dict[str, object]] | None = None
     try:
         policy, tokens = resolve_request(argv, env)
+    except RefusedError as refused:
+        yield refusal(refused.code)
+        return
+    yield from run_request(policy, tokens, env, stdin)
+
+
+def refusal(code: str) -> dict[str, object]:
+    return {"protocol": PROTOCOL, "ok": False, "error": code}
+
+
+def run_request(
+    policy: Policy, tokens: list[str], env: dict[str, str], stdin: object = None
+) -> Iterator[dict[str, object]]:
+    """The response documents for the request `<verb> [args]` under `policy`: the one implementation
+    behind the forced command, the explicit path, the local transport and serve mode."""
+    lines: Iterator[dict[str, object]] | None = None
+    try:
         verb, args = validate_request(tokens)
         if verb == "version":
             body = verb_version(policy)
@@ -1580,7 +1607,7 @@ def respond(argv: list[str], env: dict[str, str], stdin: object = None) -> Itera
         else:
             body = verb_capture(policy, env, args[0], int(args[1]))
     except RefusedError as refused:
-        yield {"protocol": PROTOCOL, "ok": False, "error": refused.code}
+        yield refusal(refused.code)
         return
     response: dict[str, object] = {"protocol": PROTOCOL, "ok": True}
     response.update(body)
@@ -1594,8 +1621,323 @@ def handle(argv: list[str], env: dict[str, str], stdin: object = None) -> dict[s
     return next(respond(argv, env, stdin))
 
 
+# --- serve mode ------------------------------------------------------------------------------
+#
+# The machine connects out to the hub (`switchboard-connect` runs `ssh` with its stdin and stdout
+# wired to this process). Frames are newline-delimited JSON objects, written ASCII-only. The hub
+# sends `req`, `ping`, `cancel`, `welcome` and `bye`; this side sends `hello` once, then `res`, `pong`
+# and `error`. A request runs through `run_request` exactly like `SSH_ORIGINAL_COMMAND` does, so every
+# rule and refusal code is the forced command's. The policy is this process's own argv, always.
+
+SERVE_PROTOCOL = 1
+MAX_HUB_FRAME_BYTES = 2 * 1024 * 1024
+"""Longest frame from the hub (a usage known-list of at most 1 MB as a JSON string fits)."""
+MAX_MACHINE_FRAME_BYTES = 5 * 1024 * 1024
+"""Longest frame to the hub (a 4 MB response document plus its envelope)."""
+MAX_FRAME_ID = 2**53 - 1
+SERVE_WORKERS = 4
+SERVE_MAX_ARGS = 16
+SERVE_SILENCE_SECONDS = 180.0
+"""End serve mode after this long without any frame from the hub (it pings far more often)."""
+EXIT_REPLACED = 75
+EXIT_REFUSED = 76
+BYE_EXIT = {"replaced": EXIT_REPLACED, "unknown_machine": EXIT_REFUSED, "protocol": EXIT_REFUSED, "shutdown": 0}
+MUTATING_VERBS = ("send", "keys", "resize")
+STDIN_VERBS = ("send", "usage")
+FRAME_ERRORS = ("bad_frame", "frame_too_large", "duplicate_id", "busy", "crashed")
+_HUB_FRAMES = {
+    "req": ({"t", "id", "verb", "args"}, {"input"}),
+    "ping": ({"t", "id"}, set()),
+    "cancel": ({"t", "id"}, set()),
+    "welcome": ({"t", "protocol"}, set()),
+    "bye": ({"t", "reason"}, set()),
+}
+_EOF = "eof"
+_SILENCE = "silence"
+_TOO_LARGE = "too_large"
+
+
+def serve_requested(argv: list[str]) -> bool:
+    """`--serve` among the leading options (skipping option values, as `parse_options` does)."""
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--" or not token.startswith("-"):
+            return False
+        if token == SERVE_OPTION:
+            return True
+        index += 2 if token in VALUE_OPTIONS else 1
+    return False
+
+
+def serve_policy(argv: list[str], env: dict[str, str]) -> Policy | None:
+    """The policy of a serve-mode command line, None when it is broken (every request is then
+    answered `bad_policy`, so the mistake shows up on the hub)."""
+    try:
+        options, from_hub, rest = parse_options(argv, env)
+        if from_hub or rest or options.pop(SERVE_OPTION, None) is not True:
+            return None
+        return policy_from_options(options)
+    except RefusedError:
+        return None
+
+
+def frame_line(frame: dict[str, object]) -> bytes:
+    return (json.dumps(frame, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _frame_id(value: object) -> bool:
+    return type(value) is int and 1 <= value <= MAX_FRAME_ID
+
+
+def parse_hub_frame(line: bytes) -> tuple[dict[str, object] | None, object]:
+    """(frame, id): the frame when it has exactly the schema of its type, else None and the id to
+    name in the `bad_frame` error (None when there is no valid one)."""
+    try:
+        data = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    frame_id = data.get("id") if _frame_id(data.get("id")) else None
+    kind = data.get("t")
+    shape = _HUB_FRAMES.get(kind) if isinstance(kind, str) else None
+    if shape is None:
+        return None, frame_id
+    required, optional = shape
+    keys = set(data)
+    if not required <= keys or not keys <= required | optional:
+        return None, frame_id
+    if "id" in required and frame_id is None:
+        return None, None
+    if kind == "req":
+        args = data["args"]
+        if (
+            not isinstance(data["verb"], str)
+            or not isinstance(args, list)
+            or len(args) > SERVE_MAX_ARGS
+            or not all(isinstance(arg, str) for arg in args)
+            or not isinstance(data.get("input", ""), str)
+        ):
+            return None, frame_id
+    elif kind == "welcome":
+        if type(data["protocol"]) is not int or data["protocol"] != SERVE_PROTOCOL:
+            return None, None
+    elif kind == "bye" and data["reason"] not in BYE_EXIT:
+        return None, None
+    return data, frame_id
+
+
+class LineReader:
+    """Newline-terminated lines from a file descriptor, at most `limit` bytes each (without the
+    newline), with a timeout per wait."""
+
+    def __init__(self, fd: int, limit: int) -> None:
+        self.fd = fd
+        self.limit = limit
+        self.buffer = bytearray()
+
+    def next(self, timeout: float) -> bytes | str:
+        """A line, or `_EOF`, `_SILENCE` (nothing within `timeout` seconds) or `_TOO_LARGE`."""
+        while True:
+            end = self.buffer.find(b"\n")
+            if end >= 0:
+                if end > self.limit:
+                    return _TOO_LARGE
+                line = bytes(self.buffer[:end])
+                del self.buffer[: end + 1]
+                return line
+            if len(self.buffer) > self.limit:
+                return _TOO_LARGE
+            try:
+                ready, _, _ = select.select([self.fd], [], [], max(0.0, timeout))
+            except (OSError, ValueError):
+                return _EOF
+            if not ready:
+                return _SILENCE
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                return _EOF
+            if not chunk:
+                return _EOF
+            self.buffer.extend(chunk)
+
+
+class Server:
+    """One serve-mode connection: the reader runs in the calling thread, requests in worker threads."""
+
+    def __init__(self, policy: Policy | None, env: dict[str, str], out_fd: int) -> None:
+        self.policy = policy
+        self.env = env
+        self.out_fd = out_fd
+        self.write_lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        """`send`, `keys` and `resize` run one at a time: their checks and keystrokes never interleave."""
+        self.state_lock = threading.Lock()
+        self.inflight: dict[int, threading.Event] = {}
+        self.workers: list[threading.Thread] = []
+        self.broken = threading.Event()
+
+    def write(self, frame: dict[str, object]) -> bool:
+        line = frame_line(frame)
+        if len(line) > MAX_MACHINE_FRAME_BYTES:
+            # Not reachable with the dispatcher's own caps; the framing stays intact anyway.
+            line = frame_line({"t": "error", "id": frame.get("id"), "error": "frame_too_large"})
+        with self.write_lock:
+            if self.broken.is_set():
+                return False
+            view = memoryview(line)
+            try:
+                while view:
+                    written = os.write(self.out_fd, view)
+                    view = view[written:]
+            except OSError:
+                self.broken.set()
+                return False
+        return True
+
+    def hello(self) -> None:
+        policy = self.policy
+        self.write(
+            {
+                "t": "hello",
+                "protocol": SERVE_PROTOCOL,
+                "version": VERSION,
+                "verbs": list(VERBS),
+                "allowSend": bool(policy and policy.allow_send),
+                "allowUsage": bool(policy and policy.allow_usage),
+                "policy": "ok" if policy is not None else "bad_policy",
+            }
+        )
+
+    def documents(self, verb: str, args: list[str], data: str | None) -> Iterator[dict[str, object]]:
+        if self.policy is None:
+            return iter([refusal("bad_policy")])
+        if data is not None and verb not in STDIN_VERBS:
+            return iter([refusal("bad_request")])
+        # Lone surrogates stay invalid UTF-8, which the verbs refuse as they would on stdin.
+        stdin = data.encode("utf-8", "surrogatepass") if data is not None else b""
+        return run_request(self.policy, [verb, *args], self.env, stdin)
+
+    def run_request(
+        self, request_id: int, verb: str, args: list[str], data: str | None, cancel: threading.Event
+    ) -> None:
+        try:
+            docs = self.documents(verb, args, data)
+            if verb in MUTATING_VERBS:
+                with self.send_lock:
+                    current = next(docs)
+            else:
+                current = next(docs)
+            streaming = verb == "usage"
+            while not self.broken.is_set():
+                if streaming and cancel.is_set():
+                    # The hub gave up: stop at this record and say so in the last frame.
+                    self.write({"t": "res", "id": request_id, "doc": current, "more": True})
+                    self.write({"t": "res", "id": request_id, "doc": refusal("cancelled")})
+                    return
+                following = next(docs, None)
+                if following is None:
+                    self.write({"t": "res", "id": request_id, "doc": current})
+                    return
+                self.write({"t": "res", "id": request_id, "doc": current, "more": True})
+                current = following
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            self.write({"t": "error", "id": request_id, "error": "crashed"})
+        finally:
+            with self.state_lock:
+                self.inflight.pop(request_id, None)
+
+    def start_request(self, frame: dict[str, object]) -> None:
+        request_id = frame["id"]
+        assert isinstance(request_id, int)
+        with self.state_lock:
+            if request_id in self.inflight:
+                error = "duplicate_id"
+            elif len(self.inflight) >= SERVE_WORKERS:
+                error = "busy"
+            else:
+                error = ""
+                cancel = threading.Event()
+                self.inflight[request_id] = cancel
+        if error:
+            self.write({"t": "error", "id": request_id, "error": error})
+            return
+        verb, args, data = frame["verb"], frame["args"], frame.get("input")
+        assert isinstance(verb, str)
+        assert isinstance(args, list)
+        worker = threading.Thread(
+            target=self.run_request,
+            args=(request_id, verb, [str(arg) for arg in args], data if isinstance(data, str) else None, cancel),
+            name=f"request-{request_id}",
+        )
+        self.workers = [thread for thread in self.workers if thread.is_alive()]
+        self.workers.append(worker)
+        worker.start()
+
+    def loop(self, reader: LineReader, silence_seconds: float) -> int:
+        """Reads frames until the hub closes, says bye or goes silent; the exit code."""
+        while not self.broken.is_set():
+            line = reader.next(silence_seconds)
+            if line in (_EOF, _SILENCE):
+                return 0
+            if line == _TOO_LARGE:
+                self.write({"t": "error", "id": None, "error": "frame_too_large"})
+                return EXIT_REFUSED
+            assert isinstance(line, bytes)
+            frame, frame_id = parse_hub_frame(line)
+            if frame is None:
+                self.write({"t": "error", "id": frame_id, "error": "bad_frame"})
+                continue
+            kind = frame["t"]
+            if kind == "req":
+                self.start_request(frame)
+            elif kind == "ping":
+                self.write({"t": "pong", "id": frame["id"]})
+            elif kind == "cancel":
+                cancel_id = frame["id"]
+                with self.state_lock:
+                    event = self.inflight.get(cancel_id) if isinstance(cancel_id, int) else None
+                if event is not None:
+                    event.set()
+            elif kind == "bye":
+                return BYE_EXIT[str(frame["reason"])]
+        return 0
+
+    def finish(self) -> None:
+        """Lets running requests end (a send in progress completes; tmux calls are capped)."""
+        with self.state_lock:
+            for event in self.inflight.values():
+                event.set()
+        for worker in self.workers:
+            worker.join()
+
+
+def serve(
+    argv: list[str], env: dict[str, str], in_fd: int, out_fd: int, silence_seconds: float = SERVE_SILENCE_SECONDS
+) -> int:
+    """Serve mode on `in_fd` (frames from the hub) and `out_fd` (frames to the hub); the exit code:
+    0 at the end of input, after silence or after `bye shutdown`, 75 after `bye replaced`, 76 after
+    `bye unknown_machine` or `bye protocol` or an oversized frame."""
+    if "SSH_ORIGINAL_COMMAND" in env or "SSH_CONNECTION" in env:
+        # Someone made serve mode a forced command: answer like a broken forced command does.
+        os.write(out_fd, frame_line(refusal("bad_policy")))
+        return 0
+    server = Server(serve_policy(argv, env), env, out_fd)
+    server.hello()
+    try:
+        return server.loop(LineReader(in_fd, MAX_HUB_FRAME_BYTES), silence_seconds)
+    finally:
+        server.finish()
+
+
 def main() -> int:
-    for document in respond(sys.argv[1:], dict(os.environ), sys.stdin.buffer):
+    argv = sys.argv[1:]
+    if serve_requested(argv):
+        return serve(argv, dict(os.environ), sys.stdin.fileno(), sys.stdout.fileno())
+    for document in respond(argv, dict(os.environ), sys.stdin.buffer):
         sys.stdout.write(json.dumps(document, ensure_ascii=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
     return 0

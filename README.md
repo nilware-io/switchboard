@@ -72,7 +72,7 @@ The full runbook, including deploy keys and the Claude side of pairing, is [Part
 
 ## Switchboard
 
-This fork (nilware-io/switchboard) adds tools to talk to Claude Code sessions that already run inside tmux, on the machine the server runs on and on other machines over SSH. The design is [docs/SWITCHBOARD.md](docs/SWITCHBOARD.md); the step-by-step setup on Windows with WSL is [docs/SETUP-WSL.md](docs/SETUP-WSL.md).
+This fork (nilware-io/switchboard) adds tools to talk to Claude Code sessions that already run inside tmux, on the machine the server runs on and on other machines over SSH. The design is [docs/SWITCHBOARD.md](docs/SWITCHBOARD.md); the step-by-step setup on Windows with WSL is [docs/SETUP-WSL.md](docs/SETUP-WSL.md). Machines can also connect out to the hub instead of the hub connecting to them (for a WSL box behind NAT, laptops, LAN machines): no sshd or open port on the machine, setup in [docs/SETUP-AGENTS.md](docs/SETUP-AGENTS.md).
 
 - `list_remote_sessions`, `remote_status`: the machines from the config, their allowed tmux sessions, and a short spoken summary of what a session's screen shows.
 - `pending_input`: which sessions wait for you, and what each asks. An optional watcher pushes a notification when one starts waiting or finishes a long turn.

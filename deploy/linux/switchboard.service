@@ -36,6 +36,9 @@ KillMode=control-group
 TimeoutStopSec=30s
 # New files (state, logs, project files written by Claude Code) are private.
 UMask=0077
+# The relay socket of machines that connect out to the hub (transport "agent"); the tmpfiles line
+# in deploy/relay/ names this user as the owner instead of vcm. "-": ignored while it does not exist.
+ReadWritePaths=-/run/switchboard-relay
 
 # Hardening, as deploy/voice-coding-mcp.service (see the comments there for what is deliberately
 # left out so Claude Code can still build, test and use its bubblewrap sandbox).

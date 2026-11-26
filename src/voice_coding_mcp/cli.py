@@ -1,5 +1,5 @@
-"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher, audit, usage,
-set-public-url (argparse; usage errors exit 2).
+"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher,
+remote-connector, agent-relay, audit, usage, set-public-url (argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -35,11 +35,12 @@ from .json_file import ensure_dir, loads_json, write_json_atomic
 from .log import Logger, as_log_level, create_logger, silent_logger
 from .mcp import SERVER_VERSION
 from .notify import HttpNotifier, create_notifier
+from .remote import relay
+from .remote.agents import CONTROL_SOCKET_NAME, control_request, lint_authorized_keys
 from .remote.audit import audit_path, format_audit_table, read_audit
+from .remote.check import check_machine
 from .remote.config import remote_warnings
 from .remote.inventory import Inventory
-from .remote.protocol import VersionResponse
-from .remote.speech import machine_line, unreachable_reason
 from .remote.transport import DISPATCHER_PATH, make_transport
 from .sessions import claude_home_dir
 from .tasks.manager import TaskManager, TaskManagerOptions, load_tasks
@@ -169,6 +170,16 @@ def build_parser() -> argparse.ArgumentParser:
     check = command("remote-check", "call the dispatcher of each remote machine (or one) and show what it sees")
     check.add_argument("machine", nargs="?", help="only this machine (its name in remote.machines)")
     command("remote-dispatcher", "print the switchboard-remote dispatcher script, for installing it on a machine")
+    command(
+        "remote-connector",
+        "print the switchboard-connect script, for installing it on a machine that connects out to the hub",
+    )
+    agent_relay = command(
+        "agent-relay",
+        "the relay between one machine's SSH connection and the hub (the forced command of the relay account)",
+    )
+    agent_relay.add_argument("--machine", required=True, help="the agent machine this key belongs to")
+    agent_relay.add_argument("--socket", help=f"the hub's relay socket (default: {relay.DEFAULT_SOCKET})")
     audit = command("audit", "print the remote_send audit log (stateDir/audit.jsonl) as a table")
     audit.add_argument("--limit", type=_limit, metavar="N", help="only the last N lines (default: all)")
     usage = command("usage", "active hours, billable amount and token cost per project, session or day")
@@ -202,6 +213,7 @@ class ParsedArgs:
     csv: bool = False
     cached: bool = False
     url: str | None = None
+    socket: str | None = None
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -221,6 +233,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         csv=getattr(ns, "csv", False),
         cached=getattr(ns, "cached", False),
         url=getattr(ns, "url", None),
+        socket=getattr(ns, "socket", None),
     )
 
 
@@ -308,8 +321,58 @@ async def _cmd_status(config: Config, io: CliIo) -> int:
     total = sum(counts.values())
     parts = [f"{counts[s]} {s}" for s in _STATUS_ORDER if counts.get(s)]
     lines.append(f"Tasks: {total}{f' ({", ".join(parts)})' if parts else ''}")
+    lines += await _agent_status_lines(config, now)
     io.out("\n".join(lines) + "\n")
     return EXIT_OK
+
+
+def _control_path(config: Config) -> str:
+    return os.path.join(config.state_dir, CONTROL_SOCKET_NAME)
+
+
+def _clean(value: object) -> str:
+    return strip_control_chars(str(value))[:200]
+
+
+async def _agent_status_lines(config: Config, now: int) -> list[str]:
+    """`Agent machines:` and a line per machine, from the running hub's control socket."""
+    names = [m.name for m in config.remote.machines if m.transport == "agent"]
+    if not names:
+        return []
+    answer = await control_request(_control_path(config), {"t": "status"})
+    if answer is None or not isinstance(answer.get("machines"), list):
+        return ["Agent machines: the hub is not running, so none is connected"]
+    lines = ["Agent machines:"]
+    if answer.get("problem"):
+        lines.append(f"  warning: the relay socket is not served: {_clean(answer['problem'])}")
+    for entry in answer["machines"]:
+        if not isinstance(entry, dict):
+            continue
+        name = _clean(entry.get("name"))
+        since = entry.get("sinceMs")
+        if entry.get("connected") and isinstance(since, int):
+            peer = f", from {_clean(entry['peer'])}" if entry.get("peer") else ""
+            line = (
+                f"  - {name}: connected since {format_time(since)} ({format_ago(since, now)}), "
+                f"dispatcher {_clean(entry.get('version'))}, send {'allowed' if entry.get('allowSend') else 'off'}, "
+                f"usage {'allowed' if entry.get('allowUsage') else 'off'}{peer}"
+            )
+        else:
+            last = entry.get("lastDisconnectMs")
+            when = (
+                f", last connection ended {format_ago(last, now)} ({_clean(entry.get('lastDisconnectReason'))})"
+                if isinstance(last, int)
+                else ""
+            )
+            line = f"  - {name}: not connected{when}"
+        replaced = entry.get("replacementsLastHour")
+        if isinstance(replaced, int) and replaced:
+            line += f", replaced {replaced} time(s) in the last hour"
+        lines.append(line)
+        warnings = entry.get("warnings")
+        if isinstance(warnings, list):
+            lines += [f"    warning: {_clean(w)}" for w in warnings]
+    return lines
 
 
 async def _cmd_revoke_all(config: Config, args: ParsedArgs, io: CliIo) -> int:
@@ -639,6 +702,17 @@ async def _cmd_remote_check(config: Config, args: ParsedArgs, io: CliIo) -> int:
     failed = False
     lines: list[str] = []
     for machine in machines:
+        if machine.transport == "agent":
+            lines.append(f"{machine.name} (agent: connects out to the hub)")
+            answer = await control_request(_control_path(config), {"t": "check", "machine": machine.name})
+            if answer is None:
+                failed = True
+                lines.append("  not checked: the hub is not running (only the hub holds agent connections)")
+                continue
+            got = answer.get("lines")
+            lines += [_clean(line) for line in got if isinstance(line, str)] if isinstance(got, list) else []
+            failed = failed or answer.get("ok") is not True
+            continue
         where = (
             "local dispatcher"
             if machine.transport == "local"
@@ -646,28 +720,32 @@ async def _cmd_remote_check(config: Config, args: ParsedArgs, io: CliIo) -> int:
             + ("" if machine.dispatcher == "forced" else f", dispatcher {machine.dispatcher}")
         )
         lines.append(f"{machine.name} ({where})")
-        lines += [f"  warning: {w}" for w in warnings if w.startswith(f"remote machine {machine.name}:")]
-        version = await inventory.version(machine.name)
-        if not version.ok:
-            failed = True
-            lines.append(f"  not reachable: {unreachable_reason(version.error, version.detail)}")
-            continue
-        data = version.data
-        if isinstance(data, VersionResponse):
-            lines.append(
-                f"  switchboard-remote {data.version}, verbs {', '.join(data.verbs)}, "
-                f"send {'allowed' if data.allow_send else 'off'}, usage {'allowed' if data.allow_usage else 'off'}"
-            )
-        view = await inventory.view(machine.name)
-        if not view.ok:
-            failed = True
-        lines.append("  " + machine_line(view))
+        machine_lines, ok = await check_machine(inventory, machine.name, warnings)
+        lines += machine_lines
+        failed = failed or not ok
+    if any(m.transport == "agent" for m in machines):
+        lines += _authorized_keys_lines(config)
     if _settings_hooks(config):
         lines.append(
             "warning: the server user's Claude Code settings.json defines hooks; the remote summariser loads user settings, so they run for every summary"
         )
     io.out("\n".join(lines) + "\n")
     return EXIT_ERROR if failed else EXIT_OK
+
+
+def _authorized_keys_lines(config: Config) -> list[str]:
+    """The lint of the relay account's authorized_keys, when this user can read it."""
+    path = config.remote.agents.authorized_keys_file
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(1024 * 1024)
+    except OSError:
+        return [f"relay keys ({path}): not readable here, not checked"]
+    agents = [m.name for m in config.remote.machines if m.transport == "agent"]
+    problems = lint_authorized_keys(text, agents)
+    if not problems:
+        return [f"relay keys ({path}): ok"]
+    return [f"relay keys ({path}):"] + [f"  problem: {_clean(p)}" for p in problems]
 
 
 def _cmd_audit(config: Config, args: ParsedArgs, io: CliIo) -> int:
@@ -759,6 +837,15 @@ def _cmd_remote_dispatcher(io: CliIo) -> int:
     return EXIT_OK
 
 
+CONNECTOR_PATH = os.path.join(os.path.dirname(DISPATCHER_PATH), "connector.py")
+
+
+def _cmd_remote_connector(io: CliIo) -> int:
+    with open(CONNECTOR_PATH, encoding="utf-8") as handle:
+        io.out(handle.read())
+    return EXIT_OK
+
+
 async def main(argv: Sequence[str], io: CliIo) -> int:
     """Runs one CLI invocation and returns the exit code."""
     try:
@@ -770,13 +857,17 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
         io.err(f"{err.usage}{err.prog}: error: {err}\n")
         return EXIT_USAGE
 
-    if args.command == "remote-dispatcher":
+    if args.command in ("remote-dispatcher", "remote-connector"):
         # Needs no config: it prints the bundled script.
         try:
-            return _cmd_remote_dispatcher(io)
+            return _cmd_remote_dispatcher(io) if args.command == "remote-dispatcher" else _cmd_remote_connector(io)
         except OSError as err:
             io.err(f"Error: {err}\n")
             return EXIT_ERROR
+    if args.command == "agent-relay":
+        # Needs no config either; the forced command uses `python -I -m voice_coding_mcp.remote.relay`.
+        relay_argv = ["--machine", args.machine or ""] + (["--socket", args.socket] if args.socket else [])
+        return relay.run(relay_argv, dict(io.env))
 
     config_path = args.config or io.env.get("VCM_CONFIG") or DEFAULT_CONFIG_PATH
     try:

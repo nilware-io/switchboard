@@ -1,0 +1,29 @@
+# Example systemd --user unit for a machine that connects out to the Switchboard hub
+# (docs/SWITCHBOARD.md, "Outbound agents"). Install as the machine's own user:
+#
+#   install -D -m 644 deploy/remote/switchboard-connect.service ~/.config/systemd/user/switchboard-connect.service
+#   systemctl --user daemon-reload && systemctl --user enable --now switchboard-connect
+#   sudo loginctl enable-linger USER    (once: start at boot, keep running without a login)
+#
+# Edit the hub address and the dispatcher's policy flags after "--" (the same flags as a forced
+# command: --sessions, --allow-usage, --allow-send, --allow-permission-answers, --send-to-any-pane,
+# --slash-commands, --claude-home). The policy is this line; the hub cannot change it.
+
+[Unit]
+Description=Switchboard: outbound connection to the hub
+Documentation=https://github.com/nilware-io/switchboard/blob/main/docs/SWITCHBOARD.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I %h/.local/bin/switchboard-connect --host hub.example.org --user sbrelay --identity %h/.ssh/switchboard_relay --known-hosts %h/.config/switchboard-connect/known_hosts -- /usr/bin/python3 -I %h/.local/bin/switchboard-remote --serve --sessions fpga,notes --allow-usage
+# The connector reconnects by itself (capped, jittered backoff); this only covers a crash of it.
+Restart=always
+RestartSec=30
+UMask=0077
+NoNewPrivileges=yes
+# No PrivateTmp, ProtectHome or the like: the dispatcher reaches the owner's tmux socket
+# (/tmp/tmux-<uid>) and ~/.claude, as a forced command does. No network-online.target either (a
+# user manager cannot wait for it); the backoff covers a machine that boots offline.
+
+[Install]
+WantedBy=default.target

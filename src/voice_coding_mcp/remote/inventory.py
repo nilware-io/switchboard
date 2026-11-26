@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from ..clock import SECOND_MS, now_ms
 from ..log import Logger
 from ..projects import MatchFailed, MatchOk, MatchResult, match_by_name
-from .config import MachineConfig, RemoteConfig
+from .config import MachineConfig, RemoteConfig, command_timeout_seconds
 from .protocol import CaptureResponse, ListResponse, PaneInfo
 from .transport import Transport, TransportError, TransportResult
 
@@ -70,8 +70,8 @@ class Inventory:
     def machines(self) -> list[MachineConfig]:
         return list(self._remote.machines)
 
-    def _timeout(self, budget_seconds: float | None) -> float:
-        limit = float(self._remote.ssh.command_timeout_seconds)
+    def _timeout(self, name: str, budget_seconds: float | None) -> float:
+        limit = float(command_timeout_seconds(self._remote, self._transports[name].machine))
         return max(0.5, min(limit, budget_seconds)) if budget_seconds is not None else limit
 
     def _log(self, machine: str, verb: str, result: TransportResult) -> None:
@@ -94,7 +94,7 @@ class Inventory:
             return cached
         transport = self._transports[name]
         machine = transport.machine
-        result = await transport.call("list", timeout_seconds=self._timeout(budget_seconds))
+        result = await transport.call("list", timeout_seconds=self._timeout(name, budget_seconds))
         self._log(name, "list", result)
         if not result.ok or not isinstance(result.data, ListResponse):
             return MachineView(machine=machine, error=result.error or "bad_response", detail=result.detail)
@@ -120,7 +120,7 @@ class Inventory:
         """The captured pane, or the failed TransportResult. A pane whose session (as the capture
         reports it) fails the hub's allow-list counts as gone."""
         result = await self._transports[name].call(
-            "capture", [pane_id, str(lines)], timeout_seconds=self._timeout(budget_seconds)
+            "capture", [pane_id, str(lines)], timeout_seconds=self._timeout(name, budget_seconds)
         )
         self._log(name, "capture", result)
         if result.ok and isinstance(result.data, CaptureResponse):
@@ -138,7 +138,7 @@ class Inventory:
         return result
 
     async def version(self, name: str, *, budget_seconds: float | None = None) -> TransportResult:
-        result = await self._transports[name].call("version", timeout_seconds=self._timeout(budget_seconds))
+        result = await self._transports[name].call("version", timeout_seconds=self._timeout(name, budget_seconds))
         self._log(name, "version", result)
         return result
 

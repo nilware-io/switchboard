@@ -40,6 +40,9 @@ StateDirectory=voice-coding-mcp
 StateDirectoryMode=0700
 # New files (state, logs, project files written by Claude Code) are private.
 UMask=0077
+# The relay socket of machines that connect out to the hub (transport "agent";
+# deploy/relay/tmpfiles-switchboard-relay.conf). "-": ignored while it does not exist.
+ReadWritePaths=-/run/switchboard-relay
 
 # Hardening. Claude Code must still be able to do normal dev work as vcm:
 # write projects, ~/.claude, ~/.npm, ~/.cache, run git, npm, build tools,
