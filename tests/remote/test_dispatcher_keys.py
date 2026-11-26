@@ -15,7 +15,16 @@ from typing import Any
 import pytest
 
 from tests.remote.helpers import DISPATCHER, SESSION_A, SESSION_B, RemoteWorld, pane
-from tests.remote.menu_fixtures import capture, described_menu_lines, menu_lines, plain_menu_lines
+from tests.remote.menu_fixtures import (
+    PROSE_DIALOG,
+    PROSE_YES_NO,
+    capture,
+    described_menu_lines,
+    menu_lines,
+    numbered_draft,
+    plain_menu_lines,
+    tall_menu_lines,
+)
 from voice_coding_mcp.remote import dispatcher as d
 
 SESSIONS = ["--sessions", "fpga,notes,work-*"]
@@ -488,3 +497,89 @@ def test_a_numbered_menu_with_long_descriptions_is_found_under_a_picker_footer()
     # Without the picker footer the old limit holds: prose with a numbered list is no menu.
     prose = "\n".join(["1. A", *(f"text {i}" for i in range(6)), "2. B", "esc to cancel"])
     assert d.find_menu(prose) is None
+
+
+# --- prose that looks like a dialog, numbered drafts, menus cut by a short pane ---------------
+
+
+@pytest.mark.parametrize("screen", [PROSE_DIALOG, PROSE_YES_NO], ids=["do-you-want-to", "yes-no-list"])
+def test_answer_mode_on_prose_that_looks_like_a_dialog_follows_the_unbound_rules(
+    world: RemoteWorld, screen: str
+) -> None:
+    """`dialog_hash` sees a dialog in assistant prose above an idle input box, but no answer options
+    are at the bottom: Up Enter would submit an earlier prompt, BTab cycle the permission mode and
+    Enter submit a draft. Answer mode then counts as unbound."""
+    bound = d.dialog_hash(screen)
+    assert bound is not None
+    assert d.dialog_bound(screen) is False
+    assert d.find_menu(screen) is None
+    allowed = [*FORCED, "--allow-permission-answers"]
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
+    answer = f"answer {bound}"
+    assert keys(world, "Up", "Enter", bound=answer, forced=allowed)["error"] == "history_submit"
+    assert keys(world, "BTab", "BTab", bound=answer, forced=allowed)["error"] == "mode_keys"
+    assert keys(world, "Tab", bound=answer, forced=allowed)["error"] == "mode_keys"
+    assert pressed(world) == []
+    # A draft or vim normal mode in the input box under the prose: refused as without a menu.
+    draft = screen.replace("│ >                │", "│ > rm -rf build   │")
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": draft})
+    assert keys(world, "Enter", bound=f"answer {d.dialog_hash(draft)}", forced=allowed)["error"] == "draft_present"
+    vim = screen + "  -- NORMAL --\n"
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": vim})
+    assert keys(world, "Enter", bound=f"answer {d.dialog_hash(vim)}", forced=allowed)["error"] == "vim_normal"
+    assert pressed(world) == []
+    # Enter alone at the empty input submits nothing and still goes; menu mode stays refused.
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+    assert keys(world, "Enter", bound=answer, forced=allowed)["ok"] is True
+    assert keys(world, "Escape", bound="menu none", forced=allowed)["error"] == "permission_prompt"
+    assert pressed(world) == [["send-keys", "-t", "%1", "Enter"]]
+
+
+def test_a_real_dialog_is_bound() -> None:
+    assert d.dialog_bound(DIALOG) is True
+    assert d.dialog_bound(DIALOG.replace("  Esc to cancel\n", "")) is True
+    assert d.dialog_bound(EMPTY_BOX) is False
+    # Prose "Do you want to ...?" above a real menu of its own is not that menu's question.
+    above = "Do you want to see the options?\n" + "\n".join(menu_lines()) + "\n"
+    assert d.dialog_hash(above) is not None
+    assert d.find_menu(above) is not None
+    assert d.dialog_bound(above) is False
+
+
+@pytest.mark.parametrize("lines", [2, 3])
+@pytest.mark.parametrize("boxed", [True, False], ids=["rounded-box", "rules"])
+def test_a_numbered_draft_in_the_input_box_is_no_menu(world: RemoteWorld, lines: int, boxed: bool) -> None:
+    """`> 1. fix the parser` / `2. update tests` typed in Claude Code's input box: the marked line is
+    the input prompt and the status line is skipped, but it is a draft, never a menu, so Enter, BTab
+    and Up Enter get the unbound rules."""
+    screen = numbered_draft(lines, boxed=boxed)
+    assert d.find_menu(screen) is None
+    assert d.menu_hash(screen) is None
+    assert d.shows_draft(screen) is True
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
+    assert keys(world, "Enter", bound="menu none")["error"] == "draft_present"
+    assert keys(world, "BTab", "BTab", bound="menu none")["error"] == "mode_keys"
+    assert keys(world, "Up", "Enter", bound="menu none")["error"] == "history_submit"
+    assert keys(world, "Enter", bound=f"menu {'0' * 24}")["error"] == "menu_changed"
+    assert pressed(world) == []
+
+
+def test_a_boxed_menu_under_a_picker_footer_with_option_one_first_is_still_a_menu() -> None:
+    """The input box rule is about drafts: a picker footer (which no input box has) keeps a boxed
+    menu without a question line a menu, even with `>` as its selection mark."""
+    screen = "╭────────╮\n│ > 1. A │\n│   2. B │\n╰────────╯\n  ↑/↓ choose · enter confirm · esc cancel\n"
+    menu = d.find_menu(screen)
+    assert menu is not None
+    assert menu["options"] == [(1, "A"), (2, "B")]
+
+
+def test_a_menu_taller_than_a_24_row_alternate_pane_is_unreadable() -> None:
+    cut = capture(tall_menu_lines(), rows=24, alternate=True)
+    assert d.find_menu(cut) is None
+    assert d.shows_picker(cut) is True
+    whole = capture(tall_menu_lines(), rows=40, alternate=True)
+    menu = d.find_menu(whole)
+    assert menu is not None
+    assert len(menu["options"]) == 12  # type: ignore[arg-type]

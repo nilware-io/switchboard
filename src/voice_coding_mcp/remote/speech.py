@@ -211,9 +211,15 @@ def format_status(
     return f"{label}: {fact} The screen is empty."
 
 
-def cut_note(rows: int, can_resize: bool) -> str:
-    """Appended when the pane is on its alternate screen (no scrollback) and short."""
+def cut_note(rows: int, can_resize: bool, *, menu_cut: bool = False) -> str:
+    """Appended when the pane is on its alternate screen (no scrollback) and short, or (`menu_cut`)
+    shows a picker footer whose menu cannot be read, at any height."""
     more = " I can make it bigger if you want." if can_resize else ""
+    if menu_cut:
+        return (
+            f" The pane is {rows} rows high and shows a full-screen program, and the menu on it is cut off: "
+            f"I cannot see its question or first options.{more}"
+        )
     return (
         f" The pane is only {rows} rows high and shows a full-screen program, so part of a menu may be cut off.{more}"
     )
@@ -372,12 +378,21 @@ def format_keys_readback(
     question: str | None,
     chosen: tuple[int, str] | None,
     dropped: Sequence[Confirmation],
+    dialog_shown: bool = True,
 ) -> str:
     """What `remote_send_keys` returns: the keys, the target, the menu or question on its screen
-    (labelled as the screen's), the option the keys should choose, the risk and the yes phrase."""
+    (labelled as the screen's), the option the keys should choose, the risk and the yes phrase.
+    `dialog_shown` False: a permission answer whose screen has no answer options at its bottom
+    (`dispatcher.dialog_bound`, prose that looks like a dialog), said as such."""
     parts: list[str] = [dropped_words(dropped)] if dropped else []
     keys = key_words(item.keys)
-    if item.permission_answer:
+    if item.permission_answer and not dialog_shown:
+        asked = f" ({quote(question)})" if question else ""
+        parts.append(
+            f"Ready to press {keys} in {item.place}. Its screen may ask for permission{asked}, but I see no "
+            "answer options at its bottom, so the keys go to its input."
+        )
+    elif item.permission_answer:
         asked = f" It asks for permission: {quote(question)}." if question else " It shows a permission question."
         parts.append(f"Ready to press {keys} in {item.place}.{asked}")
     elif menu is not None:

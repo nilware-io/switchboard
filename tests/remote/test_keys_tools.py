@@ -17,11 +17,16 @@ from tests.remote.helpers import SESSION_A, RemoteWorld, pane
 from tests.remote.menu_fixtures import (
     FOOTER,
     OPTIONS,
+    PROSE_DIALOG,
+    PROSE_YES_NO,
     QUESTION,
+    TALL_QUESTION,
     capture,
     described_menu_lines,
     menu_lines,
+    numbered_draft,
     plain_menu_lines,
+    tall_menu_lines,
 )
 from tests.remote.test_send_tools import (
     CLAUDE_PID,
@@ -812,3 +817,115 @@ async def test_status_of_a_menu_with_twelve_options(tmp_path: Path) -> None:
         assert '9 "Choice 9"; 10 "Choice 10"; 11 "Choice 11", selected; 12 "Choice 12".' in answer.text
     finally:
         await c.manager.shutdown("test finished")
+
+
+# --- prose that looks like a dialog, numbered drafts, menus cut by a short pane ---------------
+
+
+@pytest.mark.parametrize("screen", [PROSE_DIALOG, PROSE_YES_NO], ids=["do-you-want-to", "yes-no-list"])
+async def test_prose_that_looks_like_a_dialog_gets_the_unbound_rules(make: Make, screen: str) -> None:
+    """Assistant prose "Do you want to ...?" (or a prose Yes/No list) above an idle input box: the
+    dispatcher's broad `shows_dialog` calls it a dialog, but no answer options are at the bottom, so
+    the keys land at the input: no history submit, no mode keys, and the read-back says so."""
+    ctx = await make(dev={"allowPermissionAnswers": True})
+    ctx.world.configure(forced=[*FORCED, "--allow-permission-answers"])
+    show(ctx, screen, status="idle")
+    text, error = await prepare(ctx, ["Up", "Enter"])
+    assert error
+    assert text.startswith("There is no menu on the screen of fpga on dev; up or down and then enter")
+    text, error = await prepare(ctx, ["BTab", "BTab"])
+    assert (text, error) == (
+        "There is no menu on the screen of fpga on dev; tab and shift tab there would change Claude Code's mode, "
+        "so I will not press them.",
+        True,
+    )
+    assert len(ctx.tools.confirmations) == 0
+    readback, error = await prepare(ctx, ["Enter"])
+    assert not error
+    assert "It asks for permission" not in readback
+    assert "but I see no answer options at its bottom, so the keys go to its input." in readback
+    # A draft typed meanwhile: the dispatcher refuses the Enter at confirm.
+    show(ctx, screen.replace("│ >                │", "│ > rm -rf build   │"), status="idle")
+    ctx.later()
+    text, error = await ctx.confirm("4172", risky_ok=True)
+    assert error
+    assert text.startswith("Not pressed")
+    assert pressed(ctx) == []
+
+
+@pytest.mark.parametrize("lines", [2, 3])
+@pytest.mark.parametrize("boxed", [True, False], ids=["rounded-box", "rules"])
+async def test_a_numbered_draft_is_no_menu_to_the_hub(make: Make, lines: int, boxed: bool) -> None:
+    ctx = await make()
+    screen = numbered_draft(lines, boxed=boxed)
+    show(ctx, screen, status="idle")
+    text, error = await prepare(ctx, ["BTab", "BTab"])
+    assert error
+    assert text.startswith("There is no menu on the screen of fpga on dev; tab and shift tab")
+    text, error = await prepare(ctx, ["Up", "Enter"])
+    assert error
+    assert "up or down and then enter" in text
+    readback, error = await prepare(ctx, ["Enter"])
+    assert not error
+    assert "I see no menu on its screen." in readback
+    assert "fix the parser" not in readback
+    ctx.later()
+    assert await ctx.confirm("4172") == ("Not pressed: something is already typed in that session's input.", True)
+    assert pressed(ctx) == []
+
+
+TALL_CUT_NOTE = (
+    " The pane is 24 rows high and shows a full-screen program, and the menu on it is cut off: "
+    "I cannot see its question or first options."
+)
+
+
+async def test_a_menu_taller_than_a_24_row_alternate_pane_is_said_to_be_cut(tmp_path: Path) -> None:
+    text = capture(tall_menu_lines(), rows=24, alternate=True)
+    c = await build_status(tmp_path, menu_world(tmp_path, text, height=24, alternate=True), summary=False)
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert answer.text.endswith(TALL_CUT_NOTE)
+        assert "Theme 12" in answer.text
+    finally:
+        await c.manager.shutdown("test finished")
+    # The same menu read whole at 40 rows: no note.
+    whole = capture(tall_menu_lines(), rows=40, alternate=True)
+    c = await build_status(
+        tmp_path / "40", menu_world(tmp_path / "40", whole, height=40, alternate=True), summary=False
+    )
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert TALL_QUESTION in answer.text
+        assert "cut off" not in answer.text
+    finally:
+        await c.manager.shutdown("test finished")
+
+
+async def test_a_cut_menu_offers_a_resize_and_its_keys_refusal_names_it(make: Make) -> None:
+    ctx = await make()
+    for height, offer in ((24, True), (120, False)):
+        text = capture(tall_menu_lines(), rows=24, alternate=True)
+        ctx.world.set_panes(
+            [pane("fpga", "%1", CLAUDE_PID, command="claude", height=height, alternate=True)], {"%1": text}
+        )
+        ctx.world.register(
+            "2001",
+            os.getpid(),
+            sessionId=SESSION_A,
+            name="fpga",
+            status="waiting",
+            waitingFor="user answer",
+            tmux="0:@0.%1",
+        )
+        status = await ctx.tools.remote_status("dev", "fpga", None)
+        assert ("I can make it bigger if you want." in status.text) is offer, height
+        assert "the menu on it is cut off" in status.text
+        refused, error = await prepare(ctx, ["Enter"])
+        assert error
+        taller = " If it is cut off, I can make the pane taller." if offer else ""
+        assert refused == (
+            f"fpga on dev shows a menu I cannot read, so I will not press keys in it.{taller} "
+            "Ask me what its screen says, or answer it at the keyboard."
+        )
+    assert len(ctx.tools.confirmations) == 0

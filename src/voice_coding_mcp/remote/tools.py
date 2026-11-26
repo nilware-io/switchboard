@@ -39,6 +39,7 @@ from .dispatcher import (
     SEND_ANSWER,
     SEND_CHECK_LINES,
     SEND_MESSAGE,
+    dialog_bound,
     keys_problem,
     shows_picker,
 )
@@ -306,15 +307,14 @@ class RemoteTools:
         )
         note = ""
         rows = captured.pane_height
-        if (
-            captured.alternate_on
-            and rows is not None
-            and rows < RESIZE_ROWS[0]
-            and (screen_menu(screen) is None or len(screen.lstrip("\n").split("\n")) >= rows)
-        ):
+        if captured.alternate_on and rows is not None:
             # The alternate screen has no scrollback: a menu taller than the pane is cut at its top.
-            # Not said when the whole menu was found below a free top row.
-            note = cut_note(rows, found.item.allow_send)
+            # Not said when the whole menu was found below a free top row. A picker footer whose menu
+            # cannot be read is a cut menu at any height (a 32-line menu in a 24-row pane).
+            unread = screen_menu(screen) is None
+            cut = unread and shows_picker(screen)
+            if cut or (rows < RESIZE_ROWS[0] and (unread or len(screen.lstrip("\n").split("\n")) >= rows)):
+                note = cut_note(rows, found.item.allow_send and rows < RESIZE_ROWS[1], menu_cut=cut)
         answer = await self._describe(name, pane, label, screen, deadline)
         return ToolAnswer(answer.text + note, answer.is_error) if note else answer
 
@@ -607,6 +607,9 @@ class RemoteTools:
         )
         question: str | None
         bound: str | None = None
+        # Keys land at a menu or permission dialog the owner heard; otherwise (`unbound`) at an
+        # input, where the stricter rules of `keys_problem` hold.
+        unbound = False
         if permission:
             if not config.allow_permission_answers:
                 return refuse(
@@ -627,22 +630,35 @@ class RemoteTools:
                     "visible on its screen, so I will not press keys there. Check it at the keyboard.",
                     "dialog_not_visible",
                 )
+            # Prose that looks like a dialog ("Do you want to ...?" above an idle input box) has no
+            # answer options at the bottom: the dispatcher applies the unbound rules there too.
+            unbound = not dialog_bound(captured.text)
         else:
             bound = menu_hash(captured.text)
+            unbound = bound is None
             question = (menu.question if menu is not None else None) or (
                 ask.text if ask is not None and ask.kind == "question" else None
             )
             if question is None and claude is not None and claude.status == "waiting":
                 question = waiting_for_text(claude.waiting_for)
-            if bound is None and shows_picker(captured.text):
-                # A menu is open but cannot be read: its selection mark is no draft, and Enter would
-                # choose an option nobody heard. The dispatcher refuses the same (`menu_unreadable`).
+        if unbound:
+            if shows_picker(captured.text):
+                # A menu is open but cannot be read (a short full-screen pane may cut its top): its
+                # selection mark is no draft, and Enter would choose an option nobody heard. The
+                # dispatcher refuses the same (`menu_unreadable`).
+                taller = (
+                    " If it is cut off, I can make the pane taller."
+                    if captured.alternate_on
+                    and captured.pane_height is not None
+                    and captured.pane_height < RESIZE_ROWS[1]
+                    else ""
+                )
                 return refuse(
-                    f"{place} shows a menu I cannot read, so I will not press keys in it. "
+                    f"{place} shows a menu I cannot read, so I will not press keys in it.{taller} "
                     "Ask me what its screen says, or answer it at the keyboard.",
                     "menu_unreadable",
                 )
-            problem = keys_problem(parsed, menu_bound=bound is not None)
+            problem = keys_problem(parsed, menu_bound=False)
             if problem == "mode_keys":
                 # Tab and Shift+Tab at a Claude Code input switch modes (Shift+Tab cycles the
                 # permission mode up to accept edits or bypass), a broader grant than answering one
@@ -708,7 +724,11 @@ class RemoteTools:
                 target=target,
             ),
         )
-        return ToolAnswer(format_keys_readback(item, menu=menu, question=question, chosen=chosen, dropped=dropped))
+        return ToolAnswer(
+            format_keys_readback(
+                item, menu=menu, question=question, chosen=chosen, dropped=dropped, dialog_shown=not unbound
+            )
+        )
 
     async def remote_resize(
         self, machine: str | None, target: str | None, columns: int, rows: int, caller: Caller

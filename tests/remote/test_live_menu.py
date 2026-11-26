@@ -1,7 +1,8 @@
 """Optional live test of menus on a real tmux, skipped unless SB_LIVE_TMUX=1: the dispatcher's capture
 of a synthetic menu (tests/fixtures/fake_menu.py) on the normal and the alternate screen, in a tall
 and a short pane, through the hub's cleaning and menu heuristic; a confirmed `remote_send_keys` that
-moves the selection and chooses an option; a confirmed `remote_resize` of a short pane.
+moves the selection and chooses an option; a confirmed `remote_resize` of a short pane; a menu
+taller than a 24-row alternate pane, said to be cut off and read whole after a resize.
 
 It starts its own isolated server (`tmux -L sb-test-<random> -f /dev/null`), never the default one,
 and always kills that server afterwards. No real screen of the owner is read.
@@ -51,7 +52,9 @@ PANES = {
     "short": ("normal", 8),
     "shortalt": ("alt", 8),
     "plain": ("plain", 24),
+    "tall": ("tall", 24),
 }
+TALL_QUESTION = "Which theme should the editor use?"
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("SB_LIVE_TMUX") != "1" or shutil.which("tmux") is None,
@@ -125,6 +128,8 @@ def policy(server: Server, *extra: str) -> list[str]:
 
 def test_the_whole_menu_is_captured_on_every_screen(server: Server) -> None:
     for session, (mode, rows) in PANES.items():
+        if mode == "tall":
+            continue
         captured = d.handle([*policy(server), "capture", server.panes[session], "120"], dispatcher_env())
         assert captured["ok"] is True, captured
         assert captured["alternateOn"] is (mode in ("alt", "plain")), session
@@ -282,3 +287,32 @@ async def test_a_confirmed_resize_makes_a_short_alternate_pane_show_the_whole_me
     # The undo the read-back names: the window option is unset and the window follows the global one.
     tmux(live.server.base, "set-option", "-w", "-u", "-t", "shortalt", "window-size")
     assert tmux(live.server.base, "show-options", "-w", "-v", "-t", "shortalt", "window-size").strip() == ""
+
+
+async def test_a_menu_taller_than_a_24_row_alternate_pane_is_said_to_be_cut_and_resized(live: Live) -> None:
+    """12 options with a description line each (31 lines) on the alternate screen of a 24-row pane:
+    option 1 is off the top, so no menu is read; the answer says it is cut and offers a resize, keys
+    are refused with the resize named, and after a resize to 40 rows the whole menu is read."""
+    register(live, "tall")
+    pane_id = live.server.panes["tall"]
+    captured = d.handle([*policy(live.server), "capture", pane_id, "120"], dispatcher_env())
+    assert (captured["alternateOn"], captured["paneHeight"]) == (True, 24)
+    screen = clean_screen(str(captured["text"]))
+    assert screen_menu(screen) is None
+    assert d.shows_picker(screen) is True
+    before = await live.tools.remote_status("dev", "tall", None)
+    assert "the menu on it is cut off" in before.text
+    assert "I can make it bigger" in before.text
+    refused = await live.tools.remote_send_keys("dev", "tall", ["enter"], OWNER)
+    assert refused.is_error
+    assert "I can make the pane taller" in refused.text
+    prepared = await live.tools.remote_resize("dev", "tall", 80, 40, OWNER)
+    assert not prepared.is_error, prepared.text
+    done = await live.tools.remote_send_confirm("4172", False, OWNER)
+    assert not done.is_error, done.text
+    await asyncio.sleep(0.3)
+    after = await live.tools.remote_status("dev", "tall", None)
+    assert TALL_QUESTION in after.text
+    assert '1 "Theme 1"' in after.text
+    assert "cut off" not in after.text
+    assert not live.server.records["tall"].exists(), "nothing was pressed"

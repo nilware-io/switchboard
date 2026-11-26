@@ -3,9 +3,11 @@
 assistant line, a boxed question with four numbered options (the selected one marked `❯`) and the
 key hints "↑/↓ choose · ←/→ change size · enter confirm · esc not now".
 
-Usage: fake_menu.py normal|alt|plain <record>. `alt` draws on the alternate screen (no scrollback,
-like a full-screen program); `normal` prints 40 earlier output lines first and draws each update below
-the last one; `plain` is `alt` with three options without numbers (PLAIN_OPTIONS). The terminal is
+Usage: fake_menu.py normal|alt|plain|tall <record>. `alt` draws on the alternate screen (no
+scrollback, like a full-screen program); `normal` prints 40 earlier output lines first and draws each
+update below the last one; `plain` is `alt` with three options without numbers (PLAIN_OPTIONS); `tall`
+is `alt` with TALL_COUNT options `Theme n`, each with a description line (31 lines, taller than a
+24-row pane). The terminal is
 in raw mode: Up and Down move the selection, Enter (or, with numbers, a digit 1..4) chooses, and the
 chosen number is written to <record>. `<record>.ready` appears once the menu is drawn; a
 resize redraws it. Standard library only; it never runs anything it receives. Stops after 60 s.
@@ -25,15 +27,20 @@ QUESTION = "How big should the high score table be?"
 OPTIONS = ("Small (10 entries)", "Medium (50 entries)", "Large (100 entries)", "Type something else")
 PLAIN_OPTIONS = ("Small", "Medium", "Large")
 WIDTH = 62
+TALL_QUESTION = "Which theme should the editor use?"
+TALL_COUNT = 12
 
 
-def menu(selected: int, numbered: bool = True) -> list[str]:
+def menu(selected: int, numbered: bool = True, tall: bool = False) -> list[str]:
     def boxed(text: str) -> str:
         return "│ " + text.ljust(WIDTH - 4) + " │"
 
     lines = ["⏺ I can set the high score table up in a few ways.", "", "╭" + "─" * (WIDTH - 2) + "╮"]
-    lines += [boxed(QUESTION), boxed("")]
-    if numbered:
+    lines += [boxed(TALL_QUESTION if tall else QUESTION), boxed("")]
+    if tall:
+        for n in range(1, TALL_COUNT + 1):
+            lines += [boxed(f"{'❯' if n == selected else ' '} {n}. Theme {n}"), boxed(f"     Description of theme {n}")]
+    elif numbered:
         lines += [boxed(f"{'❯' if n == selected else ' '} {n}. {text}") for n, text in enumerate(OPTIONS, start=1)]
     else:
         lines += [boxed(f"{'❯' if n == selected else ' '} {text}") for n, text in enumerate(PLAIN_OPTIONS, start=1)]
@@ -42,9 +49,10 @@ def menu(selected: int, numbered: bool = True) -> list[str]:
 
 
 def main() -> int:
-    alternate = sys.argv[1] in ("alt", "plain")
+    alternate = sys.argv[1] in ("alt", "plain", "tall")
     numbered = sys.argv[1] != "plain"
-    count = len(OPTIONS if numbered else PLAIN_OPTIONS)
+    tall = sys.argv[1] == "tall"
+    count = TALL_COUNT if tall else len(OPTIONS if numbered else PLAIN_OPTIONS)
     record = sys.argv[2]
     fd = sys.stdin.fileno()
     out = sys.stdout.fileno()
@@ -54,7 +62,7 @@ def main() -> int:
     signal.signal(signal.SIGWINCH, lambda *_: redraw.__setitem__(0, True))
 
     def draw(selected: int) -> None:
-        text = "\r\n".join(menu(selected, numbered))
+        text = "\r\n".join(menu(selected, numbered, tall))
         if alternate:
             os.write(out, ("\x1b[H\x1b[2J" + text).encode("utf-8"))
         else:

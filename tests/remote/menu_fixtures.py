@@ -63,3 +63,53 @@ def described_menu_lines(description_lines: int = 6) -> list[str]:
     lines.append("╰" + "─" * (WIDTH - 2) + "╯")
     lines.append(FOOTER)
     return lines
+
+
+TALL_QUESTION = "Which theme should the editor use?"
+
+
+def tall_menu_lines(count: int = 12, selected: int = 9) -> list[str]:
+    """A menu taller than a 24-row pane: `count` options `Theme n`, each with a description line
+    under it (31 lines for 12 options; on a 24-row alternate screen option 1 is off the top)."""
+    lines = [ASSISTANT, "", "╭" + "─" * (WIDTH - 2) + "╮", _boxed(TALL_QUESTION), _boxed("")]
+    for number in range(1, count + 1):
+        lines.append(_boxed(f"{'❯' if number == selected else ' '} {number}. Theme {number}"))
+        lines.append(_boxed(f"     Description of theme {number}"))
+    lines.append("╰" + "─" * (WIDTH - 2) + "╯")
+    lines.append(FOOTER)
+    return lines
+
+
+PROSE_DIALOG = (
+    "⏺ I refactored the parser.\n"
+    "Do you want to run the tests now?\n"
+    "╭──────────────────╮\n"
+    "│ >                │\n"
+    "╰──────────────────╯\n"
+    "  ⏵⏵ accept edits on (shift+tab to cycle)\n"
+)
+"""Assistant prose that starts a line with "Do you want to ...?" above an idle input box: `dialog_hash`
+sees a dialog, but no answer options are at the bottom (`dispatcher.dialog_bound` False)."""
+PROSE_YES_NO = (
+    "⏺ Should I keep the old parser?\n"
+    "1. Yes, keep it\n"
+    "2. No, delete it\n"
+    "╭──────────────────╮\n"
+    "│ >                │\n"
+    "╰──────────────────╯\n"
+    "  ? for shortcuts\n"
+)
+"""A prose `1. Yes ... 2. No` list above an idle input box, the same."""
+
+
+def numbered_draft(lines: int, *, boxed: bool) -> str:
+    """Claude Code's input box holding a numbered draft of `lines` lines (`> 1. fix the parser` /
+    `  2. update tests` / `  3. write docs`), drawn as a rounded box (`boxed`) or between two rules."""
+    body = ["> 1. fix the parser", "  2. update tests", "  3. write docs"][:lines]
+    if boxed:
+        rows = ["╭" + "─" * 30 + "╮", *(f"│ {line.ljust(28)} │" for line in body), "╰" + "─" * 30 + "╯"]
+        status = "  ? for shortcuts"
+    else:
+        rows = ["─" * 32, *body, "─" * 32]
+        status = "  ⏵⏵ accept edits on (shift+tab to cycle)"
+    return "\n".join(["⏺ Done. All 41 tests pass.", "", *rows, status]) + "\n"
