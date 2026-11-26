@@ -85,12 +85,13 @@ def machine_line(view: MachineView) -> str:
     if not view.ok:
         return f"{name}: not reachable, {unreachable_reason(view.error, view.detail)}."
     sessions = view.sessions()
+    cut = " It has more panes than I can list, so some are missing." if view.truncated else ""
     if not sessions:
-        return f"{name}: no allowed tmux sessions."
+        return f"{name}: no allowed tmux sessions.{cut}"
     items = list(sessions.items())
     shown = ". ".join(_session_line(session, panes) for session, panes in items[:SESSIONS_PER_MACHINE])
     more = f" And {len(items) - SESSIONS_PER_MACHINE} more." if len(items) > SESSIONS_PER_MACHINE else ""
-    return f"{name}: {plural(len(items), 'session')}. {shown}.{more}"
+    return f"{name}: {plural(len(items), 'session')}. {shown}.{more}{cut}"
 
 
 def format_list(views: Sequence[MachineView], *, total_machines: int) -> str:
@@ -101,10 +102,10 @@ def format_list(views: Sequence[MachineView], *, total_machines: int) -> str:
     return "\n".join(lines)
 
 
-def pane_label(machine: str, pane: PaneInfo, windows: int) -> str:
-    """ "dev, fpga" or, in a session with several windows, "dev, fpga window 2"."""
+def pane_label(machine: str, pane: PaneInfo, name_window: bool) -> str:
+    """ "dev, fpga", or "dev, fpga window 2" when `name_window` (`Resolved.name_window`)."""
     label = f"{machine}, {clean_name(pane.session) or 'unnamed'}"
-    if windows > 1 and pane.window_index is not None:
+    if name_window and pane.window_index is not None:
         label += f" window {pane.window_index}"
     return label
 

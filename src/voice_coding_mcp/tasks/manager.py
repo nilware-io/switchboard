@@ -1330,7 +1330,12 @@ class TaskManager:
         someone_waiting = self._wake(task.id)
         notifier = self._opts.notifier
         if not someone_waiting and notifier is not None and not self._shutting_down:
-            note = NotifyTask(id=task.id, project=task.project, status=task.status, result=task.result)
+            if task.kind == "remote":
+                # Screen text never rides on a push: name the job, drop the result.
+                label = task.title or "remote job"
+                note = NotifyTask(id=task.id, project=task.project, status=task.status, result=None, label=label)
+            else:
+                note = NotifyTask(id=task.id, project=task.project, status=task.status, result=task.result)
             sent = asyncio.get_running_loop().create_task(self._notify(notifier, note))
             self._notifications.add(sent)
             sent.add_done_callback(self._notifications.discard)

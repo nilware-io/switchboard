@@ -104,13 +104,18 @@ class Inventory:
     async def capture(
         self, name: str, pane_id: str, lines: int, *, budget_seconds: float | None = None
     ) -> CaptureResponse | TransportResult:
-        """The captured pane, or the failed TransportResult."""
+        """The captured pane, or the failed TransportResult. A pane whose session (as the capture
+        reports it) fails the hub's allow-list counts as gone."""
         result = await self._transports[name].call(
             "capture", [pane_id, str(lines)], timeout_seconds=self._timeout(budget_seconds)
         )
         self._log(name, "capture", result)
         if result.ok and isinstance(result.data, CaptureResponse):
-            return result.data
+            if allowed(self._transports[name].machine, result.data.session):
+                return result.data
+            # The pane moved (join-pane, rename) to a session only the dispatcher allows: for the
+            # hub it is gone, and its text is dropped unread.
+            result = TransportResult(ok=False, error="refused_by_policy", detail="gone", elapsed_ms=result.elapsed_ms)
         if result.ok:
             return TransportResult(ok=False, error="bad_response", elapsed_ms=result.elapsed_ms)
         if result.detail == "gone":

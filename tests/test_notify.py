@@ -42,6 +42,16 @@ class TestNotificationText:
             == "Task 7 in voice-coding-mcp timed out."
         )
 
+    def test_a_remote_job_names_its_label_and_never_carries_the_result(self) -> None:
+        job = NotifyTask(
+            id=9, project="dev", status="done", result='A summary of the screen: "x"', label="status of fpga on dev"
+        )
+        assert notification_text(job, True) == "Task 9 (status of fpga on dev) finished."
+        assert notification_text(job, False) == "Task 9 (status of fpga on dev) finished."
+        assert notification_text(dataclasses.replace(job, status="cancelled"), True) == (
+            "Task 9 (status of fpga on dev) was cancelled."
+        )
+
 
 class TestCreateNotifier:
     def test_is_off_without_a_url(self) -> None:

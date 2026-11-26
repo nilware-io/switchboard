@@ -33,6 +33,9 @@ class NotifyTask:
     project: str
     status: str
     result: str | None
+    label: str | None = None
+    """Set for remote jobs: the job's title ("status of fpga on dev"), named instead of the project.
+    Their result is never attached (it holds screen text)."""
 
 
 Notifier = Callable[[NotifyTask], Awaitable[None]]
@@ -40,7 +43,10 @@ Notifier = Callable[[NotifyTask], Awaitable[None]]
 
 def notification_text(task: NotifyTask, include_result: bool) -> str:
     """ "Task 7 in voice-coding-mcp finished." (or "timed out", "was cancelled", "failed"), plus the
-    result after a blank line when `include_result` (cut at 2000 characters with "…")."""
+    result after a blank line when `include_result` (cut at 2000 characters with "…"). A remote job
+    (`label` set) reads "Task 7 (status of fpga on dev) finished." and never carries its result,
+    whatever `include_result` says: that result is built from screen text and the push goes to a
+    third party."""
     if task.status == "done":
         verb = "finished"
     elif task.status == "timeout":
@@ -49,6 +55,8 @@ def notification_text(task: NotifyTask, include_result: bool) -> str:
         verb = "was cancelled"
     else:
         verb = "failed"
+    if task.label is not None:
+        return f"Task {task.id} ({task.label}) {verb}."
     text = f"Task {task.id} in {task.project} {verb}."
     if include_result and task.result:
         text += f"\n\n{clip(task.result, RESULT_LIMIT + 1)}"

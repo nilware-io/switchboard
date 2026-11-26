@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from tests.remote.helpers import DISPATCHER, SESSION_A, SESSION_B, RemoteWorld, pane
+from tests.remote.helpers import DISPATCHER, FAKE_TMUX, SESSION_A, SESSION_B, RemoteWorld, pane
 from voice_coding_mcp.remote import dispatcher as d
 
 REPO = Path(__file__).resolve().parents[2]
@@ -227,6 +228,36 @@ def test_list_without_a_tmux_server_is_empty(world: RemoteWorld) -> None:
 def test_list_tmux_failure(world: RemoteWorld) -> None:
     world.set_panes([], fail=True)
     assert run(world, FORCED, "switchboard-remote list")["error"] == "tmux_failed"
+
+
+def test_the_test_tmux_hook_needs_the_test_flag(
+    world: RemoteWorld, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    standard_panes(world)
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    # No real tmux can be found, so ignoring the hook ends in tmux_failed instead of a real server.
+    monkeypatch.setattr(d, "TMUX_PATH", str(empty))
+    # The hook names a wrapper that runs the fake tmux without needing PATH.
+    hook = tmp_path / "hook-tmux"
+    # It leaves a marker, since without the flag the fake tmux would not get its FAKE_TMUX_* settings.
+    marker = tmp_path / "hook-ran"
+    hook.write_text(
+        f"#!/bin/sh\n: > {shlex.quote(str(marker))}\n"
+        f'exec {shlex.quote(sys.executable)} {shlex.quote(FAKE_TMUX)} "$@"\n',
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    env = {key: value for key, value in world.tmux_env().items() if key != "SWITCHBOARD_REMOTE_TEST"}
+    env["SWITCHBOARD_REMOTE_TEST_TMUX"] = str(hook)
+    full = {**env, "SSH_CONNECTION": "127.0.0.1 1 127.0.0.1 22", "SSH_ORIGINAL_COMMAND": "switchboard-remote list"}
+    assert d.handle(FORCED, full)["error"] == "tmux_failed"
+    for value in ("0", "yes", ""):
+        assert d.handle(FORCED, {**full, "SWITCHBOARD_REMOTE_TEST": value})["error"] == "tmux_failed"
+    assert not marker.exists()  # the executable the hook names never ran
+    flagged = d.handle(FORCED, {**full, "SWITCHBOARD_REMOTE_TEST": "1"})
+    assert flagged["ok"] is True
+    assert marker.exists()
 
 
 def test_list_skips_malformed_lines_and_cleans_names(world: RemoteWorld) -> None:

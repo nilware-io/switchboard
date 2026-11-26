@@ -11,6 +11,7 @@ from voice_coding_mcp.remote.config import MachineConfig
 from voice_coding_mcp.remote.inventory import MachineView, resolve_machine
 from voice_coding_mcp.remote.protocol import ClaudeInfo, PaneInfo
 from voice_coding_mcp.remote.redact import clean_name, clean_screen, redact, strip_terminal
+from voice_coding_mcp.remote.speech import machine_line
 from voice_coding_mcp.remote.targets import Ambiguous, NoTarget, NotFound, Resolved, resolve_target
 
 SECRETS = [
@@ -130,10 +131,11 @@ def test_session_names_fuzzy_and_literal() -> None:
     )
     picked = resolve_target(v, "fpga")
     assert isinstance(picked, Resolved)
-    assert (picked.pane.pane_id, picked.windows) == ("%1", 2)
+    # The session's only Claude Code pane is named by its session alone; another pane by its window.
+    assert (picked.pane.pane_id, picked.windows, picked.name_window) == ("%1", 2, False)
     window = resolve_target(v, "fpga:1")
     assert isinstance(window, Resolved)
-    assert window.pane.pane_id == "%2"
+    assert (window.pane.pane_id, window.name_window) == ("%2", True)
     named = resolve_target(v, "fpga:tests.0")
     assert isinstance(named, Resolved)
     assert named.pane.pane_id == "%2"
@@ -152,6 +154,10 @@ def test_several_claude_panes_in_a_session_are_ambiguous() -> None:
     result = resolve_target(v, "fpga")
     assert isinstance(result, Ambiguous)
     assert [p.pane_id for p in result.panes] == ["%1", "%2"]
+    picked = resolve_target(v, "fpga:1")
+    assert isinstance(picked, Resolved)
+    # One of several Claude Code panes: the label names its window.
+    assert (picked.pane.pane_id, picked.name_window) == ("%2", True)
 
 
 def test_session_without_claude_picks_the_active_pane() -> None:
@@ -183,6 +189,15 @@ def test_ambiguous_session_names() -> None:
     result = resolve_target(v, "work")
     assert isinstance(result, Ambiguous)
     assert result.sessions == ["work-api", "work-web"]
+
+
+def test_a_cut_pane_list_is_spoken() -> None:
+    cut = " It has more panes than I can list, so some are missing."
+    full = view(make_pane("notes", "%1"))
+    assert machine_line(full) == "dev: 1 session. notes, no Claude Code."
+    truncated = MachineView(machine=MACHINE, panes=full.panes, truncated=True)
+    assert machine_line(truncated) == "dev: 1 session. notes, no Claude Code." + cut
+    assert machine_line(MachineView(machine=MACHINE, truncated=True)) == "dev: no allowed tmux sessions." + cut
 
 
 def test_machine_resolution() -> None:

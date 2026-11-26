@@ -29,7 +29,15 @@ class Ctx:
     record: str
 
 
-async def build(tmp: Path, world: RemoteWorld, *, summary: bool = True, sync_wait: int = 20, **remote: Any) -> Ctx:
+async def build(
+    tmp: Path,
+    world: RemoteWorld,
+    *,
+    summary: bool = True,
+    sync_wait: int = 20,
+    dev_sessions: list[str] | None = None,
+    **remote: Any,
+) -> Ctx:
     projects = tmp / "projects"
     projects.mkdir(exist_ok=True)
     record = str(tmp / "record.jsonl")
@@ -43,7 +51,7 @@ async def build(tmp: Path, world: RemoteWorld, *, summary: bool = True, sync_wai
             "tasks": {"syncWaitSeconds": sync_wait, "maxConcurrent": 1},
             "remote": {
                 "machines": [
-                    machine("dev", world=world, sessions=["fpga", "notes", "work-*", "private"]),
+                    machine("dev", world=world, sessions=dev_sessions or ["fpga", "notes", "work-*", "private"]),
                     machine("buildbox", world=world, host="example-host", user="bot", sessions=["api"]),
                 ],
                 "ssh": {"bin": world.ssh, "commandTimeoutSeconds": 8},
@@ -148,7 +156,7 @@ async def test_two_claude_panes_in_one_session(ctx: Ctx) -> None:
 
 async def test_status_heuristic(ctx: Ctx) -> None:
     answer = await ctx.tools.remote_status("dev", "fpga", None)
-    assert answer.text == 'dev, fpga window 0: Claude Code is working. The screen says: "All 41 tests passed"'
+    assert answer.text == 'dev, fpga: Claude Code is working. The screen says: "All 41 tests passed"'
     shell = await ctx.tools.remote_status("dev", "work shell", None)
     assert shell.text == 'dev, work-shell: no Claude Code here. The screen says: "export TOKEN=[secret]"'
     named = await ctx.tools.remote_status("dev", "billing fix", 20)
@@ -178,6 +186,44 @@ async def test_a_pane_that_disappears_between_list_and_capture(ctx: Ctx) -> None
     assert gone.text == "dev, notes: that pane is gone. Ask me to list the sessions again."
 
 
+@pytest.fixture
+async def wide(tmp_path: Path) -> AsyncIterator[Ctx]:
+    """The dispatcher allows every session (forced `--sessions '*'`); the hub allows fewer."""
+    world = RemoteWorld.create(tmp_path, forced=["--sessions", "*"])
+    populate(world)
+    world.configure(modes={"example-host": "connect_timeout"})
+    c = await build(tmp_path, world, summary=False, dev_sessions=["fpga", "notes", "work-*"])
+    yield c
+    await c.manager.shutdown("test finished")
+
+
+async def test_the_hub_allow_list_filters_what_the_dispatcher_allows(wide: Ctx) -> None:
+    # The dispatcher reports "private"; only the hub's own list keeps it out.
+    answer = await wide.tools.list_remote_sessions(None)
+    assert "private" not in answer.text
+    assert answer.text.startswith("2 machines.\ndev: 4 sessions. fpga, ")
+    private = await wide.tools.remote_status("dev", "private", None)
+    missing = await wide.tools.remote_status("dev", "nosuch", None)
+    assert private.is_error
+    assert missing.is_error
+    assert private.text == missing.text.replace('"nosuch"', '"private"')
+    assert private.text == 'dev has no session called "private". Its sessions: fpga, notes, work-api, work-shell.'
+    # Not even by window target or by Claude Code session name, and nothing was captured.
+    assert (await wide.tools.remote_status("dev", "private:0", None)).text == private.text.replace(
+        '"private"', '"private:0"'
+    )
+    assert not any("capture-pane" in call["argv"] for call in wide.world.tmux_calls())
+
+
+async def test_a_pane_that_moved_to_a_session_only_the_dispatcher_allows(wide: Ctx) -> None:
+    await wide.tools.remote_status("dev", "notes", None)  # caches the list
+    moved = pane("private", "%3", 9_999_803, command="claude")
+    wide.world.set_panes([moved], {"%3": "the private screen"})
+    answer = await wide.tools.remote_status("dev", "notes", None)
+    assert answer.text == "dev, notes: that pane is gone. Ask me to list the sessions again."
+    assert "private screen" not in answer.text
+
+
 async def test_summary_answers_in_time_and_is_cached(tmp_path: Path) -> None:
     world = RemoteWorld.create(tmp_path)
     populate(
@@ -187,7 +233,7 @@ async def test_summary_answers_in_time_and_is_cached(tmp_path: Path) -> None:
     try:
         answer = await c.tools.remote_status("dev", "fpga", None)
         assert answer.text == (
-            "dev, fpga window 0: Claude Code is working. A summary of the screen: "
+            "dev, fpga: Claude Code is working. A summary of the screen: "
             '"It is building the parser and waits for nothing. key token=[secret]"'
         )
         again = await c.tools.remote_status("dev", "fpga", None)
@@ -209,16 +255,13 @@ async def test_slow_summary_becomes_a_task(tmp_path: Path) -> None:
         started = time.monotonic()
         answer = await c.tools.remote_status("dev", "fpga", None)
         assert time.monotonic() - started < 4
-        assert answer.text.startswith("dev, fpga window 0: I am still reading it. That is task ")
+        assert answer.text.startswith("dev, fpga: I am still reading it. That is task ")
         task_id = int(answer.text.split("task ")[1].split(";")[0])
         done = await c.manager.wait(task_id, 10_000)
         assert done is not None
         assert done.kind == "remote"
         assert done.status == "done"
-        assert (
-            done.result
-            == 'dev, fpga window 0: Claude Code is working. A summary of the screen: "Finished the refactor."'
-        )
+        assert done.result == 'dev, fpga: Claude Code is working. A summary of the screen: "Finished the refactor."'
         assert done.title == "status of fpga on dev"
     finally:
         await c.manager.shutdown("test finished")
@@ -232,7 +275,7 @@ async def test_no_free_slot_answers_with_the_heuristic(tmp_path: Path) -> None:
         lease = c.manager.claim_slot("other")
         assert lease is not None
         answer = await c.tools.remote_status("dev", "fpga", None)
-        assert answer.text == 'dev, fpga window 0: Claude Code is working. The screen says: "RESULT never used"'
+        assert answer.text == 'dev, fpga: Claude Code is working. The screen says: "RESULT never used"'
         assert read_records(c.record) == []
         lease.release()
     finally:
@@ -245,7 +288,7 @@ async def test_failed_summary_falls_back_to_the_heuristic(tmp_path: Path) -> Non
     c = await build(tmp_path, world)
     try:
         answer = await c.tools.remote_status("dev", "fpga", None)
-        assert answer.text == 'dev, fpga window 0: Claude Code is working. The screen says: "FAIL"'
+        assert answer.text == 'dev, fpga: Claude Code is working. The screen says: "FAIL"'
     finally:
         await c.manager.shutdown("test finished")
 

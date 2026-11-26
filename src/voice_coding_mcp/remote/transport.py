@@ -178,9 +178,17 @@ def interpret(verb: str, result: ProcessResult, *, via_ssh: bool, started: float
         return failed("bad_response")
     if via_ssh and result.returncode == 255:
         return failed(map_ssh_failure(result.stderr_tail))
+    silent = not result.stdout.strip()
+    if silent and "Traceback (most recent call last)" in result.stderr_tail:
+        # The dispatcher ran and crashed (its traceback may mention "No such file" too).
+        return failed("other")
     missing = result.returncode == 127 or re.search(r"command not found|no such file", result.stderr_tail, re.I)
-    if missing and not result.stdout.strip():
+    if missing and silent:
         return failed("dispatcher_missing")
+    if silent and result.returncode != 0:
+        # A non-zero exit without output and without a sign of a missing program: a crash, not a
+        # missing dispatcher.
+        return failed("other")
     try:
         parsed = parse_response(verb, result.stdout)
     except ResponseError as err:

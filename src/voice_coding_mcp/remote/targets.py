@@ -23,7 +23,10 @@ _SHELL_META_RE = re.compile(r"[;&|`$<>(){}\[\]\\'\"*?!~\n\r\t]")
 class Resolved:
     pane: PaneInfo
     windows: int
-    """Windows of the pane's session (the spoken label names the window when there are several)."""
+    """Windows of the pane's session."""
+    name_window: bool = False
+    """The spoken label names the window: the session has several windows and the pane is not its
+    only Claude Code pane ("dev, fpga" for the only one, "dev, fpga window 2" otherwise)."""
 
 
 @dataclass(frozen=True)
@@ -55,19 +58,24 @@ def _window_count(panes: Sequence[PaneInfo]) -> int:
     return len({pane.window_index for pane in panes})
 
 
+def _resolved(pane: PaneInfo, all_session_panes: Sequence[PaneInfo]) -> Resolved:
+    windows = _window_count(all_session_panes)
+    only_claude = pane.claude is not None and sum(p.claude is not None for p in all_session_panes) == 1
+    return Resolved(pane=pane, windows=windows, name_window=windows > 1 and not only_claude)
+
+
 def pick_pane(session_panes: Sequence[PaneInfo], target: str, all_session_panes: Sequence[PaneInfo]) -> TargetResult:
     """One pane out of a session or window: the only pane, else the only Claude Code pane, else the
     active pane when none runs Claude Code."""
-    windows = _window_count(all_session_panes)
     if len(session_panes) == 1:
-        return Resolved(pane=session_panes[0], windows=windows)
+        return _resolved(session_panes[0], all_session_panes)
     claude = [pane for pane in session_panes if pane.claude is not None]
     if len(claude) == 1:
-        return Resolved(pane=claude[0], windows=windows)
+        return _resolved(claude[0], all_session_panes)
     if len(claude) > 1:
         return Ambiguous(target=target, panes=claude)
     active = [pane for pane in session_panes if pane.active] or list(session_panes)
-    return Resolved(pane=active[0], windows=windows)
+    return _resolved(active[0], all_session_panes)
 
 
 def _literal(view: MachineView, target: str) -> TargetResult | None:
@@ -95,7 +103,7 @@ def resolve_target(view: MachineView, target: str | None) -> TargetResult:
     if target is None or not target.strip():
         claude = [pane for pane in view.panes if pane.claude is not None]
         if len(claude) == 1:
-            return Resolved(pane=claude[0], windows=_window_count(sessions[claude[0].session]))
+            return _resolved(claude[0], sessions[claude[0].session])
         return NoTarget(sessions=names)
     if is_path_like(target) or _SHELL_META_RE.search(target):
         return NotFound(target=target, sessions=names)
@@ -111,7 +119,7 @@ def resolve_target(view: MachineView, target: str | None) -> TargetResult:
     by_claude = match_by_name(named, lambda pane: pane.claude.name if pane.claude and pane.claude.name else "", target)
     if isinstance(by_claude, MatchOk):
         pane = by_claude.item
-        return Resolved(pane=pane, windows=_window_count(sessions[pane.session]))
+        return _resolved(pane, sessions[pane.session])
     if by_claude.reason == "ambiguous":
         return Ambiguous(target=target, sessions=sorted({p.session for p in named if p.claude}))
     return NotFound(target=target, sessions=names)

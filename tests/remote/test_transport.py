@@ -17,7 +17,9 @@ from voice_coding_mcp.remote.config import MachineConfig, RemoteConfig, SshConfi
 from voice_coding_mcp.remote.protocol import CaptureResponse, ListResponse, VersionResponse
 from voice_coding_mcp.remote.transport import (
     LocalTransport,
+    ProcessResult,
     SshTransport,
+    interpret,
     make_transport,
     map_ssh_failure,
     run_process,
@@ -169,6 +171,26 @@ async def test_run_process_kills_leftover_children_on_timeout(tmp_path: Path) ->
             break
         await asyncio.sleep(0.05)
     assert not is_alive(child)
+
+
+CRASH = (
+    "Traceback (most recent call last):\n"
+    '  File "switchboard-remote", line 9, in <module>\n'
+    "FileNotFoundError: [Errno 2] No such file or directory: 'x'\n"
+)
+
+
+@pytest.mark.parametrize("via_ssh", [True, False])
+def test_a_dispatcher_crash_is_not_reported_as_missing(via_ssh: bool) -> None:
+    def code(returncode: int, stderr: str, stdout: bytes = b"") -> str | None:
+        result = ProcessResult(returncode=returncode, stdout=stdout, stderr_tail=stderr)
+        return interpret("list", result, via_ssh=via_ssh, started=time.monotonic()).error
+
+    assert code(1, CRASH) == "other"  # a traceback, even one that says "No such file"
+    assert code(1, "") == "other"  # non-zero exit, no output, nothing says missing
+    assert code(127, "sh: switchboard-remote: command not found") == "dispatcher_missing"
+    assert code(1, "bash: /opt/x: No such file or directory") == "dispatcher_missing"
+    assert code(0, "", b"Welcome to example-host") == "dispatcher_missing"
 
 
 def test_ssh_stderr_mapping() -> None:

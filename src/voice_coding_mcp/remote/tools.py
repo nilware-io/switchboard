@@ -127,7 +127,7 @@ class RemoteTools:
         if not isinstance(resolved, Resolved):
             return ToolAnswer(format_target_problem(name, resolved), True)
         pane = resolved.pane
-        label = pane_label(name, pane, resolved.windows)
+        label = pane_label(name, pane, resolved.name_window)
         count = min(lines if lines is not None else self._remote.capture_lines, 500)
         captured = await self.inventory.capture(name, pane.pane_id, count, budget_seconds=deadline.left())
         if not isinstance(captured, CaptureResponse):

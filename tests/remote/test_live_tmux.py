@@ -45,6 +45,9 @@ def socket_name() -> Iterator[str]:
 
 def test_list_and_capture_on_an_isolated_tmux_server(socket_name: str) -> None:
     env = {"HOME": os.environ.get("HOME", "/nonexistent"), "SWITCHBOARD_REMOTE_TEST": "1"}
+    if "TMUX_TMPDIR" in os.environ:
+        # The fixture's tmux used it, so the dispatcher must look in the same socket directory.
+        env["TMUX_TMPDIR"] = os.environ["TMUX_TMPDIR"]
     argv = ["--policy-from-hub", "--sessions", "fpga", "--tmux-socket-name", socket_name, "--", "list"]
     listed = d.handle(argv, env)
     assert listed["ok"] is True, listed

@@ -7,15 +7,23 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import httpx2
 import pytest
 
 from tests.helpers import claude_config, tasks_config, until
+from voice_coding_mcp.config import NotifyConfig
 from voice_coding_mcp.log import silent_logger
-from voice_coding_mcp.notify import NotifyTask
+from voice_coding_mcp.notify import Notifier, NotifyTask, create_notifier, notification_text
 from voice_coding_mcp.tasks.manager import Started, StartFailed, TaskManager, TaskManagerOptions, format_for_voice
 
 
-async def make(tmp: Path, *, max_concurrent: int = 1, notified: list[NotifyTask] | None = None) -> TaskManager:
+async def make(
+    tmp: Path,
+    *,
+    max_concurrent: int = 1,
+    notified: list[NotifyTask] | None = None,
+    notifier_override: Notifier | None = None,
+) -> TaskManager:
     root = tmp / "projects"
     (root / "alpha").mkdir(parents=True, exist_ok=True)
 
@@ -30,7 +38,7 @@ async def make(tmp: Path, *, max_concurrent: int = 1, notified: list[NotifyTask]
             claude=claude_config(str(tmp / "record.jsonl")),
             tasks=tasks_config(max_concurrent=max_concurrent),
             logger=silent_logger,
-            notifier=notifier,
+            notifier=notifier_override or notifier,
             kill_grace_ms=200,
         )
     )
@@ -119,6 +127,55 @@ async def test_a_job_nobody_waits_for_notifies(tmp_path: Path) -> None:
     await until(lambda: bool(notified))
     assert (notified[0].id, notified[0].project, notified[0].status) == (started.task.id, "dev", "done")
     await m.shutdown("test finished")
+
+
+SCREEN = 'dev, fpga: idle. A summary of the screen: "deploy key sk-live-123 printed"'
+
+
+async def test_a_job_push_never_carries_the_screen_text_even_with_include_result(tmp_path: Path) -> None:
+    bodies: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        bodies.append(request.content.decode("utf-8"))
+        return httpx2.Response(200, text="ok")
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
+        push = create_notifier(
+            NotifyConfig(url="https://ntfy.example.com/topic", headers={}, include_result=True),
+            silent_logger,
+            client=http,
+        )
+        assert push is not None
+        m = await make(tmp_path, notifier_override=push)
+
+        async def job(abort: asyncio.Event) -> str:
+            return SCREEN
+
+        started = m.start_job(label="status of fpga on dev", machine="dev", lock_key="a", job=job)
+        assert isinstance(started, Started)
+        await until(lambda: bool(bodies))
+        await m.shutdown("test finished")
+    done = m.get(started.task.id)
+    assert done is not None
+    assert done.result == SCREEN  # the result itself is kept for get_task_result
+    assert bodies == [f"Task {started.task.id} (status of fpga on dev) finished."]
+    for word in ("summary", "screen", "sk-live", "deploy", "idle"):
+        assert word not in bodies[0]
+
+
+async def test_a_failed_job_push_names_the_job_only(tmp_path: Path) -> None:
+    notified: list[NotifyTask] = []
+    m = await make(tmp_path, notified=notified)
+
+    async def job(abort: asyncio.Event) -> str:
+        raise RuntimeError(SCREEN)
+
+    started = m.start_job(label="status of fpga on dev", machine="dev", lock_key="a", job=job)
+    assert isinstance(started, Started)
+    await until(lambda: bool(notified))
+    await m.shutdown("test finished")
+    assert notified[0].result is None
+    assert notification_text(notified[0], True) == f"Task {started.task.id} (status of fpga on dev) failed."
 
 
 async def test_claim_slot_counts_toward_max_concurrent_and_releases(tmp_path: Path) -> None:
