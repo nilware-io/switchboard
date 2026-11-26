@@ -312,16 +312,134 @@ def test_service_mode_reports_a_port_mismatch(host: Host) -> None:
     assert host.funnel() is None
 
 
-def test_on_and_off_wait_for_no_one_while_another_run_holds_the_lock(host: Host) -> None:
+@pytest.mark.parametrize("marker", ["", "1"], ids=["plain", "forged-marker"])
+def test_on_and_off_wait_for_no_one_while_another_run_holds_the_lock(host: Host, marker: str) -> None:
     run_dir = host.home / ".local" / "state" / "sb-linux"
     run_dir.mkdir(parents=True)
     with open(run_dir / "sb-linux.lock", "w", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         for command in ("on", "off"):
-            out = host.run(command)
+            # SB_LOCKED=1 from the caller's environment is not taken as "the lock is mine".
+            out = host.run(command, SB_LOCKED=marker)
             assert out.returncode == 1
             assert "Another sb-linux on/off is running" in out.stderr
     assert host.calls() == []
+
+
+def test_a_forged_lock_marker_still_takes_the_lock(host: Host) -> None:
+    on = host.run("on", SB_LOCKED="1")
+    assert on.returncode == 0, on.stderr
+    off = host.run("off", SB_LOCKED="1")
+    assert off.returncode == 0, off.stderr
+    # The marked run went through flock: the lock file exists and is free again.
+    lock = host.home / ".local" / "state" / "sb-linux" / "sb-linux.lock"
+    assert lock.exists()
+    with open(lock, "w", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+# --- what the hub user prints reaches the owner's terminal without control characters -------------
+
+HOSTILE = "\x1b]0;owned\x07\x1b[2J\x9b\r\x08\x7f"
+
+
+def hostile_vcm(host: Host, *, fail: bool = False) -> Path:
+    """A hub-side voice-coding-mcp that answers set-public-url and status with terminal escapes on
+    both streams, and runs the real CLI for everything else (the unit's own argv is unchanged)."""
+    script = host.root / "bin" / "hostile-vcm"
+    script.write_text(
+        f"""#!{sys.executable} -I
+import os, sys
+args = sys.argv[1:]
+bad = {HOSTILE!r}
+if args[:1] == ["set-public-url"]:
+    sys.stderr.write("warning" + bad + "\\n")
+    if {fail!r}:
+        sys.exit(2)
+    print("changed: publicUrl is now " + args[1] + bad)
+    sys.exit(0)
+if args[:1] == ["status"]:
+    sys.stderr.write("err" + bad + "\\n")
+    print("Pairing window: closed" + bad + "\\ttab kept")
+    sys.exit(0)
+os.execv({sys.executable!r}, [{sys.executable!r}, "-m", "voice_coding_mcp", *args])
+""",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def assert_clean(text: str) -> None:
+    assert not any(ch in text for ch in "\x1b\x07\x08\x7f\r"), repr(text)
+
+
+def test_service_mode_strips_control_characters_from_the_hub_users_output(host: Host) -> None:
+    vcm = str(hostile_vcm(host))
+    on = host.run("on", mode="service", SB_VCM=vcm)
+    assert on.returncode == 0, on.stderr
+    assert f"Set publicUrl in {host.config} to {URL}." in on.stdout
+    assert "warning]0;owned" in on.stderr, "stderr passes through, cleaned"
+    assert_clean(on.stdout)
+    assert_clean(on.stderr)
+
+    status = host.run("status", mode="service", SB_VCM=vcm)
+    assert status.returncode == 0, status.stderr
+    assert "Pairing window: closed]0;owned[2J" in status.stdout
+    assert "\ttab kept" in status.stdout, "tab and newline are kept"
+    assert "err]0;owned" in status.stderr
+    assert_clean(status.stdout)
+    assert_clean(status.stderr)
+    host.run("off", mode="service")
+
+
+def test_service_mode_keeps_the_exit_code_through_the_filter(host: Host) -> None:
+    on = host.run("on", mode="service", SB_VCM=str(hostile_vcm(host, fail=True)))
+    assert on.returncode == 1
+    assert "Could not set publicUrl" in on.stderr
+    assert_clean(on.stderr)
+    assert ["systemctl", "start", "switchboard-test"] not in host.calls("sudo")
+
+
+# --- user mode without SB_VCM: `uv run` in this repository -----------------------------------------
+
+
+def test_user_mode_defaults_to_uv_run_in_the_repository(host: Host) -> None:
+    log = host.root / "uv.log"
+    uv = host.root / "bin" / "uv"
+    uv.write_text(
+        f"""#!/bin/sh
+printf '%s\\n' "$*" >> "{log}"
+[ "$1 $2 $3 $4 $5 $6" = "run --frozen --quiet --project {REPO} voice-coding-mcp" ] || exit 9
+shift 6
+exec "{sys.executable}" -m voice_coding_mcp "$@"
+""",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    env = {k: v for k, v in host.env.items() if k != "SB_VCM"}
+    h = Host(root=host.root, home=host.home, host=host.host, config=host.config, port=host.port, env=env)
+
+    on = h.run("on")
+    assert on.returncode == 0, on.stderr
+    assert f"To pair a new client: uv run --project {REPO} voice-coding-mcp pair --config {host.config}" in on.stdout
+    assert healthz(host.port)
+    status = h.run("status")
+    assert status.returncode == 0, status.stderr
+    assert "State: on" in status.stdout
+    off = h.run("off")
+    assert off.returncode == 0, off.stderr
+    assert not healthz(host.port)
+    calls = log.read_text(encoding="utf-8").splitlines()
+    prefix = f"run --frozen --quiet --project {REPO} voice-coding-mcp "
+    assert all(call.startswith(prefix) for call in calls), calls
+    assert [call[len(prefix) :].split()[0] for call in calls] == ["set-public-url", "serve", "status"]
+
+    # Without uv on PATH the default layout says what is missing.
+    uv.unlink()
+    missing = h.run("on")
+    assert missing.returncode == 1
+    assert "uv is required" in missing.stderr
 
 
 # --- arguments and lint ---------------------------------------------------------------------------

@@ -64,6 +64,22 @@ Git identity: tasks act as the agents' own bot account (for example `example-bot
 
 Optional: the root-owned managed settings from [DEPLOY.md, step 4](DEPLOY.md#4-install-claude-code-for-vcm) (deny Claude's file tools on the state and config directories) work the same here, with paths under `/home/switchboard`.
 
+### Your own copy: the only source for what runs as you or as root
+
+Three files run outside the hub user: the dispatcher `switchboard-remote` (as you, and as the user on every other machine, on every login of the hub's key), `sb-linux` (as you, and it calls `sudo`) and `switchboard.service` (read by root's systemd). Take them only from a clone in your own home, at a commit you checked, never from `/home/switchboard/switchboard`. The hub user can write its own checkout, and a task that gets code execution runs as the hub user: a file copied from there would hand it your account, every remote machine user and, through the unit, root.
+
+```sh
+git clone https://github.com/nilware-io/switchboard.git ~/src/switchboard
+cd ~/src/switchboard
+git checkout --detach <commit>     # the full commit hash (or release tag) you checked on GitHub
+git rev-parse HEAD                  # must print exactly that commit
+git status --porcelain              # must print nothing
+```
+
+Nothing is run from this clone (no `uv sync`, no hooks): it is only the source of the files you install, and only you can write it (`chmod 750 ~` in step 2 keeps others out). If you already have your own install of this repository (Mac mode, or [same-user mode](#same-user-mode) in your own clone), `voice-coding-mcp remote-dispatcher` there prints the same dispatcher file.
+
+Updates repeat this: `git -C ~/src/switchboard fetch`, read `git diff <old>..<new> -- deploy/linux deploy/remote`, check out the new commit and verify it as above, then install the three files again from this clone (steps 5.2, 6.1 and 9). Never update them from the hub's checkout, not even when it is at the same commit: check with `git -C ~/src/switchboard rev-parse HEAD`, not with the hub's tree.
+
 ## 4. Keys
 
 One dedicated key per machine, no passphrase (the hub runs unattended), never loaded into an agent:
@@ -92,14 +108,17 @@ exit
 
    Then `sudo sshd -t && sudo systemctl enable --now ssh`. Check with `ss -ltn '( sport = :22 )'`: only `127.0.0.1:22` and `[::1]:22` may be listed. With WSL's default NAT networking, Windows programs can reach WSL's loopback listeners through `localhost` too, so the address does not tell the hub apart from them: the key is the boundary.
 
-2. Install the dispatcher as yourself. Read it first; it is one short Python file with only the standard library:
+2. Install the dispatcher as yourself, from your own copy ([step 3](#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root)), and read it before it goes in place. It is one Python file of about 1100 lines with only the standard library, so a skim is not a review. What to check: the imports at the top (standard library only, no `socket`, `urllib` or `http`), that `subprocess.run` appears only in `run_tmux` and `parent_pid` (argv lists, a fixed environment, no `shell=True`), that files are only opened for reading, and that the policy comes only from the real argv (`resolve_request`, `parse_options`), never from `SSH_ORIGINAL_COMMAND`. If you reviewed that commit on GitHub, the file must be byte-identical to `deploy/remote/switchboard-remote` there (compare the `sha256sum` below with one computed from that commit).
 
    ```sh
-   mkdir -p ~/.local/bin
-   sudo cat /home/switchboard/switchboard/deploy/remote/switchboard-remote > ~/.local/bin/switchboard-remote
-   chmod 755 ~/.local/bin/switchboard-remote
-   less ~/.local/bin/switchboard-remote
+   cd ~/src/switchboard
+   git rev-parse HEAD                                  # the commit you checked in step 3
+   less deploy/remote/switchboard-remote               # read it before installing
+   install -D -m 755 deploy/remote/switchboard-remote ~/.local/bin/switchboard-remote
+   sha256sum deploy/remote/switchboard-remote ~/.local/bin/switchboard-remote   # the two must match
    ```
+
+   Never copy it from `/home/switchboard`: that file belongs to the hub user, and this one runs as you on every login of the hub's key.
 
 3. Add the hub's key to your `~/.ssh/authorized_keys`, as one line, with the tmux sessions the hub may see (replace `USER`, the session names and the key):
 
@@ -122,7 +141,7 @@ exit
 
 On each machine you want to reach (named `buildbox` here):
 
-1. A user whose tmux sessions you want to reach (for agents, their own user, for example `bot`). Install the dispatcher there as in step 5.2 (copy `deploy/remote/switchboard-remote` with `scp`, read it, `chmod 755`). It needs Python 3.8 or newer and tmux.
+1. A user whose tmux sessions you want to reach (for agents, their own user, for example `bot`). Install the dispatcher there as in step 5.2, from your own copy: `scp ~/src/switchboard/deploy/remote/switchboard-remote example-host:` (as yourself, not as `switchboard`), then on that machine `install -D -m 755 ~/switchboard-remote ~/.local/bin/switchboard-remote` and compare its `sha256sum` with the one from step 5.2. It needs Python 3.8 or newer and tmux.
 2. In that user's `~/.ssh/authorized_keys`, the hub's key for this machine with a forced command, and `from=` set to the address the WSL machine connects from (its Tailscale address if you go through the tailnet):
 
    ```
@@ -165,11 +184,18 @@ In the Tailscale admin console: rename the machine to something short before the
 
 ## 9. Install the unit and the on/off script
 
+Both files come from your own copy (step 3), never from `/home/switchboard`: `sb-linux` runs as you and calls `sudo`, and root's systemd reads the unit. Read them first (`sb-linux` is a bash script of about 700 lines; in the unit check `User=switchboard`, `ExecStart` and the hardening lines):
+
 ```sh
-sudo install -m 644 /home/switchboard/switchboard/deploy/linux/switchboard.service /etc/systemd/system/
-sudo install -m 755 /home/switchboard/switchboard/deploy/linux/sb-linux /usr/local/bin/
+cd ~/src/switchboard
+git rev-parse HEAD                                  # the commit you checked in step 3
+less deploy/linux/switchboard.service deploy/linux/sb-linux
+sudo install -m 644 deploy/linux/switchboard.service /etc/systemd/system/
+sudo install -m 755 deploy/linux/sb-linux /usr/local/bin/
 sudo systemctl daemon-reload
 ```
+
+On an update, repeat this from your copy at the new, verified commit (step 3). Updating the hub's checkout as `switchboard` does not update these files, and they are never taken from it.
 
 Do not `enable` the unit: `sb-linux on` starts it and `sb-linux off` stops it. The unit runs the hub as `switchboard` with the same hardening as the VPS unit and hides every other home directory from it (`ProtectHome=tmpfs`).
 
@@ -212,7 +238,7 @@ Everything a screen, a summary or a pending question says is quoted as screen te
 
 ```sh
 sb-linux off       # closes the Funnel, then stops the unit; safe to run twice
-sb-linux status    # on or off, the connector URL, then `voice-coding-mcp status` as switchboard
+sb-linux status    # on or off, the connector URL, then `voice-coding-mcp status` as switchboard (control characters removed)
 ```
 
 While it is off, the Claude app shows the connector as unreachable; tokens stay valid, so the next `sb-linux on` works without pairing. Turn it off whenever you do not use it.
@@ -251,12 +277,14 @@ If you suspect that someone else used the connector, that a task or a session wa
 
 1. Remove the connector in Claude (Settings, Connectors).
 2. `sudo -H -u switchboard /home/switchboard/switchboard/.venv/bin/voice-coding-mcp revoke-all --yes --config /home/switchboard/.config/voice-coding-mcp/config.json`.
-3. `sb-linux off`.
+3. `sb-linux off`. If you are not sure `/usr/local/bin/sb-linux` is the file from your own copy, do it by hand instead: `tailscale funnel --https=443 off` and `sudo systemctl stop switchboard`.
 4. Remove the hub's keys from every `authorized_keys` they are in: yours (machine `dev`) and the user on every other machine. Until you do, the hub user can still do what each forced command allows.
 5. Read the audit log: `sudo -H -u switchboard /home/switchboard/switchboard/.venv/bin/voice-coding-mcp audit --config /home/switchboard/.config/voice-coding-mcp/config.json` (it lists every send, with time, machine, session and outcome). It is append-only by convention only: a compromised hub user can rewrite it, so also look at the sessions themselves.
-6. Rotate the hub's SSH keys (step 4, new keys), install the new public keys with their forced commands (steps 5 and 6), and replace the `claude setup-token` token in `/etc/switchboard/env`.
-7. Look for persistence as `switchboard` and as every user a dispatcher runs as: shell profiles (`~/.bashrc`, `~/.profile` and similar), user systemd units, `crontab -l`, `~/.claude/settings.json` (hooks and allow rules), `~/.ssh/authorized_keys`, and git hooks (`.git/hooks`) in every project.
-8. Pair again only after that.
+6. Check what runs as you or as root against your own copy (step 3). First the copy itself: `git -C ~/src/switchboard rev-parse HEAD` must be the commit you verified, and `git -C ~/src/switchboard status --porcelain` must print nothing. Then `cmp ~/src/switchboard/deploy/remote/switchboard-remote ~/.local/bin/switchboard-remote`, `cmp ~/src/switchboard/deploy/linux/sb-linux /usr/local/bin/sb-linux` and `cmp ~/src/switchboard/deploy/linux/switchboard.service /etc/systemd/system/switchboard.service`, and the dispatcher on every other machine (`sha256sum`, as in step 6.1). Any difference: treat that account (or root) as compromised too, and reinstall the file from your copy only after you have dealt with it.
+7. Throw away the hub's code. Everything in `/home/switchboard` is untrusted now, the checkout and its `.venv` included, and nothing from it is ever installed as you or as root. Simplest: stop every process of the user and remove it with its home (`sudo pkill -KILL -u switchboard`, `sudo deluser --remove-home switchboard`), then start again from step 2. At the least, as `switchboard`: `rm -rf ~/switchboard ~/.local/bin/uv ~/.local/bin/uvx ~/.cache/uv`, clone again, `git checkout --detach <commit>` with the commit of your own copy, check `git rev-parse HEAD` and `git status --porcelain` as in step 3, then `uv sync --locked`.
+8. Look for persistence as every user a dispatcher runs as (you and the user on every other machine), and as `switchboard` if you kept the user: shell profiles (`~/.bashrc`, `~/.profile` and similar), user systemd units, `crontab -l`, `~/.claude/settings.json` (hooks and allow rules), `~/.ssh/authorized_keys`, and git hooks (`.git/hooks`) in every project.
+9. Rotate the hub's SSH keys (step 4, new keys) and replace the `claude setup-token` token in `/etc/switchboard/env`. Install the new public keys with their forced commands (steps 5.3 and 6.2); if a dispatcher has to be installed again, take it from your own copy (steps 5.2 and 6.1), never from the hub's new checkout.
+10. Pair again only after that.
 
 ## Troubleshooting
 

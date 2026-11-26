@@ -85,11 +85,22 @@ usage() {
   sed -n '4,23p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
 }
 
+# Drops the C0 control characters except tab and newline, and DEL, so text from the hub user cannot
+# send escape sequences to your terminal.
+strip_controls() {
+  LC_ALL=C tr -d '\000-\010\013-\037\177'
+}
+
 # Runs voice-coding-mcp: as the hub user in service mode (sudo, from / because your working
-# directory may be closed to that user), as you in user mode.
+# directory may be closed to that user), as you in user mode. In service mode the program and its
+# output belong to the hub user, so both stdout and stderr pass through strip_controls (the swap
+# through fd 3 keeps them apart; pipefail keeps the program's exit code).
 vcm_cmd() {
   if [ "$MODE" = service ]; then
-    (cd / && sudo -H -u "$HUB_USER" -- "${VCM_CMD[@]}" "$@")
+    (
+      cd / || exit 1
+      { sudo -H -u "$HUB_USER" -- "${VCM_CMD[@]}" "$@" 2>&1 1>&3 3>&- | strip_controls >&2; } 3>&1 | strip_controls
+    )
   elif [ "${#VCM_CMD[@]}" -gt 0 ]; then
     "${VCM_CMD[@]}" "$@"
   else
@@ -334,12 +345,18 @@ make_dirs() {
 # $LOCK_FILE while it runs. The kernel releases it when flock exits, also after a crash or kill -9,
 # so a lock is never stale. -o keeps the lock's descriptor out of the script, so the server that
 # `on` starts does not hold the lock. SB_LOCKED marks the inner run and is removed from its
-# environment.
+# environment. The marker alone is not trusted: the inner run also checks that its parent is
+# flock(1) and that the lock is really held (a second flock -n on the file fails while the outer
+# flock holds it), so an SB_LOCKED=1 inherited from the caller's environment does not skip the lock.
 run_locked() {
-  local rc=0
+  local rc=0 held=0 parent
   if [ "${SB_LOCKED:-}" = 1 ]; then
     unset SB_LOCKED
-    return 0
+    parent="$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d ' ' || true)"
+    if [ "$parent" = flock ] && [ -f "$LOCK_FILE" ]; then
+      flock -n -E 75 "$LOCK_FILE" true || held=$?
+      [ "$held" -ne 75 ] || return 0
+    fi
   fi
   make_dirs
   SB_LOCKED=1 flock -n -o -E 75 "$LOCK_FILE" "$SCRIPT_PATH" "$@" || rc=$?
