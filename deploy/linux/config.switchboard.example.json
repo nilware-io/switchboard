@@ -1,0 +1,54 @@
+{
+  "publicUrl": "https://example-host.example-tailnet.ts.net",
+  "listen": { "host": "127.0.0.1", "port": 8787, "allowNonLoopback": false },
+  "stateDir": "/home/switchboard/.local/state/voice-coding-mcp",
+  "projectRoots": ["/home/switchboard/projects"],
+  "claude": {
+    "bin": "claude",
+    "access": "isolated",
+    "permissionMode": "auto",
+    "settingSources": ["user"],
+    "configDir": null,
+    "mcpServers": {},
+    "extraArgs": [],
+    "env": {}
+  },
+  "tasks": { "syncWaitSeconds": 25, "timeoutMinutes": 15, "maxConcurrent": 2, "maxQueued": 10 },
+  "notify": { "url": null, "headers": {}, "includeResult": false },
+  "logPrompts": false,
+  "remote": {
+    "machines": [
+      {
+        "name": "dev",
+        "transport": "ssh",
+        "host": "localhost",
+        "user": "owner",
+        "port": 22,
+        "identityFile": "/home/switchboard/.ssh/switchboard_dev",
+        "knownHostsFile": "/home/switchboard/.ssh/switchboard_known_hosts",
+        "dispatcher": "forced",
+        "sessions": ["fpga", "notes", "work-*"],
+        "allowUsage": true,
+        "allowSend": false,
+        "allowPermissionAnswers": false,
+        "sendToAnyPane": false
+      },
+      {
+        "name": "buildbox",
+        "transport": "ssh",
+        "host": "example-host",
+        "user": "bot",
+        "identityFile": "/home/switchboard/.ssh/switchboard_buildbox",
+        "knownHostsFile": "/home/switchboard/.ssh/switchboard_known_hosts",
+        "sessions": ["api", "web-*"],
+        "allowUsage": false
+      }
+    ],
+    "ssh": { "bin": "ssh", "connectTimeoutSeconds": 5, "commandTimeoutSeconds": 10 },
+    "captureLines": 60,
+    "summary": { "enabled": true, "model": "haiku", "timeoutSeconds": 15 },
+    "send": { "confirmSeconds": 120, "maxChars": 2000, "maxPending": 1, "minConfirmSeconds": 4, "slashCommands": [] }
+  },
+  "watch": { "intervalSeconds": 0, "longTurnMinutes": 10, "notifyUnreachable": false, "includeQuestion": false },
+  "usage": { "idleGapMinutes": 15, "hourlyRate": 40, "currency": "EUR", "overlap": "union" }
+}

@@ -1,6 +1,6 @@
 # Switchboard design
 
-Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher) and M3 (`remote_send`, `remote_send_confirm`, audit) and M4 (usage, `usage_report`, `voice-coding-mcp usage`) implemented; M5 designed, not yet implemented. This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
+Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher), M3 (`remote_send`, `remote_send_confirm`, audit), M4 (usage, `usage_report`, `voice-coding-mcp usage`) and M5 (Linux and WSL hub deploy, upstream session tools on Linux, the owner guide [SETUP-WSL.md](SETUP-WSL.md)) implemented. What only the owner can verify on the real setup is listed in DESIGN.md "To verify with the real app". This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
 
 ## Goal
 
@@ -33,7 +33,7 @@ Checked on the target WSL box (Claude Code 2.x on Linux, tmux 3.4, OpenSSH 9.6).
 
 Consequences:
 
-- Upstream's Mac-mode session code (transcripts, registry, `list_sessions`, `ask_session_readonly`) has no macOS dependency except `remoteControl.handoffToDesktop`, which is already refused outside macOS. It works on Linux when the hub runs as the user who owns the sessions. The relay of `send_message_to_session` uses the socket path from the registry, so the different directory does not matter; still to verify live on Linux (M5).
+- Upstream's Mac-mode session code (transcripts, registry, `list_sessions`, `ask_session_readonly`) has no macOS dependency except `remoteControl.handoffToDesktop`, which is already refused outside macOS. It works on Linux when the hub runs as the user who owns the sessions. The relay of `send_message_to_session` uses the socket path from the registry, so the different directory does not matter. M5 tests this against Linux-shaped registry entries (both socket layouts, the `tmux` field, `waiting`); a live relay on Linux is still for the owner to verify.
 - The registry's `tmux` field gives an exact pane id for each Claude Code process in tmux, so "which pane runs Claude Code, and is it waiting" needs no screen scraping. Screen scraping stays a fallback.
 - A hub running as a separate `switchboard` user cannot read the owner's `~/.claude` or connect to the owner's tmux socket (tmux checks the client uid). The owner's own sessions are therefore reached the same way as remote ones, through the dispatcher over SSH to `localhost`.
 
@@ -217,15 +217,17 @@ src/voice_coding_mcp/usage/
 deploy/remote/switchboard-remote     byte-identical copy of remote/dispatcher.py (a test checks it)
 deploy/linux/sb-linux                on/off/status for Linux and WSL (Funnel), like deploy/mac/vcm-mac
 deploy/linux/switchboard.service     hardened system unit for the dedicated user
-docs/SWITCHBOARD-SETUP.md            owner setup guide (M5)
+deploy/linux/config.switchboard.example.json   example config for the dedicated user
+docs/SETUP-WSL.md                    owner setup guide (M5)
 tests/remote/                        one test module per remote module
 tests/usage/
 tests/fixtures/fake_ssh.py           fake OpenSSH client
 tests/fixtures/fake_tmux.py          fake tmux driven by a JSON scenario
-tests/fixtures/fake_tui.py           bracketed-paste recorder for the optional isolated-tmux test
+tests/fixtures/fake_tui.py           bracketed-paste recorder for the optional isolated-tmux tests
+tests/fixtures/fake_linux_host.py    fake tailscale, sudo and systemctl for the sb-linux tests
 ```
 
-`mcp.py` registers the new tools, `cli.py` gets `usage` (M4), `remote-check` and `remote-dispatcher`, `notify.py` gets a plain-text send path, `tasks/manager.py` gets a `remote` task kind for background remote jobs. Modules receive their dependencies (options, logger, clock, transport factory) as arguments, as upstream.
+`mcp.py` registers the new tools, `cli.py` gets `usage` (M4), `set-public-url` (M5), `remote-check` and `remote-dispatcher`, `notify.py` gets a plain-text send path, `tasks/manager.py` gets a `remote` task kind for background remote jobs. Modules receive their dependencies (options, logger, clock, transport factory) as arguments, as upstream.
 
 ## The dispatcher
 
@@ -556,23 +558,25 @@ The hub runs as the owner (like Mac mode on Linux). Upstream session tools see t
 
 ### `deploy/linux/sb-linux`
 
-Bash, shellcheck-clean, modelled on `vcm-mac`: `on`, `off`, `status`. Two layouts, chosen by `SB_MODE`:
+Bash, shellcheck-clean (CI), modelled on `vcm-mac`: `on`, `off`, `status`, with the same Funnel handling (exit code 0 of `tailscale funnel --bg` alone is not success, an approval link is printed instead of waited for, `off` closes the Funnel only when it proxies the hub's port). Two layouts, chosen by `SB_MODE` (implemented in M5; variables in [REFERENCE.md](REFERENCE.md#deploylinuxsb-linux)):
 
-- `service` (dedicated user): run by the owner. `on`: `sudo systemctl start switchboard` (one password prompt or a narrow sudoers rule the owner may add), waits for `/healthz`, opens the Funnel, sets `publicUrl` in the config through the service (`sudo -u switchboard voice-coding-mcp ...`, no direct file edit), prints the connector URL and the pair command. `off`: closes the Funnel, then `sudo systemctl stop switchboard`.
-- `user` (same-user): starts `voice-coding-mcp serve --pid-file` in the background like `vcm-mac`, no sudo.
+- `service` (default, dedicated user): run by the owner, refused when run as the hub user. `on`: `sudo -H -u switchboard <venv>/voice-coding-mcp set-public-url https://<name> --config <config>` (the hub user's own CLI checks the new config and rewrites it atomically; the owner never edits the hub's file), `sudo systemctl start switchboard` (or `restart` when `publicUrl` changed), waits for `/healthz` (a unit that does not answer is stopped again), opens the Funnel, prints the connector URL and the pair command. `off`: closes the Funnel, then `sudo systemctl stop switchboard`. The owner cannot read the hub's config, so the port comes from `SB_PORT` (default 8787); a mismatch shows up as a `/healthz` timeout that names `SB_PORT`.
+- `user` (same-user): starts `voice-coding-mcp serve --pid-file` in the background like `vcm-mac` (`nohup`, no `caffeinate`), no sudo; `listen.host` and `listen.port` come from the config, which `set-public-url` rewrites.
+
+Differences from `vcm-mac`: util-linux `flock` instead of macOS `lockf(1)`, both for the on/off lock (`flock -n -o`, so the server started by `on` does not inherit the lock's descriptor) and for the liveness probe of the server's pid file (`serve --pid-file` holds a `flock`); the run directory is `~/.local/state/sb-linux` (`SB_RUN_DIR`); `tailscale` comes from `PATH` (`SB_TAILSCALE`); a Funnel refused because the user is not the operator gets the `tailscale set --operator` hint.
 
 Funnel on Linux (the owner is the Tailscale operator: `sudo tailscale set --operator=<owner>` once; the `switchboard` user is not, so a compromised hub cannot change the tailnet node):
 
 ```
-tailscale funnel --bg --https=443 http://127.0.0.1:8787     # on
+tailscale funnel --bg 8787                                  # on (a bare port means http://127.0.0.1:<port>)
 tailscale funnel --https=443 off                            # off
-tailscale funnel status --json                              # status, checked like vcm-mac
+tailscale funnel status                                     # status, parsed like vcm-mac (text output)
 tailscale status --json                                     # MagicDNS name, BackendState
 ```
 
 WSL notes for the guide: Tailscale runs inside the WSL distribution (its own tailnet node and `ts.net` name, separate from a Windows Tailscale), which needs systemd in WSL (`[boot] systemd=true` in `/etc/wsl.conf`); the hub is reachable only while Windows is awake and the WSL VM runs (a running systemd service keeps the VM up); the Funnel node attribute and HTTPS certificates must be enabled for the tailnet as in the Mac guide.
 
-`deploy/linux/switchboard.service`: derived from `deploy/voice-coding-mcp.service` with `User=switchboard`, paths under `/home/switchboard`, the same hardening, `ProtectHome=tmpfs` plus `BindPaths=/home/switchboard` so the service cannot even see other homes (the dispatcher reaches the owner's files through sshd, not through the filesystem).
+`deploy/linux/switchboard.service`: derived from `deploy/voice-coding-mcp.service` with `User=switchboard`, the checkout and venv in `/home/switchboard/switchboard`, the config in `/home/switchboard/.config/voice-coding-mcp/config.json`, the same hardening, `ProtectHome=tmpfs` plus `BindPaths=/home/switchboard` so the service cannot even see other homes (the dispatcher reaches the owner's files through sshd, not through the filesystem), and the `claude setup-token` token in the root-owned `EnvironmentFile=/etc/switchboard/env`. No `StateDirectory=`: `stateDir` lives in the hub user's home. It is not enabled; `sb-linux` starts and stops it. `deploy/linux/config.switchboard.example.json` is the matching config (machine `dev` first, over SSH to `localhost`, read-only).
 
 ## The dev machine as a machine
 
@@ -642,7 +646,7 @@ All tests stay hermetic: no network, no real `ssh`, `tmux` or `claude`, never th
 - Optional live tmux test, skipped unless `SB_LIVE_TMUX=1`: starts an isolated server `tmux -L sb-test-<random> -f /dev/null`, runs the dispatcher against it (the dispatcher takes `--tmux-socket-name` for this test only, from its real argv, rejected unless an env flag set by the test is present), and always `kill-server`s it in a finalizer. Never touches the default tmux server. The pane runs `tests/fixtures/fake_tui.py`, a small program that turns on bracketed paste and records the bytes it receives, so the test checks real tmux behaviour (one bracketed block, LF handling of `paste-buffer`, Enter after it, buffer deleted) without Claude Code.
 
 Not testable here, verified by the owner and recorded in DESIGN.md "To verify with the real app" (M3 and M5): Claude Code's handling of a bracketed paste with newlines, of a leading `!`, `/` and `#` inside a paste, of vim input mode (pasted text would be read as commands: the dispatcher refuses when the capture shows Claude Code's vim `NORMAL` indicator, to confirm), and which option Enter selects in its permission dialog; whether the registry `status` switches to `waiting` before the dialog is drawn; whether the installed CLI has `--no-session-persistence`; whether voice mode keeps `remote_send` and `remote_send_confirm` in separate turns, and whether it shows the app's approval for `clientApproval`.
-- `deploy/linux/sb-linux` and `deploy/remote/switchboard-remote`: shellcheck in CI for the former; a test asserts the latter equals `remote/dispatcher.py` byte for byte and that the dispatcher imports only the standard library.
+- `deploy/linux/sb-linux` and `deploy/remote/switchboard-remote`: shellcheck in CI for the former, plus `tests/test_sb_linux.py` (M5), which runs it in both layouts against `tests/fixtures/fake_linux_host.py` (fake `tailscale`, `sudo`, `systemctl`) and a real `voice-coding-mcp serve` on a loopback port; a test asserts the latter equals `remote/dispatcher.py` byte for byte and that the dispatcher imports only the standard library.
 
 ## Milestones
 
@@ -707,11 +711,18 @@ Done as listed, with these notes:
 - Tests: `tests/usage/test_dispatcher_usage.py` (policy, request and stdin validation, what leaves the machine, cwd, sidechain, overlong and malformed lines, timestamps, clamping, hostile ids, known and gone files, since, size cap, symlinks and subagent directories, `--claude-home`, the script's JSON lines), `test_records_protocol.py` (strict line parsing, the `usage` response, summaries, over fake ssh and the local transport), `test_compute.py` (periods and time zones, DST, idle gaps, the one-minute rule, clipping, union versus sum, per-project billing and rounding, dedup across lines, forks and machines, cache token types, prices, unpriced models, known costs, by day and session), `test_cache_report.py` (cache round trip, mode, retention, broken files, known list cap; spoken shapes, numbers, quoting; CSV and table, formula guard), `test_service_tool.py` (end to end with the fake ssh: refresh and cache, freshness, incremental refresh and gone files, failed machines with an old cache, a dispatcher without `--allow-usage`, filters, a slow machine turning into a task, hub dedupe with a `local` machine, summariser runs, the CLI's CSV, `--cached`, `--by session` and argument errors), `test_config_usage.py`.
 - Not verified yet (owner, against real transcripts): the transcript fields the parser relies on (`timestamp`, `cwd`, `requestId`, `message.id`, `message.model`, `message.usage` with `cache_creation`) in the installed Claude Code, whether a resumed or forked session keeps the original message ids and times (dedup relies on it), and that subagent runs in newer Claude Code versions write their usage into the session's own transcript (the dispatcher reads no subagent directories, so tokens of subagent transcripts stored separately are not counted).
 
-### M5: Linux and WSL hub deploy, local session features on Linux, owner setup guide
+### M5: Linux and WSL hub deploy, local session features on Linux, owner setup guide (implemented)
 
-- `deploy/linux/sb-linux`, `deploy/linux/switchboard.service`, `docs/SWITCHBOARD-SETUP.md`: dedicated user, bot GitHub identity, keys, the dev machine over localhost SSH (first), remote machines, Funnel, pairing, a first voice test with one harmless project, turning it off, the "if something is compromised" steps extended with: remove the hub keys from every `authorized_keys`, check `audit.jsonl`, rotate the hub's SSH keys.
+- `deploy/linux/sb-linux`, `deploy/linux/switchboard.service`, `docs/SETUP-WSL.md`: dedicated user, bot GitHub identity, keys, the dev machine over localhost SSH (first), remote machines, Funnel, pairing, a first voice test with one harmless project, turning it off, the "if something is compromised" steps extended with: remove the hub keys from every `authorized_keys`, check `audit.jsonl`, rotate the hub's SSH keys.
 - Verify upstream session features on Linux in same-user mode with fixtures shaped like real Linux registry entries; record what was verified live (by the owner, not by tests) in DESIGN.md "To verify with the real app": relay to a session over the `/run/user` socket, `list_sessions` on WSL, voice-mode behaviour of the confirm flow.
 - README: a third mode, "Linux workstation mode", next to Mac and VPS mode.
+
+Done as listed, with these notes:
+
+- The guide is `docs/SETUP-WSL.md` (not `SWITCHBOARD-SETUP.md`): create the user, install, keys, machine `dev`, other machines, config, Tailscale, unit and script, pair, voice phrases to try, turning off, optional extras, the owner's own extensions (MCP servers, plugins, skills, agent teams: the owner's tmux sessions keep theirs, the hub's headless tasks only have what the hub user has), same-user mode, the extended "if something is compromised" steps and troubleshooting. `deploy/linux/config.switchboard.example.json` is the dedicated-user example config.
+- New CLI command `set-public-url` (so `sb-linux` in service mode changes the hub's config as the hub user). See [`deploy/linux/sb-linux`](#deploylinuxsb-linux) for how the script differs from `vcm-mac` (util-linux `flock -o`, `SB_PORT`, the operator hint, a unit that does not answer is stopped).
+- Tests: `tests/test_sb_linux.py` (both layouts end to end with a real server: on, status, a second on, a restart for a changed address, off twice; approval link, operator hint, disconnected Tailscale, a Funnel to another port left alone, port mismatch, the on/off lock, arguments), `tests/test_deploy_linux.py` (the example config parses and keeps everything in the hub user's home, the unit runs it with the same hardening as the VPS unit, `sb-linux`'s defaults match both, no personal details or dashes in the deploy files and the guide), `tests/test_cli_public_url.py`, `tests/test_linux_sessions.py` (upstream `list_sessions`, `ask_session_readonly`, `send_message_to_session` and the hub-local part of `pending_input` against registry entries with every key seen on Linux, both socket layouts), and `tests/remote/test_live_local.py` (optional, `SB_LIVE_TMUX=1`: `list_remote_sessions`, `remote_status`, `pending_input`, `remote_send` and `remote_send_confirm` through the real `LocalTransport` and dispatcher against an isolated `tmux -L sb-test-<random>` server running `fake_tui.py`).
+- Verified on the WSL box (tmux 3.4): the live local-transport smoke and the existing live dispatcher tests, each on its own isolated server that is killed afterwards. shellcheck was not available on the box; CI runs it (`tests/test_sb_linux.py` also runs it when installed). Not verified yet (owner, on the real setup): see DESIGN.md "To verify with the real app" (sshd forced command on localhost, a live relay over `/run/user`, `list_sessions` on WSL, Funnel from inside WSL, the voice-mode confirm flow).
 
 ## Open questions from the brief, with recommendations
 

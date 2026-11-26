@@ -1,0 +1,70 @@
+# systemd unit for the Switchboard hub (voice-coding-mcp) on Linux or WSL, as the dedicated
+# `switchboard` user. Install it as root to /etc/systemd/system/switchboard.service, then
+# `sudo systemctl daemon-reload`. Do not enable it: deploy/linux/sb-linux starts and stops it
+# together with the Tailscale Funnel. Steps: docs/SETUP-WSL.md.
+
+[Unit]
+Description=Switchboard hub (voice-coding-mcp, remote MCP server for Claude Code sessions)
+Documentation=file:///home/switchboard/switchboard/docs/SETUP-WSL.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=switchboard
+Group=switchboard
+# Claude Code (native installer) lives in ~/.local/bin, so it must be on PATH for
+# `claude.bin: "claude"` to resolve; ssh, tmux and python3 come from the system.
+Environment=PATH=/home/switchboard/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=PYTHONUNBUFFERED=1
+# Holds CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`, run as switchboard). Root-owned, 0600:
+# systemd reads it before dropping to the switchboard user. The leading "-" lets the unit load
+# when it is missing; the app then reports the missing token.
+EnvironmentFile=-/etc/switchboard/env
+# Never let an API key from anywhere override the subscription token.
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN SSH_AUTH_SOCK
+WorkingDirectory=/home/switchboard
+# The checkout in ~/switchboard with its venv (`uv sync --locked` as switchboard).
+ExecStart=/home/switchboard/switchboard/.venv/bin/voice-coding-mcp serve --config /home/switchboard/.config/voice-coding-mcp/config.json
+Restart=on-failure
+RestartSec=5s
+# Kill every process in the cgroup on stop, so running `claude -p` children (and whatever they
+# spawned, including ssh calls to the machines) die with the service.
+KillMode=control-group
+# The runner sends SIGTERM and escalates to SIGKILL after 10 s; give it room.
+TimeoutStopSec=30s
+# New files (state, logs, project files written by Claude Code) are private.
+UMask=0077
+
+# Hardening, as deploy/voice-coding-mcp.service (see the comments there for what is deliberately
+# left out so Claude Code can still build, test and use its bubblewrap sandbox).
+ProtectSystem=strict
+# Hide all homes (and /root, /run/user) behind an empty tmpfs: the owner's home, keys and
+# ~/.claude are not even visible. The owner's sessions are reached through sshd and the
+# switchboard-remote forced command, never through the file system.
+ProtectHome=tmpfs
+# ... and bring back only switchboard's home, writable.
+BindPaths=/home/switchboard
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# IP for the API, git and ssh to the machines, Unix sockets for local tools, netlink for interface
+# lookups. No raw or packet sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitNOFILE=65536
+TasksMax=2048
+
+[Install]
+WantedBy=multi-user.target

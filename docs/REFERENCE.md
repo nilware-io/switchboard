@@ -4,7 +4,7 @@ Configuration, CLI, MCP tools and HTTP endpoints of voice-coding-mcp. Setup is i
 
 ## Configuration
 
-JSON file, path from `--config` or `VCM_CONFIG`, default `/etc/voice-coding-mcp/config.json` (the VPS layout; `deploy/mac/vcm-mac` defaults to `~/.config/voice-coding-mcp/config.json`). See [config.example.json](../config.example.json). The defaults below are the VPS paths; in Mac mode put `stateDir` and `projectRoots` under your home directory.
+JSON file, path from `--config` or `VCM_CONFIG`, default `/etc/voice-coding-mcp/config.json` (the VPS layout; `deploy/mac/vcm-mac` defaults to `~/.config/voice-coding-mcp/config.json`, `deploy/linux/sb-linux` to `/home/switchboard/.config/voice-coding-mcp/config.json` for the dedicated hub user). See [config.example.json](../config.example.json), and [deploy/linux/config.switchboard.example.json](../deploy/linux/config.switchboard.example.json) for a Linux or WSL hub as the dedicated `switchboard` user. The defaults below are the VPS paths; in Mac mode put `stateDir` and `projectRoots` under your home directory.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -75,7 +75,7 @@ JSON file, path from `--config` or `VCM_CONFIG`, default `/etc/voice-coding-mcp/
 uv run voice-coding-mcp <command> [options]
 ```
 
-On the VPS use the wrapper, which runs as the service user and adds `--config /etc/voice-coding-mcp/config.json`: `sudo voice-coding-mcp <command>`. On the Mac pass `--config` yourself (`vcm-mac on` prints the exact `pair` command). `--config` may come before or after the command; the other options belong after their command. `voice-coding-mcp -h` and `voice-coding-mcp <command> -h` show the help.
+On the VPS use the wrapper, which runs as the service user and adds `--config /etc/voice-coding-mcp/config.json`: `sudo voice-coding-mcp <command>`. On the Mac pass `--config` yourself (`vcm-mac on` prints the exact `pair` command). On a Linux or WSL hub with the dedicated user run it as that user: `sudo -H -u switchboard /home/switchboard/switchboard/.venv/bin/voice-coding-mcp <command> --config /home/switchboard/.config/voice-coding-mcp/config.json` (`sb-linux on` prints the `pair` command). `--config` may come before or after the command; the other options belong after their command. `voice-coding-mcp -h` and `voice-coding-mcp <command> -h` show the help.
 
 | Command | What it does |
 |---|---|
@@ -88,6 +88,7 @@ On the VPS use the wrapper, which runs as the service user and adds `--config /e
 | `remote-dispatcher` | Print the `switchboard-remote` dispatcher script (needs no config), for example `voice-coding-mcp remote-dispatcher > ~/.local/bin/switchboard-remote` on the machine to reach |
 | `audit [--limit N]` | Print `stateDir/audit.jsonl`, one line per `remote_send_confirm` that reached the send step, as a table: time (UTC), machine, tmux session, pane, outcome (`sent`, `not_sent:<reason>`, `pasted_no_enter`, `unknown`), risk reasons, whether the risky part was confirmed, text length, client name, and the redacted text only for lines written with `logPrompts`. `--limit` shows the last N lines (1 to 100000). Unreadable lines are counted on stderr |
 | `usage [--period P] [--machine M] [--project X] [--by project\|session\|day] [--csv] [--cached]` | Usage for billing: per project (or Claude Code session, or day) the sessions, active hours, billable hours (parallel sessions of a project count once with `usage.overlap` `union`), the amount at `usage.hourlyRate`, tokens by type (input, output, 5-minute and 1-hour cache writes, cache reads) and the API-equivalent cost in USD, then a total. `--period`: `today`, `yesterday`, `this week`, `last week`, `this month` (default), `last month`, `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD`, in local time, weeks from Monday. `--machine local` is the server's own Claude Code home. It first reads every machine with `allowUsage` (a progress line on stderr) and updates the caches in `stateDir/usage/`; `--cached` skips that. `--csv` prints CSV with a header row (names that start like a spreadsheet formula get a leading `'`; notes go to stderr). Exit 1 when a machine could not be read (its cached records are used), 2 for a bad option |
+| `set-public-url URL` | Set `publicUrl` in the config file to `URL` (a trailing slash is dropped): the file is read, the new value checked by parsing the whole config again (exit 2 and nothing written when it is invalid), and written atomically with mode 600, other keys and their order kept (formatting is not). Prints `changed: publicUrl is now URL (restart the server to apply it)` or `unchanged: publicUrl is already URL`. A running server keeps its old value until restarted. `deploy/linux/sb-linux on` runs it as the hub user, so the owner never edits the hub's config file |
 
 | Option or variable | Meaning |
 |---|---|
@@ -102,6 +103,28 @@ Exit codes: 0 success, 1 runtime error, 2 usage or config error. A usage error p
 `serve` logs JSON lines to stdout (journald on the VPS, `vcm-mac-server.log` on the Mac): one line per request with method, path without query, status, duration, client IP and a token fingerprint, never headers or bodies. Prompts and Claude's stderr appear only with `logPrompts`.
 
 The CLI and the running server share `stateDir`: changes to `oauth.json` and `pairing.json` are serialized across processes with file locks (`oauth.lock`, `pairing.lock`), and the server notices changes made by the CLI.
+
+## deploy/linux/sb-linux
+
+On and off for a Linux or WSL hub published through Tailscale Funnel (Switchboard; steps in [SETUP-WSL.md](SETUP-WSL.md)). Run it as yourself, the Tailscale operator (`sudo tailscale set --operator=$USER` once), never as the hub user. Needs bash, jq, curl and util-linux `flock`; in service mode also sudo and systemctl, in user mode uv (unless `SB_VCM` is set).
+
+| Command | What it does |
+|---|---|
+| `on` | Checks Tailscale (`tailscale status --json`: connected, MagicDNS name), runs `set-public-url https://<name>` (as the hub user in service mode), starts the hub (service: `sudo systemctl start`, or `restart` when `publicUrl` changed; user: `voice-coding-mcp serve --pid-file` in the background), waits for `/healthz` (`SB_START_SECONDS`, default 30; a service that does not answer is stopped again), then `tailscale funnel --bg <port>` and checks `tailscale funnel status`. Prints the connector URL and the pair command. If Funnel or HTTPS still need approval it prints Tailscale's link, stops the hub and exits 1 |
+| `off` | `tailscale funnel --https=443 off`, only when the Funnel proxies the hub's port; then stops the hub (service: `sudo systemctl stop`; user: SIGTERM to the pid in the pid file, SIGKILL after 25 s). Safe to run twice |
+| `status` | On or off, the mode, the connector URL, the service state or server pid and port, then `voice-coding-mcp status` (as the hub user in service mode) |
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SB_MODE` | `service` | `service`: the hub runs as a dedicated user under the systemd unit `SB_SERVICE` (`deploy/linux/switchboard.service`). `user`: the hub runs as you, started in the background like `deploy/mac/vcm-mac` |
+| `SB_USER` | `switchboard` | Service mode: the hub's Linux user. `on` refuses to run as this user |
+| `SB_SERVICE` | `switchboard` | Service mode: the systemd unit |
+| `SB_CONFIG` | service: `/home/<SB_USER>/.config/voice-coding-mcp/config.json`; user: `~/.config/voice-coding-mcp/config.json` | The hub's config file |
+| `SB_VCM` | service: `/home/<SB_USER>/switchboard/.venv/bin/voice-coding-mcp`; user: `uv run --frozen` in the repository | The `voice-coding-mcp` executable |
+| `SB_PORT` | `8787` | Service mode: `listen.port` of the hub's config (the file is closed to you). User mode reads `listen.host` and `listen.port` from the config |
+| `SB_RUN_DIR` | `~/.local/state/sb-linux` | Your lock file (`on` and `off` are serialized with `flock`), and in user mode the server log, pid file and Funnel port file, all private |
+| `SB_TAILSCALE` | `tailscale` on `PATH` | The Tailscale CLI |
+| `SB_START_SECONDS` | `30` | How long `on` waits for `/healthz` |
 
 ## MCP tools
 

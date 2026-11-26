@@ -1,0 +1,660 @@
+#!/bin/bash
+# Backticks in single-quoted messages are literal command names, not substitutions.
+# shellcheck disable=SC2016
+# sb-linux: run the Switchboard hub (voice-coding-mcp) on Linux or WSL on demand, published through
+# Tailscale Funnel. Run it as yourself (the Tailscale operator), never as the hub user.
+#
+#   sb-linux on       start the hub and open the Funnel; it stays on until `sb-linux off`
+#   sb-linux off      close the Funnel and stop the hub (idempotent)
+#   sb-linux status   show whether it is on, the connector URL and `voice-coding-mcp status`
+#
+# Environment:
+#   SB_MODE       service (default): the hub runs as a dedicated user under systemd (unit SB_SERVICE);
+#                 user: the hub runs as you, started in the background like deploy/mac/vcm-mac
+#   SB_USER       service mode: the hub's Linux user (default switchboard)
+#   SB_SERVICE    service mode: the systemd unit (default switchboard)
+#   SB_CONFIG     config file (service: /home/<SB_USER>/.config/voice-coding-mcp/config.json,
+#                 user: ~/.config/voice-coding-mcp/config.json)
+#   SB_VCM        the voice-coding-mcp executable (service: /home/<SB_USER>/switchboard/.venv/bin/
+#                 voice-coding-mcp; user: `uv run` in this repository)
+#   SB_PORT       service mode: listen.port of the hub's config, which you cannot read (default 8787)
+#   SB_RUN_DIR    your directory for the lock, pid and state files (default ~/.local/state/sb-linux)
+#   SB_TAILSCALE  the Tailscale CLI (default `tailscale` on PATH)
+#   SB_START_SECONDS  how long `on` waits for the hub's /healthz (default 30)
+
+set -euo pipefail
+# Logs, pid files and the rewritten config are private.
+umask 077
+
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")/../.." && pwd)"
+
+MODE="${SB_MODE:-service}"
+case "$MODE" in
+  service | user) ;;
+  *)
+    printf 'sb-linux: SB_MODE must be service or user, not %s\n' "$MODE" >&2
+    exit 2
+    ;;
+esac
+HUB_USER="${SB_USER:-switchboard}"
+SERVICE="${SB_SERVICE:-switchboard}"
+HUB_HOME="/home/$HUB_USER"
+
+if [ "$MODE" = service ]; then
+  CONFIG="${SB_CONFIG:-$HUB_HOME/.config/voice-coding-mcp/config.json}"
+else
+  CONFIG="${SB_CONFIG:-$HOME/.config/voice-coding-mcp/config.json}"
+  if CONFIG_DIR="$(cd "$(dirname "$CONFIG")" 2>/dev/null && pwd)"; then
+    CONFIG="$CONFIG_DIR/$(basename "$CONFIG")"
+  fi
+fi
+CONFIG_DIR="$(dirname "$CONFIG")"
+
+# How to run voice-coding-mcp (as an array, so a path with spaces stays one word).
+VCM_CMD=()
+if [ -n "${SB_VCM:-}" ]; then
+  VCM_CMD=("$SB_VCM")
+elif [ "$MODE" = service ]; then
+  VCM_CMD=("$HUB_HOME/switchboard/.venv/bin/voice-coding-mcp")
+fi
+
+RUN_DIR="${SB_RUN_DIR:-$HOME/.local/state/sb-linux}"
+LOG_FILE="$RUN_DIR/server.log"
+SERVER_PID_FILE="$RUN_DIR/server.pid"
+FUNNEL_PORT_FILE="$RUN_DIR/funnel.port"
+LOCK_FILE="$RUN_DIR/sb-linux.lock"
+START_SECONDS="${SB_START_SECONDS:-30}"
+case "$START_SECONDS" in
+  "" | *[!0-9]*) START_SECONDS=30 ;;
+esac
+# Set from listen.host in the config by load_listen (user mode); the service listens on loopback.
+LISTEN_HOST="127.0.0.1"
+TS=""
+
+die() {
+  printf 'sb-linux: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+usage() {
+  sed -n '4,23p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+}
+
+# Runs voice-coding-mcp: as the hub user in service mode (sudo, from / because your working
+# directory may be closed to that user), as you in user mode.
+vcm_cmd() {
+  if [ "$MODE" = service ]; then
+    (cd / && sudo -H -u "$HUB_USER" -- "${VCM_CMD[@]}" "$@")
+  elif [ "${#VCM_CMD[@]}" -gt 0 ]; then
+    "${VCM_CMD[@]}" "$@"
+  else
+    uv run --frozen --quiet --project "$REPO_DIR" voice-coding-mcp "$@"
+  fi
+}
+
+# The command line to show for pairing.
+pair_hint() {
+  if [ "$MODE" = service ]; then
+    printf 'sudo -H -u %s %s pair --config %s\n' "$HUB_USER" "${VCM_CMD[0]}" "$CONFIG"
+  elif [ "${#VCM_CMD[@]}" -gt 0 ]; then
+    printf '%s pair --config %s\n' "${VCM_CMD[0]}" "$CONFIG"
+  else
+    printf 'uv run --project %s voice-coding-mcp pair --config %s\n' "$REPO_DIR" "$CONFIG"
+  fi
+}
+
+# --- Tailscale -------------------------------------------------------------
+
+find_tailscale() {
+  if [ -n "${SB_TAILSCALE:-}" ]; then
+    [ -x "$SB_TAILSCALE" ] || die "SB_TAILSCALE=$SB_TAILSCALE is not an executable file."
+    TS="$SB_TAILSCALE"
+  elif command -v tailscale >/dev/null 2>&1; then
+    TS="$(command -v tailscale)"
+  else
+    return 1
+  fi
+}
+
+require_tailscale() {
+  find_tailscale || die "Tailscale CLI not found (\`tailscale\` on PATH).
+Install Tailscale inside this Linux or WSL system (https://tailscale.com/download/linux), run
+\`sudo tailscale up\` and \`sudo tailscale set --operator=\$USER\`, then run this again."
+}
+
+# Prints the machine's MagicDNS name without the trailing dot, or fails if not logged in.
+tailscale_hostname() {
+  local json state magic name
+  json="$("$TS" status --json 2>/dev/null)" || die "\`tailscale status --json\` failed. Is tailscaled running? (\`sudo systemctl status tailscaled\`; on WSL systemd must be on, see docs/SETUP-WSL.md)"
+  state="$(printf '%s' "$json" | jq -r '.BackendState // empty')"
+  if [ "$state" != "Running" ]; then
+    die "Tailscale is not connected (state: ${state:-unknown}). Run \`sudo tailscale up\`, then run this again."
+  fi
+  magic="$(printf '%s' "$json" | jq -r 'if .CurrentTailnet == null then "unknown" else (.CurrentTailnet.MagicDNSEnabled | tostring) end')"
+  if [ "$magic" = false ]; then
+    die "MagicDNS is off for this tailnet, and Funnel needs the machine's ts.net name. Enable MagicDNS in the Tailscale admin console (DNS page), then run this again."
+  fi
+  name="$(printf '%s' "$json" | jq -r '.Self.DNSName // empty')"
+  name="${name%.}"
+  [ -n "$name" ] || die "Tailscale reports no DNS name for this machine. Enable MagicDNS in the admin console (DNS page)."
+  printf '%s\n' "$name"
+}
+
+# --- tools and config ------------------------------------------------------
+
+require_tools() {
+  local tool
+  for tool in jq curl flock; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is required (for example \`sudo apt install $tool\`)."
+  done
+  if [ "$MODE" = service ]; then
+    command -v sudo >/dev/null 2>&1 || die "sudo is required in service mode."
+    command -v systemctl >/dev/null 2>&1 || die "systemctl is required in service mode (on WSL turn on systemd, see docs/SETUP-WSL.md)."
+  elif [ "${#VCM_CMD[@]}" -eq 0 ]; then
+    command -v uv >/dev/null 2>&1 || die "uv is required (https://docs.astral.sh/uv/)."
+  fi
+}
+
+require_config() {
+  [ "$MODE" = service ] && return 0
+  [ -f "$CONFIG" ] || die "Config not found: $CONFIG (set SB_CONFIG or copy config.example.json there)."
+}
+
+# The port the hub listens on: listen.port of the config in user mode, SB_PORT in service mode
+# (the config belongs to the hub user and is closed to you).
+config_port() {
+  if [ "$MODE" = service ]; then
+    printf '%s\n' "${SB_PORT:-8787}"
+  else
+    jq -r '.listen.port // 8787' "$CONFIG"
+  fi
+}
+
+# Reads listen.host into LISTEN_HOST (user mode; the service listens on 127.0.0.1).
+load_listen() {
+  [ "$MODE" = user ] || return 0
+  LISTEN_HOST="$(jq -r '.listen.host // "127.0.0.1"' "$CONFIG")"
+  [ -n "$LISTEN_HOST" ] || LISTEN_HOST="127.0.0.1"
+}
+
+# LISTEN_HOST for use in a URL (IPv6 literals in brackets).
+url_host() {
+  case "$LISTEN_HOST" in
+    *:*) printf '[%s]\n' "$LISTEN_HOST" ;;
+    *) printf '%s\n' "$LISTEN_HOST" ;;
+  esac
+}
+
+# The target given to `tailscale funnel --bg`: the bare port means 127.0.0.1.
+funnel_target() {
+  if [ "$LISTEN_HOST" = 127.0.0.1 ]; then
+    printf '%s\n' "$1"
+  else
+    printf 'http://%s:%s\n' "$(url_host)" "$1"
+  fi
+}
+
+# Sets publicUrl through `voice-coding-mcp set-public-url` (as the hub user in service mode), which
+# checks the new config and rewrites it atomically. Prints "changed" or "unchanged".
+ensure_public_url() {
+  local out
+  out="$(vcm_cmd set-public-url "$1" --config "$CONFIG")" || die "Could not set publicUrl in $CONFIG."
+  case "$out" in
+    changed*) echo changed ;;
+    unchanged*) echo unchanged ;;
+    *) die "Unexpected answer from set-public-url: $out" ;;
+  esac
+}
+
+# --- processes (user mode) -------------------------------------------------
+
+read_pid() {
+  local file="$1" pid
+  [ -f "$file" ] || return 1
+  pid="$(tr -cd '0-9' <"$file")"
+  [ -n "$pid" ] || return 1
+  printf '%s\n' "$pid"
+}
+
+alive() {
+  kill -0 "$1" 2>/dev/null
+}
+
+# Like alive, but a zombie (our own exited child not yet reaped by wait) does not count.
+running() {
+  local stat
+  stat="$(ps -o stat= -p "$1" 2>/dev/null | tr -d " " || true)"
+  case "$stat" in
+    "" | Z*) return 1 ;;
+  esac
+  return 0
+}
+
+# Succeeds if a server holds the flock on its pid file (`serve --pid-file` keeps it for its whole
+# lifetime; the kernel drops it when the server dies). flock -n exits 75 at once when it is held.
+pid_file_locked() {
+  local rc=0
+  [ -f "$SERVER_PID_FILE" ] || return 1
+  flock -n -E 75 "$SERVER_PID_FILE" true || rc=$?
+  [ "$rc" -eq 75 ]
+}
+
+# Prints the pid of our running server (the Python process, as it wrote it into the pid file).
+server_pid() {
+  pid_file_locked || return 1
+  read_pid "$SERVER_PID_FILE"
+}
+
+# Removes a pid file whose lock is free (left behind by a crash or kill -9). Only on and off call
+# it, under the on/off lock.
+drop_stale_pid_file() {
+  local pid
+  [ -f "$SERVER_PID_FILE" ] || return 0
+  pid_file_locked && return 0
+  pid="$(read_pid "$SERVER_PID_FILE" 2>/dev/null || true)"
+  rm -f "$SERVER_PID_FILE"
+  printf 'sb-linux: removed the stale pid file %s (its lock is free, pid %s is not a running server).\n' \
+    "$SERVER_PID_FILE" "${pid:-none}" >&2
+}
+
+# Sends signal $1 to the pids that follow, ignoring those already gone.
+signal() {
+  local sig="$1"
+  shift
+  [ "$#" -gt 0 ] || return 0
+  kill "-$sig" "$@" 2>/dev/null || true
+}
+
+# Waits up to $2 seconds (polling every 0.5 s) until check $1 (alive or running) fails for every
+# pid that follows. Fails if some pid is still there at the end.
+wait_gone() {
+  local check="$1" tries=$(($2 * 2)) i=0 p any
+  shift 2
+  while [ "$i" -lt "$tries" ]; do
+    any=0
+    for p in "$@"; do "$check" "$p" && any=1; done
+    [ "$any" -eq 0 ] && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Stops the server with pid $1: one TERM (a second signal would make it skip its graceful
+# shutdown). Waits up to $2 seconds, then KILL to that pid only.
+stop_pid() {
+  local pid="$1" wait_s="${2:-25}"
+  signal TERM "$pid"
+  wait_gone alive "$wait_s" "$pid" && return 0
+  signal KILL "$pid"
+  wait_gone alive 5 "$pid" || true
+}
+
+# Prints all descendants of $1 (children first found, depth-first), without $1 itself.
+descendants() {
+  local kid
+  for kid in $(pgrep -P "$1" 2>/dev/null || true); do
+    printf '%s\n' "$kid"
+    descendants "$kid"
+  done
+}
+
+# Stops $1 and everything below it: TERM, up to 2 s, then KILL. The tree is collected before the
+# first signal, so a wrapper that dies first cannot orphan its child.
+kill_tree() {
+  local procs
+  procs="$1 $(descendants "$1")"
+  # shellcheck disable=SC2086 # word splitting of the pid list is intended
+  signal TERM $procs
+  # shellcheck disable=SC2086
+  wait_gone running 2 $procs && return 0
+  # shellcheck disable=SC2086
+  signal KILL $procs
+}
+
+healthy() {
+  curl -fsS --max-time 2 "http://$(url_host):$1/healthz" >/dev/null 2>&1
+}
+
+# Creates the run directory (mode 700, also when it already exists).
+make_dirs() {
+  mkdir -p "$RUN_DIR"
+  chmod 700 "$RUN_DIR"
+  if [ -f "$LOG_FILE" ]; then chmod 600 "$LOG_FILE"; fi
+}
+
+# --- lock ------------------------------------------------------------------
+
+# Serializes `on` and `off`: runs the script again under flock(1), which holds a lock on
+# $LOCK_FILE while it runs. The kernel releases it when flock exits, also after a crash or kill -9,
+# so a lock is never stale. -o keeps the lock's descriptor out of the script, so the server that
+# `on` starts does not hold the lock. SB_LOCKED marks the inner run and is removed from its
+# environment.
+run_locked() {
+  local rc=0
+  if [ "${SB_LOCKED:-}" = 1 ]; then
+    unset SB_LOCKED
+    return 0
+  fi
+  make_dirs
+  SB_LOCKED=1 flock -n -o -E 75 "$LOCK_FILE" "$SCRIPT_PATH" "$@" || rc=$?
+  [ "$rc" -ne 75 ] || die "Another sb-linux on/off is running. Wait for it to finish."
+  exit "$rc"
+}
+
+# --- server: user mode -----------------------------------------------------
+
+start_user_server() {
+  local port="$1" launch pid i
+  if healthy "$port"; then
+    die "Something already answers on $(url_host):$port and it is not a server started by sb-linux. Stop it first."
+  fi
+  printf '\n--- sb-linux on, %s ---\n' "$(date '+%Y-%m-%d %H:%M:%S')" >>"$LOG_FILE"
+  if [ "${#VCM_CMD[@]}" -gt 0 ]; then
+    nohup "${VCM_CMD[@]}" serve --config "$CONFIG" --pid-file "$SERVER_PID_FILE" </dev/null >>"$LOG_FILE" 2>&1 &
+  else
+    nohup uv run --frozen --quiet --project "$REPO_DIR" voice-coding-mcp serve --config "$CONFIG" \
+      --pid-file "$SERVER_PID_FILE" </dev/null >>"$LOG_FILE" 2>&1 &
+  fi
+  launch=$!
+  i=0
+  while [ "$i" -lt $((START_SECONDS * 2)) ]; do
+    if ! running "$launch"; then
+      drop_stale_pid_file 2>/dev/null
+      die "The server exited during start. Last log lines from $LOG_FILE:
+$(tail -n 15 "$LOG_FILE")"
+    fi
+    if healthy "$port" && server_pid >/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if pid="$(server_pid)"; then stop_pid "$pid" 5; else kill_tree "$launch"; fi
+  drop_stale_pid_file 2>/dev/null
+  die "The server did not answer /healthz on port $port within $START_SECONDS s. See $LOG_FILE."
+}
+
+stop_user_server() {
+  local pid
+  if pid="$(server_pid)"; then
+    info "Stopping the server (pid $pid)."
+    stop_pid "$pid" 25
+  fi
+  drop_stale_pid_file
+}
+
+# --- server: service mode --------------------------------------------------
+
+service_active() {
+  systemctl is-active --quiet "$SERVICE" 2>/dev/null
+}
+
+# Waits up to START_SECONDS for /healthz after a start or restart of the unit; stops the unit when
+# it does not answer.
+wait_service_healthy() {
+  local port="$1" i=0
+  while [ "$i" -lt $((START_SECONDS * 2)) ]; do
+    healthy "$port" && return 0
+    if [ "$i" -ge 4 ] && ! service_active; then
+      die "The $SERVICE service stopped during start. See \`journalctl -u $SERVICE -n 30\`."
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  stop_service
+  die "The $SERVICE service did not answer /healthz on port $port within $START_SECONDS s (is SB_PORT the port in its config?). See \`journalctl -u $SERVICE -n 30\`."
+}
+
+start_service() {
+  local port="$1" restart="$2"
+  if service_active; then
+    if [ "$restart" = yes ]; then
+      info "Restarting the $SERVICE service for the new publicUrl."
+      sudo systemctl restart "$SERVICE"
+    else
+      info "The $SERVICE service is already running."
+    fi
+  else
+    if healthy "$port"; then
+      die "Something already answers on $(url_host):$port and it is not the $SERVICE service. Stop it first."
+    fi
+    sudo systemctl start "$SERVICE"
+    info "Started the $SERVICE service."
+  fi
+  wait_service_healthy "$port"
+}
+
+stop_service() {
+  if service_active; then
+    info "Stopping the $SERVICE service."
+    sudo systemctl stop "$SERVICE"
+  fi
+}
+
+# --- funnel ----------------------------------------------------------------
+
+LINK_RE='https://login\.tailscale\.com/[^ ]*'
+
+# Succeeds if `tailscale funnel status` lists a proxy to our local port. With "funnel" as $2 the
+# proxy must also sit under a "(Funnel on)" address, not a "(tailnet only)" one.
+proxy_listed() {
+  local port="$1" need="${2:-any}" status
+  [ -n "$TS" ] || return 1
+  status="$("$TS" funnel status 2>/dev/null)" || return 1
+  printf '%s\n' "$status" | awk -v want="proxy http://$(url_host):$port" -v need="$need" '
+    /^https?:\/\// { on = ($0 ~ /\(Funnel on\)/) }
+    {
+      i = index($0, want)
+      if (i > 0) {
+        rest = substr($0, i + length(want))
+        if ((rest == "" || rest ~ /^[\/ ]/) && (need != "funnel" || on)) found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }'
+}
+
+funnel_active() {
+  proxy_listed "$1" funnel
+}
+
+# Prints the output of a failed `tailscale funnel --bg` with a hint, to stderr.
+funnel_failure() {
+  local port="$1" rc="$2" out="$3" err="$4" link
+  link="$(grep -Eho "$LINK_RE" "$out" "$err" | head -n 1 || true)"
+  {
+    cat "$out" "$err"
+    if [ -n "$link" ]; then
+      printf '\nFunnel (or HTTPS certificates) is not enabled for this tailnet yet.\nOpen this link, approve it, then run sb-linux on again:\n  %s\n' "$link"
+    elif grep -qi 'access denied\|not permitted\|operator' "$err" "$out"; then
+      printf '\nYou are not the Tailscale operator of this machine. Run once:\n  sudo tailscale set --operator=%s\nthen run sb-linux on again.\n' "$(id -un)"
+    elif grep -q 'HTTPS must be enabled' "$err" "$out"; then
+      printf '\nFunnel needs HTTPS certificates. In the Tailscale admin console, DNS page, enable HTTPS Certificates, then run sb-linux on again.\n'
+    elif grep -q '"funnel" node attribute not set' "$err" "$out"; then
+      printf '\nThis machine lacks the "funnel" node attribute. Add it to the tailnet policy file (Access controls) under "nodeAttrs", e.g. {"target": ["autogroup:member"], "attr": ["funnel"]}, then run sb-linux on again.\n'
+    elif [ "$rc" = timeout ]; then
+      printf '\n`tailscale funnel --bg %s` did not finish within 20 s.\n' "$port"
+    elif [ "$rc" -eq 0 ]; then
+      printf '\n`tailscale funnel --bg %s` exited without error, but `tailscale funnel status` does not show a Funnel to %s:%s.\n' "$port" "$(url_host)" "$port"
+    else
+      printf '\n`tailscale funnel --bg %s` failed (exit code %s).\n' "$port" "$rc"
+    fi
+  } >&2
+}
+
+# Runs `tailscale funnel --bg <port>` and checks `tailscale funnel status` afterwards (exit code 0
+# alone is not success). If the tailnet still needs Funnel or HTTPS enabled, the CLI prints an
+# approval link and may wait for approval; we print the link and stop waiting instead.
+open_funnel() {
+  local port="$1" out err pid i rc=0
+  out="$(mktemp "$RUN_DIR/funnel-out.XXXXXX")"
+  err="$(mktemp "$RUN_DIR/funnel-err.XXXXXX")"
+  "$TS" funnel --bg "$(funnel_target "$port")" </dev/null >"$out" 2>"$err" &
+  pid=$!
+  i=0
+  while alive "$pid" && [ "$i" -lt 40 ]; do
+    grep -Eqs "$LINK_RE" "$out" "$err" && break
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if alive "$pid"; then
+    # Still running: give the rest of the output a moment, then stop waiting.
+    sleep 1
+    kill_tree "$pid"
+    wait "$pid" 2>/dev/null || true
+    rc=timeout
+  else
+    wait "$pid" || rc=$?
+  fi
+  if [ "$rc" != timeout ] && ! grep -Eqs "$LINK_RE" "$out" "$err" && funnel_active "$port"; then
+    rm -f "$out" "$err"
+    echo "$port" >"$FUNNEL_PORT_FILE"
+    return 0
+  fi
+  funnel_failure "$port" "$rc" "$out" "$err"
+  rm -f "$out" "$err"
+  return 1
+}
+
+# Turns off the Funnel only if it proxies our local port. `--https=443 off` removes all handlers on
+# public port 443 (our `funnel --bg` uses 443) and leaves other ports alone; it never resets the
+# whole serve config.
+close_funnel() {
+  local port out
+  find_tailscale || return 0
+  port="$(read_pid "$FUNNEL_PORT_FILE" 2>/dev/null || true)"
+  [ -n "$port" ] || port="$(config_port 2>/dev/null || true)"
+  if [ -z "$port" ] || [ "$port" = null ]; then
+    port=8787
+    printf 'sb-linux: Warning: cannot tell which port the Funnel was opened for (no %s, and the config cannot be read); assuming the default 8787.\nA Funnel to another port is not closed: check `%s funnel status` and close it by hand.\n' "$FUNNEL_PORT_FILE" "$TS" >&2
+  fi
+  rm -f "$FUNNEL_PORT_FILE"
+  proxy_listed "$port" || return 0
+  out="$("$TS" funnel --https=443 off </dev/null 2>&1 || true)"
+  if proxy_listed "$port"; then
+    [ -z "$out" ] || printf '%s\n' "$out" >&2
+    printf 'sb-linux: Warning: the Funnel to %s:%s is still listed. Close it by hand:\n  %s funnel --https=443 off\nthen check `%s funnel status`.\n' "$(url_host)" "$port" "$TS" "$TS" >&2
+  else
+    info "Funnel closed."
+  fi
+}
+
+# --- commands --------------------------------------------------------------
+
+stop_server() {
+  if [ "$MODE" = service ]; then stop_service; else stop_user_server; fi
+}
+
+cmd_on() {
+  local host url port result
+  [ "$(id -un)" != "$HUB_USER" ] || [ "$MODE" = user ] || die "Run sb-linux as yourself (the Tailscale operator), not as $HUB_USER."
+  require_tools
+  require_config
+  require_tailscale
+  host="$(tailscale_hostname)"
+  url="https://$host"
+  load_listen
+  port="$(config_port)"
+  make_dirs
+
+  result="$(ensure_public_url "$url")"
+  [ "$result" = changed ] && info "Set publicUrl in $CONFIG to $url."
+
+  if [ "$MODE" = service ]; then
+    start_service "$port" "$([ "$result" = changed ] && echo yes || echo no)"
+  else
+    drop_stale_pid_file
+    if server_pid >/dev/null; then
+      if [ "$result" = changed ]; then
+        info "Restarting the server for the new publicUrl."
+        stop_user_server
+        start_user_server "$port"
+      else
+        info "Server already running (pid $(server_pid))."
+      fi
+    else
+      start_user_server "$port"
+      info "Server started (pid $(server_pid)), log $LOG_FILE."
+    fi
+  fi
+
+  if ! open_funnel "$port"; then
+    stop_server
+    exit 1
+  fi
+
+  info ""
+  info "On. Connector URL: $url/mcp"
+  info "It stays on until you run: $SCRIPT_PATH off"
+  info "To pair a new client: $(pair_hint)"
+}
+
+cmd_off() {
+  if [ "$MODE" = user ] && [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then load_listen; fi
+  close_funnel
+  stop_server
+  info "Off."
+}
+
+cmd_status() {
+  local pid="" port host="" state="off" server=no
+  command -v jq >/dev/null 2>&1 || die "jq is required (for example \`sudo apt install jq\`)."
+  require_config
+  load_listen
+  port="$(config_port)"
+  find_tailscale || true
+  if [ "$MODE" = service ]; then
+    service_active && server=yes
+  elif pid="$(server_pid)"; then
+    server=yes
+  else
+    pid=""
+  fi
+  if [ "$server" = yes ]; then
+    if funnel_active "$port"; then state="on"; else state="server running, Funnel closed"; fi
+  elif funnel_active "$port"; then
+    state="Funnel open, server not running"
+  fi
+  if [ -n "$TS" ]; then host="$("$TS" status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)"; fi
+  host="${host%.}"
+  info "State: $state"
+  info "Mode: $MODE"
+  if [ -n "$host" ]; then info "Connector URL: https://$host/mcp"; fi
+  if [ "$MODE" = service ]; then
+    info "Service: $SERVICE ($([ "$server" = yes ] && echo active || echo inactive), port $port)"
+  else
+    info "Server pid: ${pid:-none} (port $port)"
+  fi
+  [ -n "$TS" ] || info "Tailscale CLI: not found"
+  info ""
+  if [ "$server" = yes ] || [ "$MODE" = user ]; then
+    vcm_cmd status --config "$CONFIG" || true
+  fi
+}
+
+case "${1:-}" in
+  on)
+    [ "$#" -eq 1 ] || die "usage: sb-linux on (it takes no arguments)"
+    run_locked "$@"
+    cmd_on
+    ;;
+  off)
+    run_locked "$@"
+    cmd_off
+    ;;
+  status)
+    cmd_status
+    ;;
+  -h | --help | help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

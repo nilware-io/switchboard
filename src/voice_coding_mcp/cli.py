@@ -1,5 +1,5 @@
-"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher, audit, usage
-(argparse; usage errors exit 2).
+"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher, audit, usage,
+set-public-url (argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -29,9 +29,9 @@ import uvicorn
 from .auth import OAuthStore, close_pairing, get_pairing, open_pairing
 from .auth.text import strip_control_chars
 from .clock import SECOND_MS, ago, now_ms
-from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
+from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config, parse_config
 from .http import CreateAppOptions, create_app
-from .json_file import ensure_dir
+from .json_file import ensure_dir, loads_json, write_json_atomic
 from .log import Logger, as_log_level, create_logger, silent_logger
 from .mcp import SERVER_VERSION
 from .notify import HttpNotifier, create_notifier
@@ -180,6 +180,10 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--by", choices=("project", "session", "day"), default="project", help="rows (default: project)")
     usage.add_argument("--csv", action="store_true", help="CSV with a header row instead of a table")
     usage.add_argument("--cached", action="store_true", help="use the cached records, do not read the machines")
+    public_url = command(
+        "set-public-url", "set publicUrl in the config file (deploy/linux/sb-linux on calls it); restart to apply"
+    )
+    public_url.add_argument("url", help="the new publicUrl, an https origin such as https://example-host.ts.net")
     return parser
 
 
@@ -197,6 +201,7 @@ class ParsedArgs:
     by: str = "project"
     csv: bool = False
     cached: bool = False
+    url: str | None = None
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -215,6 +220,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         by=getattr(ns, "by", "project"),
         csv=getattr(ns, "csv", False),
         cached=getattr(ns, "cached", False),
+        url=getattr(ns, "url", None),
     )
 
 
@@ -723,6 +729,30 @@ async def _cmd_usage(config: Config, args: ParsedArgs, io: CliIo) -> int:
     return EXIT_ERROR if failed else EXIT_OK
 
 
+def _cmd_set_public_url(config_path: str, config: Config, url: str, io: CliIo) -> int:
+    """Rewrites `publicUrl` in the config file (atomically, mode 0600, other keys and their order kept)
+    after checking that the file with the new value is still a valid config. Prints `changed: ...` or
+    `unchanged: ...` as its first word, which `deploy/linux/sb-linux` reads."""
+    want = url.rstrip("/")
+    if want == config.public_url:
+        io.out(f"unchanged: publicUrl is already {want}\n")
+        return EXIT_OK
+    path = os.path.realpath(config_path)
+    with open(path, encoding="utf-8") as handle:
+        data = loads_json(handle.read())
+    if not isinstance(data, dict):
+        raise ConfigError(f"{config_path}: the config is not a JSON object")
+    data = {**data, "publicUrl": want}
+    try:
+        parse_config(data)
+    except ConfigError as err:
+        io.err(f"{err}\n")
+        return EXIT_USAGE
+    write_json_atomic(path, data)
+    io.out(f"changed: publicUrl is now {want} (restart the server to apply it)\n")
+    return EXIT_OK
+
+
 def _cmd_remote_dispatcher(io: CliIo) -> int:
     with open(DISPATCHER_PATH, encoding="utf-8") as handle:
         io.out(handle.read())
@@ -776,6 +806,8 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
                 return _cmd_audit(config, args, io)
             case "usage":
                 return await _cmd_usage(config, args, io)
+            case "set-public-url":
+                return _cmd_set_public_url(config_path, config, args.url or "", io)
     except Exception as err:
         io.err(f"Error: {err}\n")
         return EXIT_ERROR

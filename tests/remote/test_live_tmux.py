@@ -35,11 +35,15 @@ def socket_name() -> Iterator[str]:
     name = f"sb-test-{secrets.token_hex(6)}"
     base = ["tmux", "-L", name, "-f", "/dev/null"]
     try:
-        subprocess.run([*base, "new-session", "-d", "-s", "fpga", "-x", "80", "-y", "20"], check=True, timeout=10)
-        subprocess.run([*base, "new-session", "-d", "-s", "private"], check=True, timeout=10)
+        # Plain programs, no interactive shell: the user's shell setup (profile, motd) neither runs nor
+        # races the printed line.
+        shell = "printf 'hello from %s\\n' live-test; exec sleep 120"
         subprocess.run(
-            [*base, "send-keys", "-t", "fpga", "printf 'hello from %s\\n' live-test", "Enter"], check=True, timeout=10
+            [*base, "new-session", "-d", "-s", "fpga", "-x", "80", "-y", "20", "sh", "-c", shell],
+            check=True,
+            timeout=10,
         )
+        subprocess.run([*base, "new-session", "-d", "-s", "private", "sleep", "120"], check=True, timeout=10)
         time.sleep(0.5)
         yield name
     finally:

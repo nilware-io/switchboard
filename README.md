@@ -4,10 +4,11 @@ A small remote MCP server that lets you drive Claude Code hands-free from the vo
 
 Not affiliated with Anthropic. "Claude" and "Claude Code" are used only to describe what this project works with.
 
-It runs in one of two modes:
+It runs in one of these modes:
 
 - **Mac mode (main)**: the server runs on your own Mac, next to your own Claude Code sessions, and is published through [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) only while you switch it on (`deploy/mac/vcm-mac on` and `off`). Besides running tasks, it can list your live Claude Code sessions, answer questions about them and pass messages into them.
 - **VPS mode (alternative)**: the server runs on a Linux VPS behind Caddy, with its own copies of your projects. Your own computer is not exposed, but the server cannot reach your local sessions, and work that needs macOS is not possible there.
+- **Linux workstation mode (Switchboard)**: the server runs on your Linux or WSL workstation, recommended as a dedicated `switchboard` user, and is published through Tailscale Funnel only while you switch it on (`deploy/linux/sb-linux on` and `off`). It reaches the Claude Code sessions you run inside tmux, on that machine and on others over SSH. See [Switchboard](#switchboard).
 
 **Risks in short.** Whoever holds a valid token for the connector can run Claude Code on that machine with the server user's rights. In Mac mode that is your own macOS user, and your Mac is reachable from the internet while the Funnel is on. Your Claude account holds those tokens, so it becomes a key to your machine. Prompt injection in files Claude Code reads can make a task act against you. Read [Security](#security) before you deploy.
 
@@ -69,10 +70,33 @@ sudo voice-coding-mcp pair
 
 The full runbook, including deploy keys and the Claude side of pairing, is [Part B of DEPLOY.md](docs/DEPLOY.md#part-b-linux-vps-alternative).
 
+## Switchboard
+
+This fork (nilware-io/switchboard) adds tools to talk to Claude Code sessions that already run inside tmux, on the machine the server runs on and on other machines over SSH. The design is [docs/SWITCHBOARD.md](docs/SWITCHBOARD.md); the step-by-step setup on Windows with WSL is [docs/SETUP-WSL.md](docs/SETUP-WSL.md).
+
+- `list_remote_sessions`, `remote_status`: the machines from the config, their allowed tmux sessions, and a short spoken summary of what a session's screen shows.
+- `pending_input`: which sessions wait for you, and what each asks. An optional watcher pushes a notification when one starts waiting or finishes a long turn.
+- `remote_send` and `remote_send_confirm`: type an instruction into a session after a read-back and your yes in a later turn; off by default, opt-in per machine in two places.
+- `usage_report` and `voice-coding-mcp usage`: active hours, billable amount and token cost per project or session.
+
+How it is built:
+
+- The server runs `switchboard-remote` (a small stdlib-only Python dispatcher with a fixed set of verbs) on each machine, over SSH with a dedicated key that a forced command in `authorized_keys` ties to the dispatcher and to the tmux sessions you list there. Your own sessions on the workstation are machine `dev`, reached over SSH to `localhost`.
+- Recommended layout: the server and its tasks run as a dedicated Linux user without sudo, under the systemd unit `deploy/linux/switchboard.service`, which cannot see your home. `deploy/linux/sb-linux on` starts it and opens the Funnel, `off` closes both. A same-user layout (`SB_MODE=user`, machine `dev` with `transport: "local"`) needs no sshd, but a manipulated task then runs as you.
+
+```sh
+sb-linux on        # start the hub, open the Funnel, print the connector URL and the pair command
+sb-linux status
+sb-linux off       # close the Funnel and stop the hub
+```
+
+Safety in short: read-only unless a machine opts in to sending in both the server config and its forced command; screen text is quoted as untrusted data, never treated as an instruction; risky sends (push, delete, deploy and similar) need an explicit yes to the risk; every send is audited; keep the Funnel off when you are not using it. If something is compromised, also remove the hub's keys from every `authorized_keys` and rotate them ([steps](docs/SETUP-WSL.md#if-something-is-compromised)).
+
 ## Turning it off and revoking access
 
 - Mac: `deploy/mac/vcm-mac off` closes the Funnel and stops the server. Tokens stay valid, so `vcm-mac on` works again without pairing.
 - VPS: `sudo systemctl stop voice-coding-mcp` (and `disable` to keep it off after a reboot).
+- Linux or WSL (Switchboard): `sb-linux off` closes the Funnel and stops the hub.
 - `voice-coding-mcp unpair` closes an open pairing window early.
 - `voice-coding-mcp revoke-all --yes` removes every client and token; the connector has to be paired again. `voice-coding-mcp status` lists the connected clients. On the Mac add `--config <path>`, on the VPS use `sudo voice-coding-mcp ...`.
 
@@ -82,7 +106,7 @@ If you suspect that someone else used the connector, that a task was manipulated
 
 1. Remove the connector in Claude (Settings, Connectors).
 2. Run `voice-coding-mcp revoke-all --yes`.
-3. Stop the server: `deploy/mac/vcm-mac off` on the Mac, `sudo systemctl stop voice-coding-mcp` on the VPS.
+3. Stop the server: `deploy/mac/vcm-mac off` on the Mac, `sudo systemctl stop voice-coding-mcp` on the VPS, `sb-linux off` on a Linux or WSL hub. With Switchboard machines, also remove the hub's keys from every `authorized_keys`, read `voice-coding-mcp audit` and rotate the hub's SSH keys ([details](docs/SETUP-WSL.md#if-something-is-compromised)).
 4. Look for persistence as the user Claude Code runs as: shell profiles (`~/.zshrc`, `~/.bashrc`, `~/.profile` and similar), `~/Library/LaunchAgents` on the Mac or user systemd units on Linux, `crontab -l`, `~/.claude/settings.json` (hooks and allow rules), and git hooks (`.git/hooks`) in every project.
 5. On a VPS, replace the `claude setup-token` token in `/etc/voice-coding-mcp/env` with a new one.
 6. Pair again only after that.
