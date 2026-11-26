@@ -101,6 +101,11 @@ nothing lands on the screen that follows the menu, which nobody checked."""
 HISTORY_KEYS = ("Up", "Down")
 """At an input without a menu these recall earlier prompts or shell commands: never followed by Enter
 there, which would submit text nobody heard."""
+UNBOUND_ANSWER_KEYS = ("Escape", *"123456789", "y", "n")
+"""The only `keys` request into a permission wait no dialog on the screen binds (`answer none`: the
+registry says waiting, the screen shows none, maybe an empty input box): one of these keys alone
+(`dialog_unreadable`), no Enter, Tab, BTab or arrows, so it can neither submit a draft or an earlier
+prompt nor change Claude Code's permission mode. Like the one digit `send answer` types."""
 MAX_KEYS = 10
 RESIZE_COLUMNS = (80, 300)
 RESIZE_ROWS = (24, 120)
@@ -503,15 +508,18 @@ def shows_picker(screen: str) -> bool:
     return _picker_footer(_menu_footer(_menu_lines(screen))[0])
 
 
-def keys_problem(keys: list[str], menu_bound: bool) -> str | None:
+def keys_problem(keys: list[str], menu_bound: bool, unbound_answer: bool = False) -> str | None:
     """Why a `keys` request may not be pressed as it is, or None; the hub runs the same function
     before it reads back. A FINAL_KEYS key (a choice, Enter, Escape, y, n) may only be the last key
     (`key_order`): what follows it would land on whatever screen the choice opens, which nobody
     checked. Without a bound menu or permission dialog (`menu_bound` False), no MODE_KEYS
     (`mode_keys`) and no HISTORY_KEYS before Enter (`history_submit`: that recalls and submits an
-    earlier prompt or shell command nobody heard)."""
+    earlier prompt or shell command nobody heard). A permission answer that no dialog on the screen
+    binds (`unbound_answer`) is one UNBOUND_ANSWER_KEYS key alone (`dialog_unreadable`)."""
     if any(key in FINAL_KEYS for key in keys[:-1]):
         return "key_order"
+    if unbound_answer and (len(keys) != 1 or keys[0] not in UNBOUND_ANSWER_KEYS):
+        return "dialog_unreadable"
     if not menu_bound:
         if any(key in MODE_KEYS for key in keys):
             return "mode_keys"
@@ -1119,7 +1127,8 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
     `menu` mode no permission dialog may show (`permission_prompt`) and the menu must be the one read
     back (`menu_changed`, `none` when there was none; then also no draft and no vim normal mode); in
     `answer` mode the permission dialog must be the one read back (`dialog_changed`), and only with
-    --allow-permission-answers. Without a bound menu, a screen with a picker footer is refused
+    --allow-permission-answers; `answer none` (no dialog on the screen) is one UNBOUND_ANSWER_KEYS
+    key alone (`dialog_unreadable`). Without a bound menu, a screen with a picker footer is refused
     (`menu_unreadable`). `keys_problem` limits the order of the keys (`key_order`, `mode_keys`,
     `history_submit`), and every check runs before the one `send-keys`, so a key that ends the
     selection is the last one pressed."""
@@ -1127,7 +1136,10 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
         raise RefusedError("not_allowed")
     pane_id, pane_pid, session_id, mode, bound = args[:5]
     keys = args[5:]
-    problem = keys_problem(keys, menu_bound=mode == SEND_ANSWER or bound != NO_MENU)
+    # A permission answer is bound only by a dialog on the screen: `answer none` (a registry-only
+    # wait) gets no menu rules, so it is one key that submits nothing (UNBOUND_ANSWER_KEYS).
+    unbound_answer = mode == SEND_ANSWER and bound == NO_DIALOG
+    problem = keys_problem(keys, menu_bound=bound != NO_MENU and not unbound_answer, unbound_answer=unbound_answer)
     if problem is not None:
         raise RefusedError(problem)
     pane, entry, screen = _send_state(policy, env, pane_id)

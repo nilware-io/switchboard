@@ -268,6 +268,33 @@ def test_a_registry_permission_wait_counts_as_a_dialog(world: RemoteWorld) -> No
     assert keys(world, "Enter")["error"] == "permission_prompt"
 
 
+@pytest.mark.parametrize(
+    "names",
+    ["Up Enter", "Enter", "BTab BTab BTab", "Tab", "Down 2", "Left Escape", "Down Down"],
+)
+def test_a_registry_only_permission_wait_is_not_a_bound_dialog(world: RemoteWorld, names: str) -> None:
+    """`answer none`: the registry says it waits for permission, the screen shows only the empty input
+    box (a stale entry, or a dialog shows_dialog cannot see). Up Enter would submit an earlier prompt,
+    Enter a draft, BTab would cycle the permission mode toward bypass: only one key that submits
+    nothing goes in, whatever the opt-ins."""
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="waiting", waitingFor="permission", tmux="0:@0.%1")
+    everything = [*FORCED, "--allow-permission-answers", "--send-to-any-pane"]
+    out = keys(world, *names.split(), bound="answer none", forced=everything)
+    assert out == {"protocol": 1, "ok": False, "error": "dialog_unreadable"}
+    assert pressed(world) == []
+
+
+@pytest.mark.parametrize("name", d.UNBOUND_ANSWER_KEYS)
+def test_a_registry_only_permission_wait_takes_one_key_that_submits_nothing(world: RemoteWorld, name: str) -> None:
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="waiting", waitingFor="permission", tmux="0:@0.%1")
+    allowed = [*FORCED, "--allow-permission-answers"]
+    assert keys(world, name, bound="answer none", forced=allowed)["ok"] is True
+    assert pressed(world) == [["send-keys", "-t", "%1", name]]
+    assert_fixed_shapes(world)
+
+
 def test_tmux_failure(world: RemoteWorld) -> None:
     world.set_panes(
         [pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": MENU}, failOn=["send-keys", "resize-window"]
@@ -399,6 +426,11 @@ def test_keys_problem_rules() -> None:
     assert d.keys_problem(["Up", "Enter"], menu_bound=False) == "history_submit"
     assert d.keys_problem(["Up", "Tab"], menu_bound=False) == "mode_keys"
     assert d.keys_problem(["1", "2", "Enter"], menu_bound=False) == "key_order"
+    assert d.keys_problem(["2"], menu_bound=False, unbound_answer=True) is None
+    assert d.keys_problem(["Escape"], menu_bound=False, unbound_answer=True) is None
+    assert d.keys_problem(["Enter"], menu_bound=False, unbound_answer=True) == "dialog_unreadable"
+    assert d.keys_problem(["Down", "2"], menu_bound=False, unbound_answer=True) == "dialog_unreadable"
+    assert set(d.UNBOUND_ANSWER_KEYS) <= set(d.FINAL_KEYS) - {"Enter"}
     assert set(d.FINAL_KEYS) | set(d.MODE_KEYS) | set(d.HISTORY_KEYS) <= set(d.KEY_NAMES)
 
 

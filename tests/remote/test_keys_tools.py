@@ -263,6 +263,32 @@ async def test_permission_answers_by_keys_say_which_option_they_choose(make: Mak
     assert "Careful," in readback
 
 
+@pytest.mark.parametrize("names", [["Up", "Enter"], ["Enter"], ["BTab", "BTab", "BTab"], ["Down", "2"], ["Tab"]])
+async def test_a_registry_only_permission_wait_takes_one_key_that_submits_nothing(make: Make, names: list[str]) -> None:
+    """The registry says it waits for permission, the screen shows only the empty input box (a stale
+    entry, or a dialog shows_dialog cannot see): nothing binds the keys to a dialog, so Up Enter would
+    submit an earlier prompt, Enter a draft, Shift+Tab would cycle the permission mode. Only a single
+    number, y, n or escape."""
+    ctx = await make(dev={"allowPermissionAnswers": True, "sendToAnyPane": True})
+    ctx.world.configure(forced=[*FORCED, "--allow-permission-answers", "--send-to-any-pane"])
+    show(ctx, EMPTY_BOX, waiting_for="permission prompt")
+    text, error = await prepare(ctx, names)
+    assert (text, error) == (
+        "fpga on dev is waiting for a permission decision, but I cannot see its dialog on the screen, "
+        "so I will only press one number, y, n or escape there, and nothing else.",
+        True,
+    )
+    assert len(ctx.tools.confirmations) == 0
+    assert keys_calls(ctx) == []
+    readback, error = await prepare(ctx, ["1"])
+    assert not error
+    assert readback.startswith("Ready to press 1 in fpga on dev.")
+    ctx.later()
+    assert await ctx.confirm("4172", risky_ok=True) == ("Pressed 1 in fpga on dev.", False)
+    assert keys_calls(ctx) == [f"switchboard-remote keys %1 {CLAUDE_PID} {SESSION_A} answer none 1"]
+    assert pressed(ctx) == [["send-keys", "-t", "%1", "1"]]
+
+
 @pytest.mark.parametrize("key", ["Tab", "shift tab", "BTab", "backtab"])
 async def test_tab_and_shift_tab_without_a_menu_are_refused(make: Make, key: str) -> None:
     """Shift+Tab at an idle Claude Code input cycles its permission mode: no voice route around the

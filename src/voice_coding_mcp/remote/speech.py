@@ -417,6 +417,7 @@ _NOT_DONE_KEYS: dict[str, str] = {
     "key_order": "Not pressed: switchboard-remote on {machine} presses a number, enter, escape, y or n only as the last key.",
     "history_submit": "Not pressed: there is no menu on that screen; up or down and then enter would send an earlier prompt or command again.",
     "menu_unreadable": "Not pressed: that screen now shows a menu I cannot read. Ask me what it says.",
+    "dialog_unreadable": "Not pressed: no permission dialog is on that screen any more, and without one I press only a single number, y, n or escape.",
     "bad_request": "Not pressed: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
 }
 _NOT_DONE_RESIZE: dict[str, str] = {

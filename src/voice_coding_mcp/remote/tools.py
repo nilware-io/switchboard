@@ -613,6 +613,16 @@ class RemoteTools:
             question = (ask.text if ask is not None and ask.kind == "permission" else None) or waiting_for_text(
                 claude.waiting_for if claude else None
             )
+            if dialog_hash(captured.text) is None and keys_problem(parsed, menu_bound=False, unbound_answer=True):
+                # The registry says it waits for permission, but no dialog is on the screen to bind
+                # the keys to (a stale entry, or a dialog shows_dialog cannot see): Enter would submit
+                # a draft or an earlier prompt, Shift+Tab would change the permission mode. Only one
+                # key that submits nothing; the dispatcher refuses the same (`dialog_unreadable`).
+                return refuse(
+                    f"{place} is waiting for a permission decision, but I cannot see its dialog on the "
+                    "screen, so I will only press one number, y, n or escape there, and nothing else.",
+                    "dialog_unreadable",
+                )
         else:
             bound = menu_hash(captured.text)
             question = (menu.question if menu is not None else None) or (
