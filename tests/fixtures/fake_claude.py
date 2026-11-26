@@ -432,6 +432,7 @@ emit(
         "duration_ms": 1234,
         "num_turns": 2,
         "permission_denials": permission_denials,
+        "usage": {"input_tokens": 120, "output_tokens": 30, "cache_read_input_tokens": 0},
     }
 )
 flush()

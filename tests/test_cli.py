@@ -139,7 +139,7 @@ def test_rejects_unknown_command() -> None:
         parse_args(["frobnicate"])
     # Python 3.12 patch releases differ in whether argparse quotes the choices.
     assert str(err.value).replace("'", "") == (
-        "argument <command>: invalid choice: frobnicate (choose from serve, pair, unpair, status, revoke-all)"
+        "argument <command>: invalid choice: frobnicate (choose from serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher)"
     )
 
 

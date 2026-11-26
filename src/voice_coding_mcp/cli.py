@@ -1,4 +1,5 @@
-"""Entry point: serve, pair, unpair, status, revoke-all (argparse; usage errors exit 2).
+"""Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher (argparse;
+usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -11,6 +12,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import signal
@@ -30,9 +32,15 @@ from .clock import SECOND_MS, ago, now_ms
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
 from .http import CreateAppOptions, create_app
 from .json_file import ensure_dir
-from .log import Logger, as_log_level, create_logger
+from .log import Logger, as_log_level, create_logger, silent_logger
 from .mcp import SERVER_VERSION
 from .notify import HttpNotifier, create_notifier
+from .remote.config import remote_warnings
+from .remote.inventory import Inventory
+from .remote.protocol import VersionResponse
+from .remote.speech import machine_line, unreachable_reason
+from .remote.transport import DISPATCHER_PATH, make_transport
+from .sessions import claude_home_dir
 from .tasks.manager import TaskManager, TaskManagerOptions, load_tasks
 
 EXIT_OK = 0
@@ -142,6 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
     command("status", "show the pairing window, connected clients and task counts")
     revoke = command("revoke-all", "revoke every client and token; the Claude connector must pair again")
     revoke.add_argument("-y", "--yes", action="store_true", help="confirm")
+    check = command("remote-check", "call the dispatcher of each remote machine (or one) and show what it sees")
+    check.add_argument("machine", nargs="?", help="only this machine (its name in remote.machines)")
+    command("remote-dispatcher", "print the switchboard-remote dispatcher script, for installing it on a machine")
     return parser
 
 
@@ -152,6 +163,7 @@ class ParsedArgs:
     minutes: int | None = None
     yes: bool = False
     pid_file: str | None = None
+    machine: str | None = None
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -163,6 +175,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         minutes=getattr(ns, "minutes", None),
         yes=getattr(ns, "yes", False),
         pid_file=getattr(ns, "pid_file", None),
+        machine=getattr(ns, "machine", None),
     )
 
 
@@ -545,6 +558,71 @@ async def _serve(config: Config, io: CliIo) -> int:
             loop.remove_signal_handler(sig)
 
 
+def _settings_hooks(config: Config) -> bool:
+    """True when the server user's Claude Code settings define hooks (the summariser loads them)."""
+    path = os.path.join(claude_home_dir(config.claude.config_dir), "settings.json")
+    try:
+        with open(path, "rb") as handle:
+            data = json.loads(handle.read(1024 * 1024).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and bool(data.get("hooks"))
+
+
+async def _cmd_remote_check(config: Config, args: ParsedArgs, io: CliIo) -> int:
+    machines = list(config.remote.machines)
+    if args.machine is not None:
+        machines = [m for m in machines if m.name == args.machine]
+        if not machines:
+            names = ", ".join(m.name for m in config.remote.machines) or "none"
+            io.err(f"No machine called {args.machine}. Configured: {names}.\n")
+            return EXIT_USAGE
+    if not machines:
+        io.out("No remote machines are configured (remote.machines).\n")
+        return EXIT_OK
+    transports = {m.name: make_transport(m, config.remote, config.state_dir, io.env) for m in machines}
+    inventory = Inventory(config.remote, transports, silent_logger)
+    warnings = remote_warnings(config.remote)
+    failed = False
+    lines: list[str] = []
+    for machine in machines:
+        where = (
+            "local dispatcher"
+            if machine.transport == "local"
+            else f"ssh {machine.user}@{machine.host}:{machine.port}"
+            + ("" if machine.dispatcher == "forced" else f", dispatcher {machine.dispatcher}")
+        )
+        lines.append(f"{machine.name} ({where})")
+        lines += [f"  warning: {w}" for w in warnings if w.startswith(f"remote machine {machine.name}:")]
+        version = await inventory.version(machine.name)
+        if not version.ok:
+            failed = True
+            lines.append(f"  not reachable: {unreachable_reason(version.error, version.detail)}")
+            continue
+        data = version.data
+        if isinstance(data, VersionResponse):
+            lines.append(
+                f"  switchboard-remote {data.version}, verbs {', '.join(data.verbs)}, "
+                f"send {'allowed' if data.allow_send else 'off'}, usage {'allowed' if data.allow_usage else 'off'}"
+            )
+        view = await inventory.view(machine.name)
+        if not view.ok:
+            failed = True
+        lines.append("  " + machine_line(view))
+    if _settings_hooks(config):
+        lines.append(
+            "warning: the server user's Claude Code settings.json defines hooks; the remote summariser loads user settings, so they run for every summary"
+        )
+    io.out("\n".join(lines) + "\n")
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+def _cmd_remote_dispatcher(io: CliIo) -> int:
+    with open(DISPATCHER_PATH, encoding="utf-8") as handle:
+        io.out(handle.read())
+    return EXIT_OK
+
+
 async def main(argv: Sequence[str], io: CliIo) -> int:
     """Runs one CLI invocation and returns the exit code."""
     try:
@@ -555,6 +633,14 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
     except UsageError as err:
         io.err(f"{err.usage}{err.prog}: error: {err}\n")
         return EXIT_USAGE
+
+    if args.command == "remote-dispatcher":
+        # Needs no config: it prints the bundled script.
+        try:
+            return _cmd_remote_dispatcher(io)
+        except OSError as err:
+            io.err(f"Error: {err}\n")
+            return EXIT_ERROR
 
     config_path = args.config or io.env.get("VCM_CONFIG") or DEFAULT_CONFIG_PATH
     try:
@@ -578,6 +664,8 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
                 return await _cmd_status(config, io)
             case "revoke-all":
                 return await _cmd_revoke_all(config, args, io)
+            case "remote-check":
+                return await _cmd_remote_check(config, args, io)
     except Exception as err:
         io.err(f"Error: {err}\n")
         return EXIT_ERROR

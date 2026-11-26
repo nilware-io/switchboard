@@ -1,6 +1,6 @@
 # Switchboard design
 
-Status: design, not yet implemented. This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
+Status: M1 (`list_remote_sessions`, `remote_status`) implemented; M2 to M5 designed, not yet implemented. This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
 
 ## Goal
 
@@ -51,7 +51,7 @@ One hub, one public address, one OAuth pairing. Remote machines need no inbound 
 
 ## Config
 
-New top-level sections. All keys are camelCase in the file, snake_case in Python, like upstream. Unknown keys are errors. Defaults shown.
+New top-level sections. All keys are camelCase in the file, snake_case in Python, like upstream. Unknown keys are errors. Defaults shown. Implemented in M1: `remote.machines`, `remote.ssh`, `remote.captureLines`, `remote.summary`. `remote.send`, `watch` and `usage` are still unknown keys (rejected) until their milestones (M3, M2, M4) add them; the machine flags `allowSend`, `allowPermissionAnswers` and `sendToAnyPane` are validated from M1 on but have no effect before M3.
 
 ```json
 {
@@ -130,8 +130,8 @@ New top-level sections. All keys are camelCase in the file, snake_case in Python
 | `host` | (required for `ssh`) | DNS name or IP literal: `^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$` or a bracket-free IPv6 literal `^[0-9A-Fa-f:]{2,39}$` (parsed with `ipaddress`); never starting with `-`, no spaces, no `@`, no `%` |
 | `user` | (required for `ssh`) | `^[a-z_][a-z0-9_-]{0,31}$` |
 | `port` | `22` | 1 to 65535 |
-| `identityFile` | (required for `ssh`) | Absolute path to a private key. Startup check (warning, not error, so tests and first setup work): exists, regular file, owned by the hub user, mode 0600 or stricter, not under the owner's `~/.ssh` (a heuristic: not inside the home of a user other than the hub user) |
-| `knownHostsFile` | `<stateDir>/known_hosts` | Absolute path. Dedicated file; the hub never reads `~/.ssh/known_hosts` |
+| `identityFile` | (required for `ssh`) | Absolute path to a private key, `^/[A-Za-z0-9._/-]{1,255}$` (ssh expands `%` tokens in it). Startup check (warning, not error, so tests and first setup work): exists, regular file, owned by the hub user, mode 0600 or stricter, not under the owner's `~/.ssh` (a heuristic: not inside the home directory, from the passwd database, of a user other than the hub user) |
+| `knownHostsFile` | `<stateDir>/known_hosts` | Absolute path, same charset as `identityFile` (it goes into an `-o` value, which ssh splits at spaces). Required when `stateDir` has other characters. Dedicated file; the hub never reads `~/.ssh/known_hosts` |
 | `dispatcher` | `forced` | `forced`: the remote `authorized_keys` line forces `switchboard-remote` (recommended). Or an absolute path of the dispatcher on that machine, invoked explicitly (for machines where the key cannot carry `command=`). Path validated `^/[A-Za-z0-9._/-]{1,255}$`. An explicit path gives no protection against a compromised hub (the key opens a shell); a startup warning and `remote-check` say so |
 | `sessions` | (required) | Allow-list of tmux session names, `fnmatch` globs (`fnmatchcase`), 1 to 64 entries, each `^[A-Za-z0-9_.*?-]{1,64}$` (no `[`, no `:`). Case-sensitive. A session that matches nothing is invisible to every tool, including counts. A lone `*` is accepted with a startup warning naming the machine; examples list names. The list filters by name, which any process of the remote user can change (`rename-session`, `join-pane`): it keeps unrelated sessions out of the voice conversation, it is not a boundary against the remote user's own processes |
 | `claudeHome` | `null` | Only for `transport: "local"`: Claude Code config dir; `null` means `$CLAUDE_CONFIG_DIR`, else `~/.claude` of the hub user. Absolute path, `^/[A-Za-z0-9._/-]{1,255}$`. A config error on `ssh` machines: there only the dispatcher's own `--claude-home` (forced command) decides, the hub never sends a path |
@@ -179,7 +179,7 @@ New top-level sections. All keys are camelCase in the file, snake_case in Python
 | `usage.maxTranscriptMegabytes` | `512` | Transcripts larger than this are skipped and reported as skipped |
 | `usage.prices` | `{}` | Per model prefix, USD per million tokens: `{"claude-opus-": {"input": n, "output": n, "cacheWrite5m": n, "cacheWrite1h": n, "cacheRead": n}}`. Longest matching prefix wins. The built-in table (filled in M4 from Anthropic's published API prices on the day it is written, with that date in a comment) is used for prefixes not configured. A model without a price is reported as "unpriced" with its tokens, never guessed |
 
-Config validation additionally rejects: two machines with the same `name`, a `local` machine together with `listen.allowNonLoopback`, `allowPermissionAnswers` without `allowSend`, `sendToAnyPane` without `allowSend`, `claudeHome` on an `ssh` machine, and `watch.intervalSeconds` > 0 without `notify.url`.
+Config validation additionally rejects: two machines with the same `name`, more than 32 machines, more than one `local` machine, a `local` machine together with `listen.allowNonLoopback`, `host`, `user`, `identityFile`, `knownHostsFile` or an explicit `dispatcher` on a `local` machine, an `ssh` machine without `host`, `user` or `identityFile`, `allowPermissionAnswers` without `allowSend`, `sendToAnyPane` without `allowSend`, `claudeHome` on an `ssh` machine, and (M2) `watch.intervalSeconds` > 0 without `notify.url`.
 
 `config.example.json` gets the `dev` machine first, then one SSH machine, both with placeholder values.
 
@@ -202,6 +202,7 @@ src/voice_coding_mcp/remote/
   audit.py         stateDir/audit.jsonl writer
   watcher.py       notification watcher
   speech.py        spoken-result formatting for all remote tools
+  tools.py         the remote tools' logic (deadlines, summary or task), called by mcp.py
 src/voice_coding_mcp/usage/
   __init__.py
   records.py       usage record model, transcript line parser (shared with the dispatcher's logic)
@@ -219,7 +220,7 @@ tests/fixtures/fake_tmux.py          fake tmux driven by a JSON scenario
 tests/fixtures/fake_tui.py           bracketed-paste recorder for the optional isolated-tmux test
 ```
 
-`mcp.py` registers the new tools, `cli.py` gets `usage` and `remote-check`, `notify.py` gets a plain-text send path, `tasks/manager.py` gets a `remote` task kind for background remote jobs. Modules receive their dependencies (options, logger, clock, transport factory) as arguments, as upstream.
+`mcp.py` registers the new tools, `cli.py` gets `usage`, `remote-check` and `remote-dispatcher`, `notify.py` gets a plain-text send path, `tasks/manager.py` gets a `remote` task kind for background remote jobs. Modules receive their dependencies (options, logger, clock, transport factory) as arguments, as upstream.
 
 ## The dispatcher
 
@@ -237,9 +238,13 @@ Invocation:
 
   `python3 -I` (named explicitly, not through `#!/usr/bin/env`) keeps `PYTHONPATH`, user site-packages and the script's directory out of `sys.path`. The dispatcher sets its own environment for tmux (`PATH=/usr/local/bin:/usr/bin:/bin`, the inherited `TMUX_TMPDIR` only, `LC_ALL=C.UTF-8`), so nothing from the session environment chooses which `tmux` runs.
 - Explicit path (`dispatcher` set to a path): the hub sends `<path> <verb> <args>`; policy options then must come from a policy file `~/.config/switchboard-remote/policy.json` owned by the remote user (same option names, camelCase); without it the dispatcher refuses everything. This is not a security boundary: the key opens a shell, so a compromised hub ignores the dispatcher and its policy file. The policy file only protects against hub bugs. Documented for machines where `authorized_keys` options are not possible; the hub warns at startup and `remote-check` says it.
-- Local transport: the hub runs `python3 -I <dispatcher> --policy-from-hub <verb> <args>` as a child process (argv, no shell), with the machine's hub-side settings as policy.
+- Local transport: the hub runs `python3 -I <dispatcher> --policy-from-hub <policy options> -- <verb> <args>` as a child process (argv, no shell), with the machine's hub-side settings as policy options. `--policy-from-hub` is refused (`bad_policy`) when `SSH_ORIGINAL_COMMAND` or `SSH_CONNECTION` is set, so it cannot be used under sshd.
 
-Request line (the SSH command string, or argv for local): `switchboard-remote <verb> [args]`. The dispatcher parses `SSH_ORIGINAL_COMMAND` with `shlex.split`, requires the first token to be `switchboard-remote`, and validates everything again; it never passes any part of it to a shell. Every argument the hub sends matches `^[A-Za-z0-9%_.-]{1,64}$` (verb, pane id, pid, session id, numbers), so the command string means the same in any login shell (sh, bash, zsh, fish, csh) of an explicit-path machine; `shlex.quote` is a second layer, not the one relied on. Every response is one JSON document on stdout, at most 4 MB (usage: streamed JSON lines, at most 64 MB), with `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`. Exit code 0 even for refusals; non-zero only for crashes.
+Argument parsing (implemented in M1): leading options up to the first non-option token or `--`; unknown options, a repeated value option and malformed values are `bad_policy` (everything is refused, so a broken `authorized_keys` line shows up at once in `remote-check`). Without `--policy-from-hub` and without request tokens in argv it is the forced-command mode (`--sessions` required, request from `SSH_ORIGINAL_COMMAND`); request tokens in argv without `--policy-from-hub` mean an explicit path, where any option is `bad_request` and the policy file is required (`no_policy` when it is missing, unreadable, over 64 KB or has unknown keys). The M3 and M4 policy options (`--allow-send`, `--allow-permission-answers`, `--send-to-any-pane`, `--slash-commands`, `--allow-usage`) are parsed and validated from M1 on, so `authorized_keys` lines need no change later. `HOME` comes from the dispatcher's environment (else the passwd entry); the default `claudeHome` is `$CLAUDE_CONFIG_DIR` (absolute) or `$HOME/.claude`.
+
+Test hooks, only with `SWITCHBOARD_REMOTE_TEST=1` in the dispatcher's own environment (sshd does not pass client variables unless `AcceptEnv` allows them, and the forced command line is the owner's): `--tmux-socket-name sb-test-<letters and digits>` (for the isolated live test), `SWITCHBOARD_REMOTE_TEST_TMUX` (the tmux binary, for the fake tmux) and passing `FAKE_TMUX_*` variables to tmux.
+
+Request line (the SSH command string, or argv for local): `switchboard-remote <verb> [args]`. The dispatcher parses `SSH_ORIGINAL_COMMAND` with `shlex.split`, requires the first token to be `switchboard-remote`, and validates everything again; it never passes any part of it to a shell. Every argument the hub sends matches `^[A-Za-z0-9%_.-]{1,64}$` (verb, pane id, pid, session id, numbers), so the command string means the same in any login shell (sh, bash, zsh, fish, csh) of an explicit-path machine; `shlex.quote` is a second layer, not the one relied on. Every response is one JSON document on stdout, at most 4 MB (usage: streamed JSON lines, at most 64 MB), with `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`. Exit code 0 even for refusals; non-zero only for crashes. Error codes: `bad_request`, `bad_policy`, `no_policy`, `tmux_failed`, `gone` (M3 adds the `send` codes). The hub additionally never sends an argument that starts with `-`.
 
 Verbs:
 
@@ -247,7 +252,7 @@ Verbs:
 |---|---|---|---|
 | `version` | none | none | `{"version": "x.y.z", "verbs": [...], "allowSend": bool}`; used by `remote-check` |
 | `list` | none | none | tmux tree of allowed sessions, joined with the registry (below) |
-| `capture` | `<paneId> <lines>` | none | `tmux capture-pane -p -J -t <paneId> -S -<lines>`; refuses a pane outside allowed sessions. Returns `{"text": ..., "paneId", "session", "window"}`, text capped at 64 KB |
+| `capture` | `<paneId> <lines>` | none | `tmux capture-pane -p -J -t <paneId> -S -<lines>`; a pane outside allowed sessions is refused with `gone`, exactly like a missing pane, so pane ids do not reveal other sessions. Returns `{"text": ..., "paneId", "session", "window"}`, text capped at 64 KB (the tail is kept) |
 | `send` | `<paneId> <panePid> <sessionId>` | text, UTF-8, at most 8 KB | Only with `--allow-send`. Rechecks that the pane exists, is in an allowed session, still has `panePid`, runs Claude Code with registry `sessionId` (`-` when the pane runs no Claude Code, accepted only with `--send-to-any-pane`), shows no permission prompt unless `--allow-permission-answers`, and passes the text rules (below). Then sends (below). Returns `{"sent": true, "bytes": n}`, or `{"ok": false, "error": "<code>"}` with `gone`, `changed`, `not_claude`, `permission_prompt`, `draft_present`, `bad_text` |
 | `usage` | `<sinceEpochSeconds> <maxMegabytes>` | JSON list of known files `[{"id", "size", "mtime"}]`, at most 1 MB | Only with `--allow-usage`. Streams compact usage records for transcripts modified since then and changed since the hub's cache (below) |
 
@@ -259,7 +264,7 @@ Validation: `paneId` `^%[0-9]{1,6}$`; `panePid`, `lines` and `maxMegabytes` deci
 tmux list-panes -a -F '#{session_name}\t#{session_id}\t#{window_index}\t#{window_id}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_active}\t#{session_attached}\t#{window_activity}'
 ```
 
-Lines with the wrong field count are skipped. "No tmux server" (exit 1, `no server running`) is an empty list, not an error. Registry join: for each live registry entry (same rules as upstream `read_live_sessions`, also `os.kill` with EPERM as alive), the pane id after the last `.` of `tmux`; without a `tmux` field, the pane whose `pane_pid` is an ancestor of the registry `pid` (walk `/proc/<pid>/stat` on Linux, `ps -o ppid= -p` elsewhere, at most 32 steps). Output per pane: ids and names above plus `claude: null` or `{"sessionId", "name", "status", "waitingFor", "statusUpdatedAt", "startedAt", "cwdName"}` (`cwdName` is the basename of `cwd`; full paths, `messagingSocketPath`, `bridgeSessionId` and key files are never sent). Panes in sessions outside the dispatcher's allow-list are dropped before output.
+Lines with the wrong field count, a malformed pane id or pane pid are skipped; at most 512 panes are returned (`"truncated": true` beyond). "No tmux server" (exit 1, `no server running` or `error connecting to`) is an empty list, not an error; any other tmux failure is `tmux_failed`. tmux gets at most 8 s per call. Registry join: for each live registry entry (same rules as upstream `read_live_sessions`, also `os.kill` with EPERM as alive; registry files over 1 MB skipped), the pane id after the last `.` of `tmux` when that pane exists; without a `tmux` field, the pane whose `pane_pid` is an ancestor of the registry `pid` (walk `/proc/<pid>/stat` on Linux, `ps -o ppid= -p` elsewhere, at most 32 steps; pid 1 never matches). When two entries map to one pane, the first (by registry file name) wins. Output per pane: ids and names above plus `claude: null` or `{"sessionId", "name", "status", "waitingFor", "statusUpdatedAt", "startedAt", "cwdName"}` (`cwdName` is the basename of `cwd`; full paths, `messagingSocketPath`, `bridgeSessionId` and key files are never sent). Panes in sessions outside the dispatcher's allow-list are dropped before output.
 
 `send`: `tmux load-buffer -b sb-<16 hex> -` with the text on stdin, `tmux paste-buffer -p -d -b sb-<...> -t <paneId>` (bracketed paste, so a multi-line text arrives as one input and nothing submits early; `-d` deletes the buffer), then `tmux send-keys -t <paneId> Enter`. The text never appears in argv or in a command string.
 
@@ -271,7 +276,7 @@ Race guard: a permission dialog can open between the check and the keystrokes, a
 
 ## Transports
 
-`Transport.call(verb, args, stdin=None, timeout) -> TransportResult` (frozen dataclass: `ok`, `data` or `error`, `elapsed_ms`). Never raises. Errors map to fixed codes the speech layer turns into words: `timeout`, `host_key` (host key unknown or changed), `auth` (permission denied), `refused` (connection refused or no route), `dispatcher_missing` (exit 127 or no JSON), `bad_response`, `refused_by_policy` (dispatcher said no), `other`. For `send`, a `timeout`, `bad_response` or `other` after the command string was handed to ssh means the outcome is unknown (the dispatcher may have typed the text): it is reported and audited as `unknown`, never as "not sent".
+`Transport.call(verb, args, *, timeout_seconds) -> TransportResult` (frozen dataclass: `ok`, `data` or `error`, `detail` (the dispatcher's own code with `refused_by_policy`), `elapsed_ms`; M3 adds `stdin`). Never raises. Errors map to fixed codes the speech layer turns into words: `timeout`, `host_key` (host key unknown or changed), `auth` (permission denied), `refused` (connection refused or no route), `dispatcher_missing` (exit 127 or no JSON), `bad_response`, `refused_by_policy` (dispatcher said no), `other`. For `send`, a `timeout`, `bad_response` or `other` after the command string was handed to ssh means the outcome is unknown (the dispatcher may have typed the text): it is reported and audited as `unknown`, never as "not sent".
 
 ### SSH
 
@@ -292,16 +297,16 @@ argv, never a shell on the hub side:
 - The environment of `ssh` is built from scratch: `PATH`, `HOME`, `LANG`, `LC_ALL`. Never `SSH_AUTH_SOCK`; `IdentityAgent=none` covers the agent anyway.
 - The command string is built only by `protocol.build_command(verb, args)`: the fixed word `switchboard-remote` (or the configured dispatcher path), the verb from a fixed set, and arguments that already passed the regexes above, each through `shlex.quote`. Voice text never enters it; `remote_send` text goes on stdin.
 - stdin is `/dev/null` unless the verb takes stdin; stdout capped (4 MB, usage 64 MB), stderr kept to the last 2 KB for error mapping and never logged verbatim (only the mapped code).
-- Run with `start_new_session=True`, killed as a process group on timeout like upstream runs.
+- Run with `start_new_session=True`, killed as a process group on timeout or stdout overflow (SIGTERM, SIGKILL after 1 s). Error mapping of an ssh exit 255 by stderr: host key texts to `host_key`, `Permission denied` to `auth`, `Connection timed out` to `timeout`, refused, no route, unresolvable host and `Connection closed by` to `refused`; exit 127, `command not found` or no JSON on stdout to `dispatcher_missing`; JSON that is not a valid response to `bad_response`.
 - No connection sharing (`ControlMaster`) in M1: a socket of a shared master would be another credential on disk. If latency on WSL turns out too high, M2 may add `ControlMaster=auto` with `ControlPath=<stateDir>/ssh/%C` (directory 0700) and `ControlPersist=60`, recorded here when done.
 
 ### Local transport
 
-For the owner who runs the hub as their own user (weaker isolation: tasks, the hub and the owner's sessions share one uid). Runs the bundled dispatcher as `sys.executable -I <path to remote/dispatcher.py> --policy-from-hub ...` with the same verbs, same validation, same caps. The tools behave exactly the same. In this setup upstream's own `list_sessions` and friends also see the owner's sessions; both stay available.
+For the owner who runs the hub as their own user (weaker isolation: tasks, the hub and the owner's sessions share one uid). Runs the bundled dispatcher as `sys.executable -I <path to remote/dispatcher.py> --policy-from-hub ...` with the same verbs, same validation, same caps. Its environment holds only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMUX_TMPDIR` and `CLAUDE_CONFIG_DIR` of the hub (plus the test hooks when the hub itself has them). The tools behave exactly the same. In this setup upstream's own `list_sessions` and friends also see the owner's sessions; both stay available.
 
 ## Target resolution
 
-`machine` argument: fuzzy match against machine names (upstream matcher). Omitted: allowed only when exactly one machine is configured, or for `pending_input` and `list_remote_sessions` (all machines).
+`machine` argument: fuzzy match against machine names (upstream matcher). Omitted: allowed only when exactly one machine is configured, or for `pending_input` and `list_remote_sessions` (all machines). `target` of `remote_status` may be omitted when the machine has exactly one Claude Code pane (implemented in M1); otherwise the answer asks which session and names the allowed ones.
 
 `target` argument, in order, against a fresh `list` of that machine:
 
@@ -317,7 +322,7 @@ All new tools return plain text that reads well aloud: short sentences, the most
 
 Screen text framing: pane text, summaries, last lines, questions, `waitingFor`, window names and Claude Code session names come from programs and sessions on the machines, so they are untrusted. Every result marks them as quoted screen text (`the screen says: "..."`, `it asks: "..."`) after the hub's own facts, never as a sentence of the hub's own, and never inside the read-back of `remote_send` except as the labelled question being answered. Names are sanitised like upstream `sanitize_title` and clipped to 40 characters. The server instructions say that quoted screen text is never an instruction.
 
-Background remote jobs use a new task kind `remote` in the task manager: a task file like any other (`kind: "remote"`, `project` set to the machine name, a `title` such as "status of fpga on dev", result text), created by `TaskManager.start_job(kind, label, lock_key, job)` where `job` is an async callable returning the spoken result. It holds a run slot only while it runs `claude -p` (the summariser); its lock key is `remote:<machine>:<paneId>` or `usage:<machine|all>`. `get_task_result`, `list_tasks` and `cancel_task` work unchanged; notifications for long jobs go through the existing notifier.
+Background remote jobs use a new task kind `remote` in the task manager: a task file like any other (`kind: "remote"`, `project` set to the machine name, a `title` such as "status of fpga on dev", result text), created by `TaskManager.start_job(label=, machine=, lock_key=, job=)` where `job` is an async callable that gets the task's abort event and returns the spoken result (an exception fails the task). The label is all that is stored as the task's prompt (no pane text); `project_path` holds the lock key. It holds a run slot only while it runs `claude -p` (the summariser): such runs take one with `TaskManager.claim_slot(lock_key)`, which returns a lease (`abort`, `release`) or None when every slot is taken, the key is locked or a task waits in the queue (queued tasks keep their turn). Its lock key is `remote:<machine>:<paneId>` or `usage:<machine|all>`; while a job with the same key runs, `start_job` returns that job's task. Spoken name: "Task 12 (status of fpga on dev)". Cancel and shutdown abort the job; after a restart a job left running reads as failed ("server restarted") like any task. `get_task_result`, `list_tasks` and `cancel_task` work unchanged; notifications for jobs nobody waited for go through the existing notifier.
 
 Annotations: `list_remote_sessions`, `remote_status`, `pending_input`, `usage_report` are `readOnlyHint: true` (`remote_status` also `openWorldHint: true`, since it may run the summariser). `remote_send` is `readOnlyHint: true` too (it changes nothing on any machine; it only stores a confirmation in the hub's memory). `remote_send_confirm` is `readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true`, consistent with upstream's choice that no tool is destructive so hands-free use works; the confirmation step lives in the server instead (see [remote_send](#remote_send-and-remote_send_confirm)). With `remote.send.clientApproval` it is `destructiveHint: true`, so the Claude app itself asks the owner. `tests/fixtures/tool_list.json` is updated in each milestone that adds a tool.
 
@@ -339,17 +344,18 @@ Per session: the tmux session name, then for each Claude Code pane in it its sta
 
 Input: `machine`, `target`, `lines?` (default `remote.captureLines`, at most 500). Steps: resolve the pane (one `list`), `capture`, strip ANSI and control characters, redact secrets ([Redaction](#redaction)), then summarise.
 
-- Summariser on (`remote.summary.enabled`): one `claude -p` run with a fixed system prompt (below). It waits up to `min(summary.timeoutSeconds, syncWaitSeconds - elapsed - 2 s)`. If it is not done in time the call returns a task number and the job continues in the background up to `summary.timeoutSeconds`, then falls back to the heuristic.
-- Heuristic (summariser off, failed or timed out): registry state, the Claude Code session name, and the last meaningful line of the pane (last non-empty line that is not a box border, spinner or status bar), redacted and clipped to 120 characters.
+- Summariser on (`remote.summary.enabled`): one `claude -p` run with a fixed system prompt (below). It waits up to `min(summary.timeoutSeconds, deadline left - 2 s)`, where the deadline is `max(2 s, syncWaitSeconds - 3 s)` from the start of the call. If it is not done in time the call returns a task number and the job continues in the background up to `summary.timeoutSeconds`, then falls back to the heuristic. Only then is a task created; a summary that is ready in time creates no task. A second `remote_status` for the same pane while its job runs gets the heuristic (the pane's lock key is held).
+- Heuristic (summariser off, failed, timed out, or no run slot free): registry state, the Claude Code session name, and the last meaningful line of the pane (last non-empty line that is not a box border, a status bar line such as `? for shortcuts` or `esc to interrupt`, or an empty input prompt such as `>` or `$`), redacted and clipped to 120 characters.
 - Summary cache: per pane, the last summary is reused while the redacted capture's SHA-256 is unchanged and the summary is at most 60 s old, so a repeated "what is it doing" answers at once and costs nothing.
 
 Result shapes:
 
 ```
-dev, fpga: Claude Code is waiting for your permission to run npm test. Before that it fixed the parser and said all 41 tests pass.
-dev, fpga: Claude Code is working. The screen says: "Running cargo build".          (heuristic)
-dev, fpga: I am still reading it. That is task 12; ask me for it in a moment.         (task)
-dev, shell: no Claude Code here. The screen says: "build finished in 3 minutes".
+dev, fpga: Claude Code is waiting for your permission. A summary of the screen: "It wants to run npm test. Before that it fixed the parser and said all 41 tests pass."
+dev, fpga: Claude Code is working. The screen says: "Running cargo build"          (heuristic)
+dev, fpga: I am still reading it. That is task 12; ask me for it in a moment.       (task)
+dev, shell: no Claude Code here. The screen says: "build finished in 3 minutes"
+dev, fpga window 2: Claude Code "parser fix" is idle. The screen is empty.         (session with several windows; Claude Code name differs)
 ```
 
 Summariser run (argv, no shell, cwd `<stateDir>/summarize`, an empty directory the server creates with mode 0700):
@@ -358,11 +364,11 @@ Summariser run (argv, no shell, cwd `<stateDir>/summarize`, an empty directory t
 claude -p --output-format stream-json --verbose --permission-mode dontAsk --permission-prompts none
   --strict-mcp-config --mcp-config <stateDir/mcp-config-none.json> --setting-sources user
   --system-prompt <SUMMARY_PROMPT> --model <summary.model> --max-turns 1 --tools ""
-  --no-session-persistence --name sb-summary
+  --name sb-summary --no-session-persistence
 ```
 
-- Built with upstream's `runner.build_args` shape (with a `system_prompt` that replaces rather than appends, and `tools=[]`), but never with `claude.extraArgs`, `claude.model` or `claude.effort`: the owner's task settings do not apply to the summariser.
-- `--no-session-persistence` keeps the pane text out of a transcript on disk. M1 checks that the installed CLI accepts it (the owner runs `claude --help`; tests only see the fake); if it does not, the run's transcript file is deleted after the run instead. The summariser's tokens are therefore taken from the run's `result` event and appended to `stateDir/usage/summaries.jsonl` (time, model, token counts, no text), which usage reports as project "switchboard".
+- Built with upstream's `runner.build_args` (new `RunOptions` fields `replace_system_prompt`, `task_settings=False`, `model`, `no_session_persistence`; `tools=[]`), so never with `claude.extraArgs`, `claude.model` or `claude.effort`: the owner's task settings do not apply to the summariser. Pinned by a test.
+- `--no-session-persistence` keeps the pane text out of a transcript on disk. M1 checks that the installed CLI accepts it (the owner runs `claude --help`; tests only see the fake); if it does not, the run's transcript file is deleted after the run instead. The summariser's tokens are therefore taken from the run's `result` event (`RunResult.usage`) and appended to `stateDir/usage/summaries.jsonl` (0600; `time`, `model`, `input`, `output`, `cacheRead`, `cacheWrite`, `costUsd`, no text), which usage (M4) reports as project "switchboard".
 - `--setting-sources user` loads the hub user's own settings (hooks included). With the dedicated user those are the hub user's, which a compromised task could already change, so this adds no reach; `remote-check` warns when that `settings.json` defines hooks.
 - Environment: upstream's isolated `build_env` (no connectors, no nonessential traffic). No project, no tools, no MCP servers, so pane content that carries instructions has nothing to act with.
 - stdin: one fixed sentence ("Summarise the terminal screen between the two boundary lines for the owner, who will hear it.") then the redacted pane text between two random boundary lines (`----- untrusted terminal text <32 hex> -----`), as the relay does.
@@ -594,7 +600,7 @@ Not testable here, verified by the owner and recorded in DESIGN.md "To verify wi
 
 Each milestone ends with the full gate (`uv sync --locked`, `pytest`, `ruff check`, `ruff format --check`, `mypy --strict src tests`), updated REFERENCE.md, DESIGN.md (security model, source layout, tools table) and this file, and one commit on the working branch.
 
-### M1: `list_remote_sessions` and `remote_status`
+### M1: `list_remote_sessions` and `remote_status` (implemented)
 
 - `remote/config.py` and config validation; `config.example.json` with `dev` first.
 - `ssh.py`, `transport.py` (SSH and local), `protocol.py`, `dispatcher.py` with `version`, `list`, `capture`; `deploy/remote/switchboard-remote`.
@@ -603,6 +609,12 @@ Each milestone ends with the full gate (`uv sync --locked`, `pytest`, `ruff chec
 - Tools `list_remote_sessions`, `remote_status`; server instructions paragraph routing "what is my session on dev doing" to them.
 - CLI `remote-check [machine]` and `remote-dispatcher`.
 - fake ssh and fake tmux fixtures, tests as above.
+
+Done as listed, with these notes:
+
+- `deploy/remote/switchboard-remote` is the Python dispatcher (byte-identical to `remote/dispatcher.py`, executable), as designed; there is no shell script, so shellcheck does not apply to it. A test checks that it parses as Python 3.8 and imports only the standard library.
+- The fake ssh reads its settings from a file named by a per-test wrapper script (`tests/remote/helpers.py`), because the hub builds ssh's environment from scratch and no `FAKE_SSH_*` variable would reach it.
+- Verified on the WSL box (tmux 3.4) with `SB_LIVE_TMUX=1`: `list` and `capture` against an isolated `tmux -L sb-test-<random>` server, killed afterwards. Not verified yet (owner, with real keys): the forced command through a real sshd on localhost, and whether the installed `claude` accepts `--no-session-persistence` (`claude --help`).
 
 ### M2: `pending_input` and the notification watcher
 

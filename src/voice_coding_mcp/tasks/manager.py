@@ -73,8 +73,9 @@ PROGRESS_SAVE_MS = 5 * SECOND_MS
 ASK_TOOLS: tuple[str, ...] = ("Read", "Grep", "Glob")
 """Built-in tools of an ask_session_readonly run (besides plan mode)."""
 
-TaskKind = Literal["task", "ask", "send"]
-"""task: run_task; ask: ask_session_readonly (read-only fork); send: send_message_to_session (relay plus reply watch)."""
+TaskKind = Literal["task", "ask", "send", "remote"]
+"""task: run_task; ask: ask_session_readonly (read-only fork); send: send_message_to_session (relay plus
+reply watch); remote: a background job of the Switchboard remote tools (`start_job`)."""
 
 TaskStatus = Literal["queued", "running", "done", "failed", "cancelled", "timeout"]
 
@@ -410,7 +411,7 @@ class _SessionSpec:
 
 @dataclass
 class _Running:
-    """An active (running or reply-watching) task."""
+    """An active (running or reply-watching) task, a remote job, or a slot lease (negative key)."""
 
     lock_key: str
     abort: asyncio.Event = field(default_factory=asyncio.Event)
@@ -421,6 +422,19 @@ class _Running:
 
 def _copy(task: Task) -> Task:
     return task.model_copy(deep=True)
+
+
+@dataclass
+class SlotLease:
+    """A run slot held outside the queue (`TaskManager.claim_slot`), for example by the remote
+    summariser's `claude -p` run. `abort` is set at shutdown; `release` frees the slot (idempotent)."""
+
+    abort: asyncio.Event
+    release: Callable[[], None]
+
+
+JobFn = Callable[[asyncio.Event], Awaitable[str]]
+"""A remote job: gets the task's abort event, returns the spoken result (raising fails the task)."""
 
 
 class TaskManager:
@@ -450,6 +464,8 @@ class TaskManager:
         self._shutting_down = False
         self._reopening: dict[int, int] = {}
         """Session tasks whose session resume_task_in_remote_control is replacing (`reopening`)."""
+        self._next_lease = -1
+        """Keys of slot leases in `_active` are negative, so they never collide with task ids."""
 
     @classmethod
     async def create(cls, options: TaskManagerOptions) -> TaskManager:
@@ -674,6 +690,83 @@ class TaskManager:
             "session task created", {"taskId": task.id, "project": project.name, "promptChars": len(text)}
         )
         return Started(task=_copy(task))
+
+    def claim_slot(self, lock_key: str) -> SlotLease | None:
+        """A run slot now, outside the queue, or None when every slot is taken, the key is locked or
+        a task waits in the queue (queued tasks keep their turn). Synchronous, like `_enqueue`."""
+        if self._shutting_down or self._queue or not self._can_start_now(lock_key):
+            return None
+        key = self._next_lease
+        self._next_lease -= 1
+        running = self._active[key] = _Running(lock_key=lock_key)
+
+        def release() -> None:
+            if self._active.get(key) is running:
+                del self._active[key]
+                self._pump()
+
+        return SlotLease(abort=running.abort, release=release)
+
+    def start_job(self, *, label: str, machine: str, lock_key: str, job: JobFn) -> StartResult:
+        """A `remote` task that runs `job` in the background (no queue, no run slot of its own: a
+        job that runs `claude -p` takes one with `claim_slot`). `label` names it ("status of fpga on
+        dev") and is all that is stored as its prompt. While a job with the same `lock_key` runs, that
+        job's task is returned instead of starting another."""
+        if self._shutting_down:
+            return StartFailed(reason="shutting_down", project=machine)
+        for task_id, running in self._active.items():
+            existing = self._tasks.get(task_id)
+            if running.lock_key == lock_key and existing is not None and existing.kind == "remote":
+                return Started(task=_copy(existing))
+        now = self._now_iso()
+        label = sanitize_title(label) or "remote job"
+        task = Task(
+            id=self._next_id,
+            kind="remote",
+            title=label,
+            project=machine,
+            project_path=lock_key,
+            prompt=label,
+            status="running",
+            new_session=False,
+            created_at=now,
+            started_at=now,
+        )
+        if not self._write_new(task):
+            return StartFailed(reason="state_error", project=machine)
+        running = self._active[task.id] = _Running(lock_key=lock_key, holds_slot=False)
+        self._opts.logger.info("remote job started", {"taskId": task.id, "machine": machine})
+        run = asyncio.get_running_loop().create_task(self._run_job(task, running, job))
+        self._runs.add(run)
+        run.add_done_callback(self._runs.discard)
+        return Started(task=_copy(task))
+
+    async def _run_job(self, task: Task, running: _Running, job: JobFn) -> None:
+        work = asyncio.ensure_future(job(running.abort))
+        stop = asyncio.ensure_future(running.abort.wait())
+        try:
+            await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+        if not work.done():
+            work.cancel()
+            with contextlib.suppress(BaseException):
+                await work
+        task.finished_at = self._now_iso()
+        if work.cancelled():
+            task.status = "failed" if running.cancel_reason else "cancelled"
+            task.error = running.cancel_reason or "cancelled"
+        elif (error := work.exception()) is not None:
+            task.status = "failed"
+            task.error = str(error) or type(error).__name__
+        else:
+            task.status = "done"
+            task.result = work.result()
+        self._active.pop(task.id, None)
+        self._save(task)
+        self._opts.logger.info("remote job finished", {"taskId": task.id, "status": task.status})
+        self._finished(task)
+        self._pump()
 
     def _write_new(self, task: Task) -> bool:
         """Claims the task id and writes the new task file; False (logged) when that fails."""
@@ -1516,6 +1609,8 @@ def task_head(task: Task) -> str:
     """How a spoken answer names a task: "Task 3 for session billing-fix" or "Task 3 in alpha"."""
     if task.target_session_name:
         return f"Task {task.id} for session {task.target_session_name}"
+    if task.kind == "remote":
+        return f"Task {task.id} ({task.title or task.prompt})"
     return f"Task {task.id} in {task.project}"
 
 

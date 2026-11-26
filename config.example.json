@@ -27,5 +27,34 @@
     "allowLoopbackRedirects": false
   },
   "notify": { "url": null, "headers": {}, "includeResult": false },
-  "logPrompts": false
+  "logPrompts": false,
+  "remote": {
+    "machines": [
+      {
+        "name": "dev",
+        "transport": "ssh",
+        "host": "localhost",
+        "user": "owner",
+        "port": 22,
+        "identityFile": "/home/switchboard/.ssh/switchboard_dev",
+        "knownHostsFile": "/home/switchboard/.ssh/switchboard_known_hosts",
+        "dispatcher": "forced",
+        "sessions": ["fpga", "notes", "work-*"],
+        "allowUsage": true,
+        "allowSend": false
+      },
+      {
+        "name": "buildbox",
+        "transport": "ssh",
+        "host": "example-host",
+        "user": "bot",
+        "identityFile": "/home/switchboard/.ssh/switchboard_buildbox",
+        "knownHostsFile": "/home/switchboard/.ssh/switchboard_known_hosts",
+        "sessions": ["api", "web-*"]
+      }
+    ],
+    "ssh": { "bin": "ssh", "connectTimeoutSeconds": 5, "commandTimeoutSeconds": 10 },
+    "captureLines": 60,
+    "summary": { "enabled": true, "model": "haiku", "timeoutSeconds": 15 }
+  }
 }
