@@ -108,7 +108,7 @@ def test_send_types_one_bracketed_paste_then_enter_on_an_isolated_tmux_server(so
         encoding="utf-8",
     )
     text = "line one\nline two with 'quotes' $(not run) C-c Enter"
-    out = d.handle([*policy, "send", tui["paneId"], str(tui["panePid"]), session_id], env, text.encode())
+    out = d.handle([*policy, "send", tui["paneId"], str(tui["panePid"]), session_id, "message"], env, text.encode())
     assert out == {"protocol": 1, "ok": True, "sent": True, "bytes": len(text.encode()), "enter": True}, out
     deadline = time.monotonic() + 10
     while not (record.exists() and record.read_bytes().endswith(b"\x1b[201~\r")):

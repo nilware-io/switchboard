@@ -26,6 +26,7 @@ from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from .audit import AuditLog
 from .config import MachineConfig
+from .dispatcher import NO_DIALOG, SEND_ANSWER, SEND_CHECK_LINES, SEND_MESSAGE
 from .inventory import Inventory, resolve_machine
 from .pending import (
     PendingChecker,
@@ -43,7 +44,9 @@ from .send import (
     ConfirmationStore,
     RiskClassifier,
     ScreenEcho,
+    dialog_hash,
     normalize_text,
+    shows_dialog,
     text_problem,
 )
 from .speech import (
@@ -67,8 +70,10 @@ from .transport import Transport, make_transport
 DEADLINE_MARGIN_SECONDS = 3
 SUMMARY_MARGIN_SECONDS = 2
 MIN_DEADLINE_SECONDS = 2.0
-SEND_CAPTURE_LINES = 15
-"""Screen lines `remote_send` reads for the permission and question checks (as `pending_input`)."""
+SEND_CAPTURE_LINES = SEND_CHECK_LINES
+"""Screen lines `remote_send` reads for the permission and question checks: as many as the
+dispatcher's `send` reads, so both run `shows_dialog` and `dialog_hash` on the same lines
+(`pending.screen_ask` looks at the last 15 of them, as `pending_input`)."""
 MIN_SEND_SECONDS = 2.0
 """A send is not started with less time left: it would likely end as an unknown outcome."""
 EXPIRED = "That confirmation has expired. Ask me to prepare the message again."
@@ -198,6 +203,10 @@ class RemoteTools:
             report = await self._pending.check([found.item.name], include_local=False, left=self._deadline().left)
         else:
             report = await self.collect_pending()
+        # The answer quotes these questions; machine screens were observed by the inventory already,
+        # but the hub's own registry (`waitingFor` of local sessions) was not.
+        for entry in report.entries:
+            self.echo.observe(entry.question)
         self._logger.info(
             "tool call",
             {
@@ -358,9 +367,13 @@ class RemoteTools:
                 f"{name} is not reachable: {unreachable_reason(captured.error, captured.detail)}.", "unreachable"
             )
         ask = screen_ask(clean_screen(captured.text)) if claude is not None else None
+        # At least as broad as the dispatcher's own check (the same `shows_dialog` on the same lines),
+        # so a send is prepared as a permission answer exactly when the dispatcher will see one.
         permission = (
-            claude is not None and claude.status == "waiting" and waits_for_permission(claude.waiting_for)
-        ) or (ask is not None and ask.kind == "permission")
+            (claude is not None and claude.status == "waiting" and waits_for_permission(claude.waiting_for))
+            or (ask is not None and ask.kind == "permission")
+            or shows_dialog(captured.text)
+        )
         question: str | None = None
         if permission:
             if not config.allow_permission_answers:
@@ -404,6 +417,7 @@ class RemoteTools:
             text=text,
             risky=risky,
             permission_answer=permission,
+            dialog=dialog_hash(captured.text) if permission else None,
         )
         self._logger.info(
             "tool call",
@@ -475,9 +489,10 @@ class RemoteTools:
         left = min(float(self._remote.ssh.command_timeout_seconds), deadline.left())
         if left < MIN_SEND_SECONDS:
             return "not_sent:slow", None
+        mode = [SEND_ANSWER, item.dialog or NO_DIALOG] if item.permission_answer else [SEND_MESSAGE]
         result = await self.inventory.transport(item.machine).call(
             "send",
-            [item.pane_id, str(item.pane_pid), item.session_id or "none"],
+            [item.pane_id, str(item.pane_pid), item.session_id or "none", *mode],
             timeout_seconds=left,
             stdin=item.text.encode("utf-8"),
         )

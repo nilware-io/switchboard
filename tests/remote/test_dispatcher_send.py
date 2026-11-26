@@ -54,7 +54,7 @@ def world(tmp_path: Path) -> RemoteWorld:
 def send(
     world: RemoteWorld,
     text: str | bytes,
-    args: str = f"%1 {CLAUDE_PID} {SESSION_A}",
+    args: str = f"%1 {CLAUDE_PID} {SESSION_A} message",
     forced: list[str] | None = None,
 ) -> dict[str, Any]:
     env = {**world.tmux_env(), "SSH_CONNECTION": "127.0.0.1 1 127.0.0.1 22"}
@@ -193,7 +193,10 @@ def test_allowed_slash_commands_need_the_dispatcher_list(world: RemoteWorld) -> 
 
 
 def test_policy_flags_in_the_request_are_refused(world: RemoteWorld) -> None:
-    env = {**world.tmux_env(), "SSH_ORIGINAL_COMMAND": f"switchboard-remote --allow-send send %1 {CLAUDE_PID} none"}
+    env = {
+        **world.tmux_env(),
+        "SSH_ORIGINAL_COMMAND": f"switchboard-remote --allow-send send %1 {CLAUDE_PID} none message",
+    }
     assert d.handle(SESSIONS, env, b"hi") == {"protocol": 1, "ok": False, "error": "bad_request"}
     assert not typed(world)
 
@@ -209,13 +212,13 @@ def test_sending_needs_allow_send(world: RemoteWorld) -> None:
 @pytest.mark.parametrize(
     ("args", "error"),
     [
-        (f"%9 {CLAUDE_PID} {SESSION_A}", "gone"),
-        (f"%3 9100003 {SESSION_A}", "gone"),  # outside the allow-list: like a missing pane
-        (f"%1 4242 {SESSION_A}", "changed"),  # another process in the pane
-        (f"%1 {CLAUDE_PID} {SESSION_B}", "changed"),  # Claude Code restarted in the same shell
-        (f"%1 {CLAUDE_PID} none", "changed"),  # Claude Code now runs where the hub saw none
-        (f"%2 {SHELL_PID} {SESSION_A}", "changed"),  # Claude Code is gone from the pane
-        (f"%2 {SHELL_PID} none", "not_claude"),  # a plain shell without --send-to-any-pane
+        (f"%9 {CLAUDE_PID} {SESSION_A} message", "gone"),
+        (f"%3 9100003 {SESSION_A} message", "gone"),  # outside the allow-list: like a missing pane
+        (f"%1 4242 {SESSION_A} message", "changed"),  # another process in the pane
+        (f"%1 {CLAUDE_PID} {SESSION_B} message", "changed"),  # Claude Code restarted in the same shell
+        (f"%1 {CLAUDE_PID} none message", "changed"),  # Claude Code now runs where the hub saw none
+        (f"%2 {SHELL_PID} {SESSION_A} message", "changed"),  # Claude Code is gone from the pane
+        (f"%2 {SHELL_PID} none message", "not_claude"),  # a plain shell without --send-to-any-pane
     ],
 )
 def test_the_pane_is_rechecked(world: RemoteWorld, args: str, error: str) -> None:
@@ -225,8 +228,8 @@ def test_the_pane_is_rechecked(world: RemoteWorld, args: str, error: str) -> Non
 
 def test_a_plain_shell_gets_single_lines_only_with_send_to_any_pane(world: RemoteWorld) -> None:
     forced = [*FORCED, "--send-to-any-pane"]
-    assert send(world, "make test", f"%2 {SHELL_PID} none", forced)["ok"] is True
-    assert send(world, "make\nrm -rf /", f"%2 {SHELL_PID} none", forced)["error"] == "bad_text"
+    assert send(world, "make test", f"%2 {SHELL_PID} none message", forced)["ok"] is True
+    assert send(world, "make\nrm -rf /", f"%2 {SHELL_PID} none message", forced)["error"] == "bad_text"
     assert_fixed_shapes(world, "%2")
 
 
@@ -248,16 +251,100 @@ def test_a_registry_permission_wait_is_refused(world: RemoteWorld) -> None:
     assert not typed(world)
 
 
+def answer(dialog: str | None) -> str:
+    """The send arguments of a permission answer to the dialog of `dialog` (a screen)."""
+    return f"%1 {CLAUDE_PID} {SESSION_A} answer {(d.dialog_hash(dialog) if dialog else None) or 'none'}"
+
+
 def test_permission_answers_are_a_choice_digit_without_enter(world: RemoteWorld) -> None:
     world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})
     forced = [*FORCED, "--allow-permission-answers"]
-    assert send(world, "yes", forced=forced)["error"] == "permission_prompt"
-    assert send(world, "12", forced=forced)["error"] == "permission_prompt"
+    assert send(world, "yes", answer(DIALOG), forced=forced)["error"] == "permission_prompt"
+    assert send(world, "12", answer(DIALOG), forced=forced)["error"] == "permission_prompt"
+    assert send(world, "1", answer(DIALOG))["error"] == "permission_prompt", "needs --allow-permission-answers"
     assert not typed(world)
-    out = send(world, "1", forced=forced)
+    out = send(world, "1", answer(DIALOG), forced=forced)
     assert out == {"protocol": 1, "ok": True, "sent": True, "bytes": 1, "enter": False}
     assert stdin_of(world, "load-buffer") == ["1"]
     assert not any(argv[0] == "send-keys" for argv in tmux_argvs(world))
+
+
+DIALOG_B = DIALOG.replace("git push origin main", "rm -rf build/      ")
+ANSWERS = [*FORCED, "--allow-permission-answers"]
+
+
+def test_a_message_never_goes_into_a_dialog_even_with_permission_answers_on(world: RemoteWorld) -> None:
+    """The owner confirmed a message (no dialog when it was read back); a dialog that opened since
+    takes no digit as its answer."""
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})
+    assert send(world, "1", forced=ANSWERS) == {"protocol": 1, "ok": False, "error": "permission_prompt"}
+    assert not typed(world)
+
+
+def test_an_answer_goes_only_into_the_dialog_it_was_read_back_for(world: RemoteWorld) -> None:
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG_B})
+    assert send(world, "1", answer(DIALOG), forced=ANSWERS) == {"protocol": 1, "ok": False, "error": "dialog_changed"}
+    assert not typed(world)
+    assert send(world, "1", answer(DIALOG_B), forced=ANSWERS)["ok"] is True
+
+
+def test_an_answer_whose_dialog_closed_is_not_typed_as_a_prompt(world: RemoteWorld) -> None:
+    assert send(world, "1", answer(DIALOG), forced=ANSWERS) == {"protocol": 1, "ok": False, "error": "dialog_changed"}
+    assert send(world, "1", answer(None), forced=ANSWERS)["error"] == "dialog_changed"
+    assert not typed(world)
+
+
+def test_an_answer_to_a_registry_only_wait_is_bound_to_no_dialog_on_screen(world: RemoteWorld) -> None:
+    world.register(
+        "2001", os.getpid(), sessionId=SESSION_A, status="waiting", waitingFor="permission prompt", tmux="0:@0.%1"
+    )
+    assert send(world, "1", answer(DIALOG), forced=ANSWERS)["error"] == "dialog_changed"
+    assert send(world, "2", answer(None), forced=ANSWERS)["ok"] is True
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})
+    assert send(world, "1", answer(None), forced=ANSWERS)["error"] == "dialog_changed", "a dialog appeared since"
+    assert stdin_of(world, "load-buffer") == ["2"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        f"%1 {CLAUDE_PID} {SESSION_A}",  # the 0.2.0 form: no mode
+        f"%1 {CLAUDE_PID} {SESSION_A} reply",
+        f"%1 {CLAUDE_PID} {SESSION_A} message none",
+        f"%1 {CLAUDE_PID} {SESSION_A} answer",
+        f"%1 {CLAUDE_PID} {SESSION_A} answer 1234",
+        f"%1 {CLAUDE_PID} {SESSION_A} answer {'A' * 24}",
+        f"%1 {CLAUDE_PID} {SESSION_A} answer {'a' * 24} x",
+    ],
+)
+def test_the_send_mode_is_validated(world: RemoteWorld, args: str) -> None:
+    assert send(world, "1", args, forced=ANSWERS) == {"protocol": 1, "ok": False, "error": "bad_request"}
+    assert tmux_argvs(world) == []
+
+
+def test_the_dialog_hash_covers_the_dialog_block_only() -> None:
+    plain = d.dialog_hash(DIALOG)
+    assert plain is not None
+    assert d.DIALOG_HASH_RE.fullmatch(plain)
+    framed = "⏺ I will push now.\n" + DIALOG.replace("│ ", "│    ") + "  ? for shortcuts\n"
+    assert d.dialog_hash(framed) == plain, "text around the box and the box width do not count"
+    assert d.dialog_hash(DIALOG_B) != plain
+    assert d.dialog_hash(DIALOG.replace("2. No, and tell Claude", "2. Yes, and don't ask")) != plain
+    assert d.dialog_hash(EMPTY_BOX) is None
+    broad = "⏺ Pick one:\n 1. Yes, rewrite it\n 2. No, keep it\n> "
+    assert d.dialog_hash(broad) is not None, "every screen shows_dialog accepts has a hash"
+
+
+def test_race_guard_a_claude_code_restart_between_paste_and_enter_gets_no_enter(world: RemoteWorld) -> None:
+    registry = os.path.join(world.home, ".claude", "sessions", "2001.json")
+    restarted = {"pid": os.getpid(), "sessionId": SESSION_B, "status": "idle", "tmux": "0:@0.%1"}
+    world.set_panes(
+        [pane("fpga", "%1", CLAUDE_PID, command="claude")],
+        {"%1": EMPTY_BOX},
+        afterPaste={"write": {registry: restarted}},
+    )
+    assert send(world, "run the tests") == {"protocol": 1, "ok": False, "error": "pasted_no_enter"}
+    assert "send-keys" not in [argv[0] for argv in tmux_argvs(world)]
 
 
 def test_race_guard_a_dialog_that_opens_after_the_paste_gets_no_enter(world: RemoteWorld) -> None:
@@ -326,7 +413,7 @@ def test_the_script_reads_the_text_from_its_stdin(world: RemoteWorld) -> None:
     env = {
         **world.tmux_env(),
         "PATH": "/usr/bin:/bin",
-        "SSH_ORIGINAL_COMMAND": f"switchboard-remote send %1 {CLAUDE_PID} {SESSION_A}",
+        "SSH_ORIGINAL_COMMAND": f"switchboard-remote send %1 {CLAUDE_PID} {SESSION_A} message",
     }
     done = subprocess.run(
         [sys.executable, "-I", DISPATCHER, *FORCED],

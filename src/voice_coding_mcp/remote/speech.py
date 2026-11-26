@@ -270,6 +270,7 @@ def format_readback(item: Confirmation, *, question: str | None, dropped: Sequen
 _NOT_SENT: dict[str, str] = {
     "gone": "Not sent: the pane is gone.",
     "changed": "Not sent: that pane now runs a different session.",
+    "dialog_changed": "Not sent: the permission question you answered is no longer on that screen.",
     "draft_present": "Not sent: something is already typed in that session's input.",
     "vim_normal": "Not sent: that session's input is in vim normal mode, so the text would be read as commands.",
     "not_claude": "Not sent: switchboard-remote on {machine} does not allow typing into panes without Claude Code.",

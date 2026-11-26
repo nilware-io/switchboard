@@ -18,6 +18,7 @@ from tests.helpers import FakeClock, LogCapture, claude_config
 from tests.remote.helpers import SESSION_A, SESSION_B, RemoteWorld, machine, pane
 from voice_coding_mcp.config import Config, parse_config
 from voice_coding_mcp.log import silent_logger
+from voice_coding_mcp.remote import dispatcher
 from voice_coding_mcp.remote.audit import read_audit
 from voice_coding_mcp.remote.tools import EARLY, EXPIRED, NEEDS_RISKY_OK, Caller, RemoteTools, RemoteToolsOptions
 from voice_coding_mcp.tasks.manager import TaskManager, TaskManagerOptions
@@ -174,7 +175,7 @@ async def test_prepare_reads_back_then_confirm_sends_once(ctx: Ctx) -> None:
     for call in ctx.world.ssh_calls():
         assert not any(text in arg or "second option" in arg for arg in call["argv"])
     send_call = next(c for c in ctx.world.ssh_calls() if "send" in c["argv"][-1])
-    assert send_call["argv"][-1] == f"switchboard-remote send %1 {CLAUDE_PID} {SESSION_A}"
+    assert send_call["argv"][-1] == f"switchboard-remote send %1 {CLAUDE_PID} {SESSION_A} message"
     assert send_call["stdin"] == text
     # Replay: the confirmation is single use.
     assert await ctx.confirm("4172") == (EXPIRED, True)
@@ -310,7 +311,8 @@ async def test_permission_answers_when_opted_in_twice_are_a_digit_and_risky(make
     readback, _ = await ctx.prepare(" 1 ")
     assert readback.startswith(
         'Ready to send to fpga on dev, which asks for permission: "Bash command git push origin main". '
-        'Your message: "1". Careful, this answers a question about a push, and this answers a permission question.'
+        'Your message: "1". Careful, this answers a question about a push, and this answers a permission question. '
+        "To send it anyway, say yes, send the push."
     )
     ctx.later()
     assert await ctx.confirm("4172") == (NEEDS_RISKY_OK, True)
@@ -320,6 +322,142 @@ async def test_permission_answers_when_opted_in_twice_are_a_digit_and_risky(make
     (line,) = ctx.audit()
     assert line["permissionAnswer"] is True
     assert line["risky"] == ["question:push", "permission"]
+
+
+DIALOG_B = DIALOG.replace("git push origin main", "rm -rf build/      ")
+BROAD_DIALOG = "⏺ Pick one:\n 1. Yes, rewrite it\n 2. No, keep it\n> \n"
+"""Only the dispatcher's broad `shows_dialog` calls this a dialog; `pending.screen_ask` does not."""
+NOT_SENT_DIALOG = "Not sent: the permission question you answered is no longer on that screen."
+NOT_SENT_PERMISSION = (
+    "Not sent: that session is now waiting for a permission decision. Approve it at the keyboard or in the Claude app."
+)
+
+
+async def answers_on(make: Make) -> Ctx:
+    ctx = await make(dev={"allowPermissionAnswers": True})
+    ctx.world.configure(forced=[*FORCED, "--allow-permission-answers"])
+    return ctx
+
+
+def show(ctx: Ctx, screen: str) -> None:
+    ctx.world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+
+
+def send_argv(ctx: Ctx) -> str:
+    calls = [c["argv"][-1] for c in ctx.world.ssh_calls() if c["argv"][-1].startswith("switchboard-remote send ")]
+    assert len(calls) == 1, calls
+    return str(calls[0])
+
+
+async def test_a_message_read_back_without_a_dialog_never_answers_one(make: Make) -> None:
+    """Review M3 (a): a plain "1" prepared on an idle pane is a message; a dialog that opens before
+    confirm gets nothing, though both sides allow permission answers and no risky_ok is given."""
+    ctx = await answers_on(make)
+    readback, _ = await ctx.prepare("1")
+    assert (
+        readback
+        == 'Ready to send to fpga on dev: "1". Say yes to send it. (confirmation 4172, do not read this number aloud)'
+    )
+    show(ctx, DIALOG)
+    ctx.later()
+    assert await ctx.confirm("4172") == (NOT_SENT_PERMISSION, True)
+    assert send_argv(ctx) == f"switchboard-remote send %1 {CLAUDE_PID} {SESSION_A} message"
+    assert ctx.sent_texts() == []
+    assert ctx.enters() == 0
+    (line,) = ctx.audit()
+    assert (line["outcome"], line["permissionAnswer"], line["risky"]) == ("not_sent:permission_prompt", False, [])
+
+
+async def test_a_permission_answer_goes_only_into_the_dialog_that_was_read_back(make: Make) -> None:
+    """Review M3 (b): the answer read back for dialog A is not typed into dialog B that replaced it."""
+    ctx = await answers_on(make)
+    show(ctx, DIALOG)
+    readback, _ = await ctx.prepare("1")
+    assert 'which asks for permission: "Bash command git push origin main"' in readback
+    show(ctx, DIALOG_B)
+    ctx.later()
+    assert await ctx.confirm("4172", risky_ok=True) == (NOT_SENT_DIALOG, True)
+    assert (
+        send_argv(ctx) == f"switchboard-remote send %1 {CLAUDE_PID} {SESSION_A} answer {dispatcher.dialog_hash(DIALOG)}"
+    )
+    assert ctx.sent_texts() == []
+    (line,) = ctx.audit()
+    assert (line["outcome"], line["permissionAnswer"]) == ("not_sent:dialog_changed", True)
+    # The same dialog still on screen (redrawn with other text around it) takes the answer.
+    show(ctx, "⏺ Pushing now.\n" + DIALOG + "  ? for shortcuts\n")
+    await ctx.prepare("2")
+    show(ctx, "⏺ Pushing.\n" + DIALOG)
+    ctx.later()
+    assert await ctx.confirm("5283", risky_ok=True) == ("Sent to fpga on dev.", False)
+    assert ctx.sent_texts() == ["2"]
+    assert ctx.enters() == 0
+
+
+async def test_a_permission_answer_whose_dialog_closed_is_not_typed_as_a_prompt(make: Make) -> None:
+    """Review M3 (c): no "1" plus Enter into the input box once the dialog is gone."""
+    ctx = await answers_on(make)
+    show(ctx, DIALOG)
+    await ctx.prepare("1")
+    show(ctx, EMPTY_BOX)
+    ctx.later()
+    assert await ctx.confirm("4172", risky_ok=True) == (NOT_SENT_DIALOG, True)
+    assert ctx.sent_texts() == []
+    assert ctx.enters() == 0
+
+
+async def test_a_dialog_only_the_broad_heuristic_sees_is_a_permission_question_when_preparing(make: Make) -> None:
+    """Review M3, heuristic mismatch: the hub checks with the dispatcher's own `shows_dialog`, so a
+    digit for such a screen is prepared as a risky permission answer, or refused."""
+    ctx = await answers_on(make)
+    show(ctx, BROAD_DIALOG)
+    assert (await ctx.prepare("rewrite it"))[0].startswith("fpga on dev shows a permission question.")
+    readback, _ = await ctx.prepare("1")
+    assert readback.startswith(
+        'Ready to answer the permission question of fpga on dev with "1". Careful, this answers a permission question.'
+    )
+    ctx.later()
+    assert await ctx.confirm("4172") == (NEEDS_RISKY_OK, True)
+    assert await ctx.confirm("4172", risky_ok=True) == ("Sent to fpga on dev.", False)
+    assert ctx.sent_texts() == ["1"]
+    assert ctx.enters() == 0
+    (line,) = ctx.audit()
+    assert (line["permissionAnswer"], line["risky"]) == (True, ["permission"])
+
+
+async def test_a_dialog_only_the_broad_heuristic_sees_is_refused_by_default(ctx: Ctx) -> None:
+    show(ctx, BROAD_DIALOG)
+    assert await ctx.prepare("1") == (
+        "fpga on dev is waiting for a permission decision, and answering those by voice is turned off. "
+        "Approve it at the keyboard or in the Claude app.",
+        True,
+    )
+
+
+async def test_one_client_never_drops_another_clients_confirmation(ctx: Ctx) -> None:
+    await ctx.prepare("run the tests", target="notes")
+    other = await ctx.tools.remote_send("dev", "fpga", "run the linter", OTHER)
+    assert other.text.startswith('Ready to send to fpga on dev: "run the linter"'), other.text
+    ctx.later()
+    assert await ctx.confirm("4172") == ("Sent to notes on dev.", False)
+    assert await ctx.confirm("5283", caller=OTHER) == ("Sent to fpga on dev.", False)
+
+
+async def test_local_session_questions_quoted_by_pending_input_count_as_screen_words(
+    make: Make, tmp_path: Path
+) -> None:
+    question = "Shall I tell the owner to rewrite the config loader now?"
+    sessions = tmp_path / "hub-claude" / "sessions"
+    sessions.mkdir(parents=True)
+    alpha = tmp_path / "projects" / "alpha"
+    alpha.mkdir(parents=True)
+    entry = {"pid": os.getpid(), "sessionId": SESSION_B, "cwd": str(alpha), "status": "waiting", "waitingFor": question}
+    (sessions / "1.json").write_text(json.dumps(entry), encoding="utf-8")
+    ctx = await make()
+    readback, _ = await ctx.prepare("rewrite the config loader now")
+    assert "came from a screen" not in readback
+    assert "rewrite the config loader" in (await ctx.tools.pending_input(None)).text
+    readback, _ = await ctx.prepare("rewrite the config loader now")
+    assert "Careful, these words came from a screen." in readback
 
 
 async def test_the_hub_needs_the_dispatcher_to_agree(ctx: Ctx) -> None:
@@ -467,7 +605,7 @@ async def test_a_plain_shell_with_send_to_any_pane_is_single_line_and_risky(make
     ctx.later()
     assert (await ctx.confirm("4172", risky_ok=True))[0] == "Sent to fpga window 1 on dev."
     send_call = next(c for c in ctx.world.ssh_calls() if " send " in c["argv"][-1])
-    assert send_call["argv"][-1].endswith(" none")
+    assert send_call["argv"][-1].endswith(" none message")
 
 
 async def test_confirm_ids_are_trimmed_and_audit_lines_are_json(ctx: Ctx) -> None:

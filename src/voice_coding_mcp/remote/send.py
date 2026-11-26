@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ..clock import SECOND_MS
-from .dispatcher import PERMISSION_ANSWER_RE, text_problem
+from .dispatcher import PERMISSION_ANSWER_RE, dialog_hash, shows_dialog, text_problem
 
 __all__ = [
     "PERMISSION_ANSWER_RE",
@@ -25,7 +25,9 @@ __all__ = [
     "ConfirmationStore",
     "RiskClassifier",
     "ScreenEcho",
+    "dialog_hash",
     "normalize_text",
+    "shows_dialog",
     "text_problem",
 ]
 
@@ -146,9 +148,10 @@ def risk_words(reasons: Sequence[str]) -> str:
 
 
 def yes_phrase(reasons: Sequence[str]) -> str:
-    """What the owner says to confirm the risky part: "yes, send the push"."""
+    """What the owner says to confirm the risky part: "yes, send the push". The first code with a rule
+    names it, also as the question's code (`question:push`)."""
     for code in reasons:
-        rule = _rule_of(code)
+        rule = _rule_of(code.removeprefix(QUESTION_PREFIX))
         if rule is not None:
             return f"yes, {rule.yes}"
     return "yes, send it anyway"
@@ -219,6 +222,9 @@ class Confirmation:
     text: str
     risky: tuple[str, ...]
     permission_answer: bool
+    dialog: str | None
+    """For a permission answer: `dispatcher.dialog_hash` of the dialog the read-back quoted (None: a
+    registry-only permission wait). The dispatcher types the digit only into that dialog."""
     created_ms: int
     expires_ms: int
 
@@ -226,9 +232,14 @@ class Confirmation:
 LookupProblem = Literal["unknown", "expired", "mismatch", "early"]
 
 
+MAX_TOTAL_PENDING = 64
+"""All clients together; beyond it the oldest of any client is dropped (memory bound only)."""
+
+
 class ConfirmationStore:
-    """At most `max_pending` confirmations; a new one beyond that drops the oldest. Ids are 4-digit
-    numbers, unique among live confirmations: not secrets, they bind a confirm call to one read-back."""
+    """At most `max_pending` confirmations per OAuth client; a new one beyond that drops that client's
+    oldest, never another client's. Ids are 4-digit numbers, unique among live confirmations: not
+    secrets, they bind a confirm call to one read-back."""
 
     def __init__(
         self,
@@ -265,13 +276,17 @@ class ConfirmationStore:
         text: str,
         risky: Sequence[str],
         permission_answer: bool,
+        dialog: str | None = None,
     ) -> tuple[Confirmation, list[Confirmation]]:
-        """The new confirmation and the ones it dropped (oldest first)."""
+        """The new confirmation and the ones of the same client it dropped (oldest first)."""
         self._expire()
         dropped: list[Confirmation] = []
-        while len(self._items) >= self._max:
-            oldest = min(self._items.values(), key=lambda item: item.created_ms)
+        while (mine := [item for item in self._items.values() if item.client == client]) and len(mine) >= self._max:
+            oldest = min(mine, key=lambda item: item.created_ms)
             dropped.append(self._items.pop(oldest.id))
+        while len(self._items) >= MAX_TOTAL_PENDING:
+            oldest = min(self._items.values(), key=lambda item: item.created_ms)
+            del self._items[oldest.id]
         new_id = self._new_id()
         for _ in range(100):
             if new_id not in self._items:
@@ -291,6 +306,7 @@ class ConfirmationStore:
             text=text,
             risky=tuple(risky),
             permission_answer=permission_answer,
+            dialog=dialog,
             created_ms=now,
             expires_ms=now + self._ttl_ms,
         )

@@ -23,8 +23,9 @@ Policy options: --sessions <globs> (comma separated, required), --allow-usage, -
 --allow-permission-answers, --send-to-any-pane, --slash-commands <names>, --claude-home <path>.
 Test only (refused unless SWITCHBOARD_REMOTE_TEST=1 is in the environment): --tmux-socket-name.
 
-Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none>` (text
-on stdin, only with --allow-send). Every response is one JSON document on stdout,
+Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none> message`
+or `send <paneId> <panePid> <sessionId|none> answer <dialogHash|none>` (text on stdin, only with
+--allow-send; the mode says what the owner confirmed: a message, or the answer to one permission dialog). Every response is one JSON document on stdout,
 `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`; the exit
 code is 0 also for refusals. Nothing from the request ever reaches a shell: tmux runs from argv with
 a fixed environment, and the text of a send reaches tmux only on the stdin of `load-buffer`.
@@ -33,6 +34,7 @@ a fixed environment, and the text of a send reaches tmux only on the stdin of `l
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -44,7 +46,7 @@ import subprocess
 import sys
 import unicodedata
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PROTOCOL = 1
 VERBS = ("version", "list", "capture", "send")
 PROGRAM = "switchboard-remote"
@@ -64,6 +66,13 @@ SEND_NO_SESSION = "none"
 """The `sessionId` argument of a send to a pane that runs no Claude Code (`-` would read as an option)."""
 PERMISSION_ANSWER_RE = re.compile(r"[1-9]")
 """The only text accepted for a pane that shows a permission dialog (a choice number)."""
+SEND_MESSAGE = "message"
+SEND_ANSWER = "answer"
+"""The send modes: a message (never into a dialog) or a permission answer (only into the dialog the
+owner heard, identified by `dialog_hash`)."""
+DIALOG_HASH_RE = re.compile(r"[0-9a-f]{24}")
+NO_DIALOG = "none"
+"""The dialog hash of a permission wait that only the registry shows (nothing on the screen)."""
 
 MAX_SESSION_GLOBS = 64
 MAX_LINES = 500
@@ -211,17 +220,51 @@ def _screen_tail(screen: str) -> list[str]:
     return [line for line in lines if line][-CHECK_TAIL:]
 
 
+_BORDER_RE = re.compile(r"[\u2500-\u257f\s_-]+")
+_ANY_OPTION_RE = re.compile(r"(?:[❯>›▶]\s*)?[1-9][.)]\s")
+DIALOG_TITLE_LINES = 6
+DIALOG_BODY_LINES = 12
+
+
+def _dialog_anchor(tail: list[str]) -> int | None:
+    """The index in `tail` of the line `shows_dialog` recognises, or None."""
+    for index, line in enumerate(tail):
+        if _DIALOG_QUESTION_RE.match(line):
+            return index
+        if _YES_OPTION_RE.match(line) and any(_NO_OPTION_RE.match(other) for other in tail[index + 1 : index + 7]):
+            return index
+    return None
+
+
 def shows_dialog(screen: str) -> bool:
     """A permission dialog may be on the screen: a line that starts with "Do you want to ...?", or a
     `1. Yes` option followed within 6 lines by a `2.`..`9.` `No` option. Broader than the hub's
-    heuristic on purpose: a missed dialog would let Enter select its highlighted option."""
+    `pending_input` heuristic on purpose: a missed dialog would let Enter select its highlighted
+    option. The hub runs this same function when it prepares a send."""
+    return _dialog_anchor(_screen_tail(screen)) is not None
+
+
+def dialog_hash(screen: str) -> str | None:
+    """What identifies the dialog `shows_dialog` sees, so a permission answer goes only into the
+    dialog the owner heard: a hash of the dialog block (up to DIALOG_TITLE_LINES lines above the
+    recognised line, stopping at a border, through the last numbered option after it), each line
+    cleaned and with its whitespace collapsed. None when no dialog is on the screen. Hub and
+    dispatcher run this function on the same kind of capture."""
     tail = _screen_tail(screen)
-    for index, line in enumerate(tail):
-        if _DIALOG_QUESTION_RE.match(line):
-            return True
-        if _YES_OPTION_RE.match(line) and any(_NO_OPTION_RE.match(other) for other in tail[index + 1 : index + 7]):
-            return True
-    return False
+    anchor = _dialog_anchor(tail)
+    if anchor is None:
+        return None
+    start = anchor
+    while start > 0 and anchor - start < DIALOG_TITLE_LINES and not _BORDER_RE.fullmatch(tail[start - 1]):
+        start -= 1
+    end = anchor
+    for index in range(anchor + 1, min(len(tail), anchor + 1 + DIALOG_BODY_LINES)):
+        if _BORDER_RE.fullmatch(tail[index]):
+            break
+        if _ANY_OPTION_RE.match(tail[index]):
+            end = index
+    block = "\n".join(" ".join(clean_text(line, 400).split()) for line in tail[start : end + 1])
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()[:24]
 
 
 def shows_draft(screen: str) -> bool:
@@ -398,9 +441,17 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
         if not 1 <= int(args[1]) <= MAX_LINES:
             raise RefusedError("bad_request")
     if verb == "send":
-        if len(args) != 3 or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
+        if len(args) not in (4, 5) or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
             raise RefusedError("bad_request")
         if args[2] != SEND_NO_SESSION and not UUID_RE.fullmatch(args[2]):
+            raise RefusedError("bad_request")
+        if args[3] == SEND_MESSAGE:
+            if len(args) != 4:
+                raise RefusedError("bad_request")
+        elif args[3] == SEND_ANSWER:
+            if len(args) != 5 or (args[4] != NO_DIALOG and not DIALOG_HASH_RE.fullmatch(args[4])):
+                raise RefusedError("bad_request")
+        else:
             raise RefusedError("bad_request")
     return verb, args
 
@@ -706,32 +757,44 @@ def _asks_permission(entry: dict[str, object] | None, screen: str) -> bool:
     return shows_dialog(screen)
 
 
+def _same_session(entry: dict[str, object] | None, session_id: str) -> bool:
+    """The pane still runs the Claude Code session the hub saw (or still none)."""
+    if session_id == SEND_NO_SESSION:
+        return entry is None
+    return entry is not None and entry.get("sessionId") == session_id
+
+
 def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: object) -> dict[str, object]:
     """Types the text from stdin into a pane and presses Enter, after rechecking everything the hub
-    checked when it prepared the send. See docs/SWITCHBOARD.md, "The dispatcher"."""
+    checked when it prepared the send. See docs/SWITCHBOARD.md, "The dispatcher".
+
+    The mode binds what the owner confirmed: a `message` is refused while a permission dialog shows
+    (`permission_prompt`), and an `answer` is typed only while the same dialog shows that the hub
+    read back (`dialog_changed` otherwise)."""
     if not policy.allow_send:
         raise RefusedError("not_allowed")
-    pane_id, pane_pid, session_id = args
+    pane_id, pane_pid, session_id, mode = args[:4]
     text = read_send_text(stdin)
     pane, entry, screen = _send_state(policy, env, pane_id)
     if pane is None:
         raise RefusedError("gone")
     if pane["pane_pid"] != pane_pid:
         raise RefusedError("changed")
-    if session_id == SEND_NO_SESSION:
-        if entry is not None:
-            raise RefusedError("changed")
-        if not policy.send_to_any_pane:
-            raise RefusedError("not_claude")
-    elif entry is None or entry.get("sessionId") != session_id:
+    if not _same_session(entry, session_id):
         raise RefusedError("changed")
+    if session_id == SEND_NO_SESSION and not policy.send_to_any_pane:
+        raise RefusedError("not_claude")
     if text_problem(text, claude_pane=entry is not None, slash_commands=policy.slash_commands) is not None:
         raise RefusedError("bad_text")
-    permission_answer = False
-    if _asks_permission(entry, screen):
+    permission_answer = mode == SEND_ANSWER
+    asks = _asks_permission(entry, screen)
+    if permission_answer:
         if not policy.allow_permission_answers or not PERMISSION_ANSWER_RE.fullmatch(text):
             raise RefusedError("permission_prompt")
-        permission_answer = True
+        if not asks or (dialog_hash(screen) or NO_DIALOG) != args[4]:
+            raise RefusedError("dialog_changed")
+    elif asks:
+        raise RefusedError("permission_prompt")
     elif entry is not None:
         if shows_draft(screen):
             raise RefusedError("draft_present")
@@ -749,9 +812,15 @@ def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: objec
     if permission_answer:
         # A choice number selects in Claude Code's dialog; Enter could answer the next one.
         return {"sent": True, "bytes": len(data), "enter": False}
-    # Race guard: a dialog that opened since the first check would take the Enter as "Yes".
+    # Race guard: a dialog that opened since the first check would take the Enter as "Yes", and a
+    # Claude Code restarted in the same shell is not the session the owner confirmed.
     pane, entry, screen = _send_state(policy, env, pane_id)
-    if pane is None or pane["pane_pid"] != pane_pid or _asks_permission(entry, screen):
+    if (
+        pane is None
+        or pane["pane_pid"] != pane_pid
+        or not _same_session(entry, session_id)
+        or _asks_permission(entry, screen)
+    ):
         raise RefusedError("pasted_no_enter")
     code, _, _ = run_tmux(["send-keys", "-t", pane_id, "Enter"], policy, env)
     if code != 0:

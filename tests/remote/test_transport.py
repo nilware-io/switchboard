@@ -253,7 +253,7 @@ async def test_local_transport_sends_with_the_hub_policy_and_stdin(world: Remote
     local = make_transport(machine, remote, str(world.root / "state"), {**world.tmux_env(), "PATH": "/usr/bin:/bin"})
     assert isinstance(local, LocalTransport)
     assert local.policy_args()[-4:] == ["--allow-usage", "--allow-send", "--slash-commands", "compact"]
-    result = await local.call("send", ["%1", "1", SESSION_A], timeout_seconds=10, stdin=b"/compact now")
+    result = await local.call("send", ["%1", "1", SESSION_A, "message"], timeout_seconds=10, stdin=b"/compact now")
     assert isinstance(result.data, SendResponse), result
     assert result.data.sent is True
     assert result.data.bytes == 12
@@ -266,9 +266,9 @@ async def test_ssh_send_passes_the_text_on_stdin_only(world: RemoteWorld) -> Non
     world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
     text = 'it\'s "quoted" $(and) `this`; rm -rf ~\nsecond line'
     ssh = transport(world)
-    argv = ssh.argv("send", ["%1", "1", SESSION_A])
-    assert argv[-1] == f"switchboard-remote send %1 1 {SESSION_A}"
-    result = await ssh.call("send", ["%1", "1", SESSION_A], timeout_seconds=10, stdin=text.encode())
+    argv = ssh.argv("send", ["%1", "1", SESSION_A, "message"])
+    assert argv[-1] == f"switchboard-remote send %1 1 {SESSION_A} message"
+    result = await ssh.call("send", ["%1", "1", SESSION_A, "message"], timeout_seconds=10, stdin=text.encode())
     assert isinstance(result.data, SendResponse), result
     (call,) = world.ssh_calls()
     assert call["stdin"] == text
@@ -276,5 +276,7 @@ async def test_ssh_send_passes_the_text_on_stdin_only(world: RemoteWorld) -> Non
 
 
 async def test_a_refusal_before_reading_stdin_does_not_break_the_call(world: RemoteWorld) -> None:
-    result = await transport(world).call("send", ["%1", "1", SESSION_A], timeout_seconds=10, stdin=b"x" * 9000)
+    result = await transport(world).call(
+        "send", ["%1", "1", SESSION_A, "message"], timeout_seconds=10, stdin=b"x" * 9000
+    )
     assert (result.error, result.detail) == ("refused_by_policy", "not_allowed")

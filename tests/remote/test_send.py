@@ -121,7 +121,9 @@ def test_context_makes_harmless_words_risky() -> None:
         "this answers a permission question, and this types into a plain shell, not into Claude Code"
     )
     assert yes_phrase(["push"]) == "yes, send the push"
-    assert yes_phrase(["question:push"]) == "yes, send it anyway"
+    assert yes_phrase(["question:push"]) == "yes, send the push", "a question's code names its rule too"
+    assert yes_phrase(["question:custom", "echo"]) == "yes, send it anyway"
+    assert yes_phrase(["delete", "question:push"]) == "yes, send it anyway", "the first code with a rule wins"
     assert risk_words(["push"]) == "this asks for a push"
 
 
@@ -202,7 +204,7 @@ def test_a_new_confirmation_drops_the_oldest_beyond_max_pending() -> None:
     second = add(s)
     clock.t += 1
     third, dropped = s.add(
-        client="c",
+        client="len=8 sha256=aaaa",
         client_name=None,
         machine="dev",
         session="fpga",
@@ -219,6 +221,34 @@ def test_a_new_confirmation_drops_the_oldest_beyond_max_pending() -> None:
     assert len(s) == 2
     assert s.check(first, "len=8 sha256=aaaa") == "unknown"
     assert {second, third.id} == {"2222", "3333"}
+
+
+def test_max_pending_counts_per_client_so_one_client_never_drops_another() -> None:
+    clock = FakeClock(T0)
+    s = store(clock, max_pending=1, min_confirm_seconds=0)
+    first = add(s, client="len=8 sha256=aaaa", place="notes on dev")
+    clock.t += 1
+    other, dropped = s.add(
+        client="len=8 sha256=bbbb",
+        client_name=None,
+        machine="dev",
+        session="fpga",
+        place="fpga on dev",
+        pane_id="%1",
+        pane_pid=42,
+        session_id=None,
+        text="x",
+        risky=[],
+        permission_answer=False,
+    )
+    assert dropped == [], "the second client's read-back names nothing of the first client"
+    assert isinstance(s.check(first, "len=8 sha256=aaaa"), Confirmation)
+    assert isinstance(s.check(other.id, "len=8 sha256=bbbb"), Confirmation)
+    clock.t += 1
+    again = add(s, client="len=8 sha256=aaaa")
+    assert s.check(first, "len=8 sha256=aaaa") == "unknown", "a client's own oldest is dropped"
+    assert isinstance(s.check(again, "len=8 sha256=aaaa"), Confirmation)
+    assert isinstance(s.check(other.id, "len=8 sha256=bbbb"), Confirmation)
 
 
 def test_ids_are_four_digits_and_unique_among_live_ones() -> None:
