@@ -8,14 +8,16 @@ to 40 characters.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
-from ..text import plural
+from ..text import clip, plural
 from .inventory import MachineView
+from .menu import ScreenMenu
 from .pending import PendingEntry, PendingReport, waits_for_permission
 from .protocol import ClaudeInfo, PaneInfo
 from .redact import clean_name, redact
-from .send import Confirmation, risk_words, yes_phrase
+from .send import KEYS, RESIZE, Confirmation, key_words, risk_words, yes_phrase
 from .targets import Ambiguous, NoTarget, NotFound
 from .transport import TransportError
 
@@ -119,13 +121,108 @@ def status_fact(pane: PaneInfo) -> str:
     return f"{claude_label(pane)} is {state_words(pane.claude)}."
 
 
-def format_status(label: str, pane: PaneInfo, *, summary: str | None, line: str | None) -> str:
+MENU_WORDS_MAX = 400
+MENU_WORDS_DETAILED_MAX = 600
+"""The heuristic status names each option's description too, within this many characters."""
+MENU_AFTER_SUMMARY_MAX = 200
+"""After a model summary only the options, within this many characters."""
+DESCRIPTION_WORDS_MAX = 60
+
+
+def _option_words(menu: ScreenMenu, limit: int, used: int, details: bool) -> tuple[list[str], bool]:
+    """(the spoken options within `limit`, with "and N more" when cut; whether all fit)."""
+    parts: list[str] = []
+    for index, (number, text) in enumerate(menu.options):
+        item = (f"{number} " if menu.numbered else "") + quote(redact(text))
+        description = menu.descriptions[index] if details and index < len(menu.descriptions) else None
+        if description:
+            item += f" (details: {quote(clip(redact(description), DESCRIPTION_WORDS_MAX))})"
+        item += ", selected" if number == menu.selected else ""
+        if parts and used + len(item) + 2 > limit:
+            parts.append(f"and {len(menu.options) - index} more")
+            return parts, False
+        parts.append(item)
+        used += len(item) + 2
+    return parts, True
+
+
+def menu_words(
+    menu: ScreenMenu, limit: int = MENU_WORDS_MAX, *, hints: bool = True, details: bool = False, question: bool = True
+) -> str:
+    """'A menu on the screen asks: "<question>". Options: 1 "Small", selected; 2 "Medium".' (a menu
+    without numbers: '"Small", selected; "Medium"'), the options cut (with "and N more") so the
+    whole stays within about `limit` characters, then the unusual key hints unless `hints` is off.
+    With `details`, each option's description in short ('1 "A" (details: "...")'), dropped again
+    when then not every option fits. Without `question`: 'The menu's options: ...'. Screen text, so
+    quoted and redacted."""
+    if not question:
+        head = "The menu's options:"
+    elif menu.question:
+        head = f"A menu on the screen asks: {quote(redact(menu.question))}. Options:"
+    else:
+        head = "The screen shows a menu. Options:"
+    used = len(head) + 1
+    parts, fits = _option_words(menu, limit, used, details)
+    if details and not fits:
+        parts, _ = _option_words(menu, limit, used, False)
+    hints_said = footer_words(menu.footer) if hints else None
+    tail = f" Its key hints also say: {quote(hints_said)}." if hints_said else ""
+    return f"{head} {'; '.join(parts)}.{tail}"
+
+
+FOOTER_WORDS_MAX = 120
+_HINT_SPLIT_RE = re.compile(r"\s*(?:·|•|\||\s{2,})\s*")
+_USUAL_HINT_RE = re.compile(r"(?:↑\s*/?\s*↓|(?:enter|return|esc|escape)\b)", re.I)
+_ARROW_WORDS = (("↑/↓", "up/down"), ("←/→", "left/right"), ("↑", "up"), ("↓", "down"), ("←", "left"), ("→", "right"))
+
+
+def footer_words(footer: str | None) -> str | None:
+    """The key hints of a menu footer beyond the usual up/down, enter and esc ones ("←/→ change
+    size" becomes "left/right change size"), redacted and clipped; None when there are none. Those
+    hints name keys that do something else in that menu, so the owner hears them before choosing."""
+    if not footer:
+        return None
+    extra: list[str] = []
+    for part in _HINT_SPLIT_RE.split(footer.strip()):
+        if not part or _USUAL_HINT_RE.match(part):
+            continue
+        spoken = part
+        for arrow, word in _ARROW_WORDS:
+            spoken = spoken.replace(arrow, word)
+        extra.append(" ".join(spoken.split()))
+    if not extra:
+        return None
+    return clip(redact(", ".join(extra)), FOOTER_WORDS_MAX)
+
+
+def format_status(
+    label: str, pane: PaneInfo, *, summary: str | None, line: str | None, menu: ScreenMenu | None = None
+) -> str:
     fact = status_fact(pane)
     if summary:
-        return f"{label}: {fact} A summary of the screen: {quote(summary)}"
+        # The summary names the question and the options already; only a short list of the menu's
+        # own options follows, so they reach the owner whatever the summary says.
+        more = f" {menu_words(menu, MENU_AFTER_SUMMARY_MAX, hints=False, question=False)}" if menu is not None else ""
+        return f"{label}: {fact} A summary of the screen: {quote(summary)}{more}"
+    if menu is not None:
+        return f"{label}: {fact} {menu_words(menu, MENU_WORDS_DETAILED_MAX, details=True)}"
     if line:
         return f"{label}: {fact} The screen says: {quote(redact(line))}"
     return f"{label}: {fact} The screen is empty."
+
+
+def cut_note(rows: int, can_resize: bool, *, menu_cut: bool = False) -> str:
+    """Appended when the pane is on its alternate screen (no scrollback) and short, or (`menu_cut`)
+    shows a picker footer whose menu cannot be read, at any height."""
+    more = " I can make it bigger if you want." if can_resize else ""
+    if menu_cut:
+        return (
+            f" The pane is {rows} rows high and shows a full-screen program, and the menu on it is cut off: "
+            f"I cannot see its question or first options.{more}"
+        )
+    return (
+        f" The pane is only {rows} rows high and shows a full-screen program, so part of a menu may be cut off.{more}"
+    )
 
 
 def format_pending_task(label: str, task_id: int) -> str:
@@ -243,13 +340,20 @@ def _message(text: str) -> str:
     return f'"{text}"'
 
 
+_DROPPED_KIND = {KEYS: "key presses", RESIZE: "resize"}
+
+
+def dropped_words(dropped: Sequence[Confirmation]) -> str:
+    """ "I dropped the earlier message for fpga on dev." (or key presses, or resize)."""
+    kinds = sorted({_DROPPED_KIND.get(d.kind, "message") for d in dropped})
+    places = ", ".join(sorted({d.place for d in dropped}))
+    return f"I dropped the earlier {' and '.join(kinds)} for {places}."
+
+
 def format_readback(item: Confirmation, *, question: str | None, dropped: Sequence[Confirmation]) -> str:
     """What `remote_send` returns: the target, the question being answered (labelled as the screen's),
     the exact message, the risk and the yes phrase, then the confirmation id for the model."""
-    parts: list[str] = []
-    if dropped:
-        places = ", ".join(sorted({d.place for d in dropped}))
-        parts.append(f"I dropped the earlier message for {places}.")
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
     if question:
         asks = "asks for permission" if item.permission_answer else "asks"
         parts.append(
@@ -263,6 +367,67 @@ def format_readback(item: Confirmation, *, question: str | None, dropped: Sequen
         parts.append(f"Careful, {risk_words(item.risky)}. To send it anyway, say {yes_phrase(item.risky)}.")
     else:
         parts.append("Say yes to send it.")
+    parts.append(f"(confirmation {item.id}, do not read this number aloud)")
+    return " ".join(parts)
+
+
+def format_keys_readback(
+    item: Confirmation,
+    *,
+    menu: ScreenMenu | None,
+    question: str | None,
+    chosen: tuple[int, str] | None,
+    dropped: Sequence[Confirmation],
+    dialog_shown: bool = True,
+) -> str:
+    """What `remote_send_keys` returns: the keys, the target, the menu or question on its screen
+    (labelled as the screen's), the option the keys should choose, the risk and the yes phrase.
+    `dialog_shown` False: a permission answer whose screen has no answer options at its bottom
+    (`dispatcher.dialog_bound`, prose that looks like a dialog), said as such."""
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
+    keys = key_words(item.keys)
+    if item.permission_answer and not dialog_shown:
+        asked = f" ({quote(question)})" if question else ""
+        parts.append(
+            f"Ready to press {keys} in {item.place}. Its screen may ask for permission{asked}, but I see no "
+            "answer options at its bottom, so the keys go to its input."
+        )
+    elif item.permission_answer:
+        asked = f" It asks for permission: {quote(question)}." if question else " It shows a permission question."
+        parts.append(f"Ready to press {keys} in {item.place}.{asked}")
+    elif menu is not None:
+        # The footer's unusual hints matter only for keys beyond moving, choosing and confirming.
+        plain = all(key in ("Up", "Down", "Enter") or key.isdigit() for key in item.keys)
+        parts.append(f"Ready to press {keys} in {item.place}. {menu_words(menu, hints=not plain)}")
+    elif question:
+        parts.append(f"Ready to press {keys} in {item.place}, which asks: {quote(question)}.")
+    else:
+        parts.append(f"Ready to press {keys} in {item.place}. I see no menu on its screen.")
+    if chosen is not None:
+        number = f"{chosen[0]}, " if menu is None or menu.numbered else ""
+        parts.append(f"That should choose {number}{quote(redact(chosen[1]))}.")
+    if item.risky:
+        parts.append(f"Careful, {risk_words(item.risky)}. To press them anyway, say {yes_phrase(item.risky)}.")
+    else:
+        parts.append("Say yes to press them.")
+    parts.append(f"(confirmation {item.id}, do not read this number aloud)")
+    return " ".join(parts)
+
+
+def format_resize_readback(
+    item: Confirmation, *, current: tuple[int, int] | None, dropped: Sequence[Confirmation]
+) -> str:
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
+    assert item.size is not None
+    columns, rows = item.size
+    now = f" It is now {current[0]} by {current[1]}." if current is not None else ""
+    parts.append(f"Ready to resize the window of {item.place} to {columns} columns by {rows} rows.{now}")
+    parts.append(
+        "The size stays fixed afterwards, and it also changes the other panes in that window "
+        "and every terminal attached to it. To undo it, run tmux set-option -w -u window-size in that "
+        "window at the keyboard, which goes back to automatic sizing."
+    )
+    parts.append("Say yes to resize it.")
     parts.append(f"(confirmation {item.id}, do not read this number aloud)")
     return " ".join(parts)
 
@@ -285,8 +450,50 @@ _NOT_SENT: dict[str, str] = {
 }
 
 
+_NOT_DONE_KEYS: dict[str, str] = {
+    "menu_changed": "Not pressed: the menu on that screen changed since I read it to you. Ask me to read it again.",
+    "mode_keys": "Not pressed: there is no menu on that screen; tab and shift tab there would change Claude Code's mode.",
+    "key_order": "Not pressed: switchboard-remote on {machine} presses a number, enter, escape, y or n only as the last key.",
+    "history_submit": "Not pressed: there is no menu on that screen; up or down and then enter would send an earlier prompt or command again.",
+    "menu_unreadable": "Not pressed: that screen now shows a menu I cannot read. Ask me what it says.",
+    "dialog_not_visible": "Not pressed: the permission question is not visible on that screen. Check it at the keyboard.",
+    "bad_request": "Not pressed: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
+}
+_NOT_DONE_RESIZE: dict[str, str] = {
+    "not_claude": "Not resized: switchboard-remote on {machine} does not allow resizing panes without Claude Code.",
+    "bad_request": "Not resized: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
+}
+
+
 def format_confirm_outcome(item: Confirmation, outcome: str, detail: str | None) -> str:
     """The spoken result of `remote_send_confirm` for an audit outcome."""
+    machine = item.machine
+    code = outcome.removeprefix("not_sent:")
+    if item.kind == KEYS:
+        if outcome == "sent":
+            return f"Pressed {key_words(item.keys)} in {item.place}."
+        if outcome == "unknown":
+            session = item.place.removesuffix(f" on {machine}")
+            return f"I do not know whether the keys arrived, {machine} stopped answering. Ask me what {session} is doing before pressing them again."
+        if code in _NOT_DONE_KEYS:
+            return _NOT_DONE_KEYS[code].format(machine=machine)
+        return "Not pressed: " + _confirm_problem(item, outcome).removeprefix("Not sent: ")
+    if item.kind == RESIZE:
+        if outcome == "sent":
+            assert item.size is not None
+            return (
+                f"Resized the window of {item.place} to {item.size[0]} by {item.size[1]}. It stays that size "
+                "until someone runs tmux set-option -w -u window-size in that window."
+            )
+        if outcome == "unknown":
+            return f"I do not know whether the window was resized, {machine} stopped answering."
+        if code in _NOT_DONE_RESIZE:
+            return _NOT_DONE_RESIZE[code].format(machine=machine)
+        return "Not resized: " + _confirm_problem(item, outcome).removeprefix("Not sent: ")
+    return _confirm_problem(item, outcome)
+
+
+def _confirm_problem(item: Confirmation, outcome: str) -> str:
     machine = item.machine
     if outcome == "sent":
         return f"Sent to {item.place}."

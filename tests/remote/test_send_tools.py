@@ -101,7 +101,7 @@ async def build(tmp: Path, *, dev: dict[str, Any] | None = None, log_prompts: bo
                     machine("dev", world=world, allowSend=True, **(dev or {})),
                     machine("buildbox", world=world, host="example-host", user="bot", sessions=["api"]),
                 ],
-                "ssh": {"bin": world.ssh, "commandTimeoutSeconds": 6},
+                "ssh": {"bin": world.ssh, "commandTimeoutSeconds": 15},
                 "summary": {"enabled": False},
                 "send": send,
             },

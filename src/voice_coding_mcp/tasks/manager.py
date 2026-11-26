@@ -691,6 +691,10 @@ class TaskManager:
         )
         return Started(task=_copy(task))
 
+    def is_locked(self, lock_key: str) -> bool:
+        """A task or a job with this lock key runs now (for logging why `claim_slot` said no)."""
+        return self._locked(lock_key)
+
     def claim_slot(self, lock_key: str) -> SlotLease | None:
         """A run slot now, outside the queue, or None when every slot is taken, the key is locked or
         a task waits in the queue (queued tasks keep their turn). Synchronous, like `_enqueue`."""

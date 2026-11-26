@@ -55,7 +55,7 @@ def test_version_reports_verbs_and_policy(world: RemoteWorld) -> None:
         "protocol": 1,
         "ok": True,
         "version": d.VERSION,
-        "verbs": ["version", "list", "capture", "send", "usage"],
+        "verbs": ["version", "list", "capture", "send", "usage", "keys", "resize"],
         "allowSend": False,
         "allowUsage": True,
     }
@@ -217,6 +217,8 @@ def test_list_keeps_allowed_sessions_only_and_joins_the_registry(world: RemoteWo
         "active": True,
         "attached": False,
         "activity": 1764160000,
+        "width": 80,
+        "height": 24,
         "claude": None,
     }
     text = json.dumps(out)
@@ -308,6 +310,9 @@ def test_capture_an_allowed_pane(world: RemoteWorld) -> None:
         "paneId": "%1",
         "session": "fpga",
         "window": 0,
+        "paneWidth": 80,
+        "paneHeight": 24,
+        "alternateOn": False,
     }
     assert world.tmux_calls()[-1]["argv"] == ["capture-pane", "-p", "-J", "-t", "%1", "-S", "-2"]
 

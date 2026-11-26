@@ -26,7 +26,12 @@ Test only (refused unless SWITCHBOARD_REMOTE_TEST=1 is in the environment): --tm
 Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none> message`
 or `send <paneId> <panePid> <sessionId|none> answer <dialogHash|none>` (text on stdin, only with
 --allow-send; the mode says what the owner confirmed: a message, or the answer to one permission
-dialog), `usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
+dialog), `keys <paneId> <panePid> <sessionId|none> menu <menuHash|none> <key>...` or
+`keys <paneId> <panePid> <sessionId|none> answer <dialogHash|none> <key>...` (1 to MAX_KEYS key names
+from KEY_NAMES, only with --allow-send; bound to the menu or permission dialog the owner heard),
+`resize <paneId> <panePid> <sessionId|none> <columns> <rows>` (the pane's window, only with
+--allow-send),
+`usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
 only with --allow-usage). Every response is one JSON document on stdout,
 `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`, except a
 successful `usage`, which is JSON lines (a header document, then file headers and token records
@@ -53,9 +58,9 @@ import unicodedata
 from collections.abc import Iterator
 from typing import BinaryIO
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 PROTOCOL = 1
-VERBS = ("version", "list", "capture", "send", "usage")
+VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize")
 PROGRAM = "switchboard-remote"
 
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}")
@@ -80,6 +85,27 @@ owner heard, identified by `dialog_hash`)."""
 DIALOG_HASH_RE = re.compile(r"[0-9a-f]{24}")
 NO_DIALOG = "none"
 """The dialog hash of a permission wait that only the registry shows (nothing on the screen)."""
+KEYS_MENU = "menu"
+"""The `keys` mode for anything but a permission dialog: bound to `menu_hash` of the screen the owner
+heard (`none`: no menu was on it). The other mode is SEND_ANSWER, bound to `dialog_hash`."""
+NO_MENU = "none"
+KEY_NAMES = ("Up", "Down", "Left", "Right", "Enter", "Escape", "Tab", "BTab", *"123456789", "y", "n")
+"""The only keys `keys` presses: tmux key names (and single characters tmux types as they are), never
+free text, modifiers (`C-c`, `M-x`) or tmux commands."""
+MODE_KEYS = ("Tab", "BTab")
+"""Keys that switch modes at a Claude Code input (Shift+Tab cycles its permission mode up to accept
+edits or bypass permissions): `keys` presses them only into a bound menu or permission dialog, and
+never after a FINAL_KEYS key (`keys_problem`)."""
+FINAL_KEYS = ("Enter", "Escape", *"123456789", "y", "n")
+"""Keys that end a selection (choose, dismiss or answer): only the last key of a `keys` request, so
+nothing lands on the screen that follows the menu, which nobody checked."""
+HISTORY_KEYS = ("Up", "Down")
+"""At an input without a menu these recall earlier prompts or shell commands: never followed by Enter
+there, which would submit text nobody heard."""
+MAX_KEYS = 10
+RESIZE_COLUMNS = (80, 300)
+RESIZE_ROWS = (24, 120)
+"""Inclusive bounds of `resize`."""
 
 MAX_SESSION_GLOBS = 64
 MAX_LINES = 500
@@ -120,6 +146,9 @@ LIST_FIELDS = (
     "pane_active",
     "session_attached",
     "window_activity",
+    "pane_width",
+    "pane_height",
+    "alternate_on",
 )
 LIST_FORMAT = "\t".join("#{" + name + "}" for name in LIST_FIELDS)
 
@@ -297,6 +326,313 @@ def shows_vim_normal(screen: str) -> bool:
     return any(_VIM_NORMAL_RE.search(line) for line in _screen_tail(screen))
 
 
+_MENU_OPTION_RE = re.compile(r"(?:([❯>›▶])\s*)?([1-9][0-9]?)[.)]\s+(\S.*)")
+_MARKED_LINE_RE = re.compile(r"[❯>›▶]\s*(\S.*)")
+MENU_FOOTER_RE = re.compile(
+    r"↑\s*/?\s*↓|←\s*/?\s*→|\benter\s+(?:to\s+)?(?:confirm|select|submit|choose)\b"
+    r"|\besc\s+(?:to\s+)?(?:cancel|not now|go back|exit|close)\b|(?<![+-])\btab\s+to\s+[a-z]",
+    re.I,
+)
+"""The key hints under an interactive menu ("↑/↓ choose · enter confirm · esc not now"). Not Claude
+Code's input status line ("shift+tab to cycle", INPUT_STATUS_RE)."""
+INPUT_STATUS_RE = re.compile(r"\bshift\s*[+-]\s*tab\s+to\s+cycle\b|^\?\s+for\s+shortcuts\b", re.I)
+"""Claude Code's status line under its input box ("⏵⏵ accept edits on (shift+tab to cycle)", "? for
+shortcuts"): below a menu it is skipped, never a menu footer."""
+_PICKER_MOVE_RE = re.compile(r"↑\s*/?\s*↓")
+_PICKER_PICK_RE = re.compile(
+    r"\benter\s+(?:to\s+)?(?:confirm|select|submit|choose)\b|\besc\s+(?:to\s+)?(?:cancel|not now|go back|exit|close)\b",
+    re.I,
+)
+_ASSISTANT_MARK_RE = re.compile(r"[⏺●]\s*")
+MENU_GAP_LINES = 4
+"""Non-option lines (an option's description) allowed between two options, or under the last one."""
+MENU_GAP_LINES_PICKER = 12
+"""The same under a picker footer (`_picker_footer`), which no prose with a numbered list has."""
+MENU_PLAIN_OPTIONS = 12
+"""At most this many lines in a menu without numbers."""
+MENU_QUESTION_LINES = 3
+
+
+def _menu_lines(screen: str) -> list[str]:
+    return [line.strip().strip(_BOX_EDGES).strip() for line in screen.split("\n")]
+
+
+def _picker_footer(footer: list[str]) -> bool:
+    """Key hints that only an interactive picker shows: up/down to move and enter or esc to choose
+    or dismiss ("↑/↓ choose · enter confirm · esc not now"). Claude Code's input status line has
+    neither."""
+    text = " ".join(footer)
+    return _PICKER_MOVE_RE.search(text) is not None and _PICKER_PICK_RE.search(text) is not None
+
+
+def _menu_footer(lines: list[str]) -> tuple[list[str], int]:
+    """(the key hint lines at the bottom, the index of the last line above them that is neither
+    empty, a border nor a key hint)."""
+    index = len(lines) - 1
+    footer: list[str] = []
+    while index >= 0 and (
+        not lines[index]
+        or _BORDER_RE.fullmatch(lines[index])
+        or INPUT_STATUS_RE.search(lines[index])
+        or MENU_FOOTER_RE.search(lines[index])
+    ):
+        if lines[index] and not _BORDER_RE.fullmatch(lines[index]) and not INPUT_STATUS_RE.search(lines[index]):
+            footer.insert(0, lines[index])
+        index -= 1
+    return footer, index
+
+
+def _input_line(lines: list[str], index: int) -> bool:
+    """`lines[index]` is alone between two borders: a one-line input box (Claude Code's prompt, a
+    draft such as `❯ 2. fix it`), never a menu option."""
+    return (
+        0 < index < len(lines) - 1
+        and _BORDER_RE.fullmatch(lines[index - 1]) is not None
+        and _BORDER_RE.fullmatch(lines[index + 1]) is not None
+    )
+
+
+def _input_box(lines: list[str], first: int, last: int) -> bool:
+    """Options `lines[first]`..`lines[last]` (`last` the last option or description line) inside a
+    box: a border under `last` with only empty lines between (a draft ending in an empty line), and
+    a border above `first` whose first non-empty line under it starts with an input prompt (`❯`,
+    `>`). That is a multi-line Claude Code input draft such as `> 1. fix the parser` / `2. update
+    tests`, or one whose options follow a prompt line (`> notes` / `> 1. fix the parser` / `2. update
+    tests`), never a menu (no picker footer is under an input box, only its status line)."""
+    below = last + 1
+    while below < len(lines) and not lines[below]:
+        below += 1
+    if below >= len(lines) or _BORDER_RE.fullmatch(lines[below]) is None:
+        return False
+    top = first - 1
+    while top >= 0 and _BORDER_RE.fullmatch(lines[top]) is None:
+        top -= 1
+    if top < 0:
+        return False
+    opening = next(line for line in lines[top + 1 : first + 1] if line)
+    return opening.startswith(_INPUT_PROMPTS)
+
+
+def _numbered_options(
+    lines: list[str], last: int, max_gap: int
+) -> tuple[list[tuple[int, str, bool, str | None]], int] | None:
+    """(options `1.`..`n.` top down as (number, text, marked, description), the index of option 1)
+    ending at `last`, or None. An option's description is the lines under it, up to the next option
+    (or the bottom)."""
+    index = last
+    options: list[tuple[int, str, bool, str | None]] = []
+    gap = 0
+    below: list[str] = []
+    while index >= 0:
+        line = lines[index]
+        found = _MENU_OPTION_RE.fullmatch(line)
+        if found is not None:
+            number = int(found.group(2))
+            if (options and number != options[-1][0] - 1) or (not options and number < 2):
+                return None
+            marked = found.group(1) is not None
+            if marked and _input_line(lines, index):
+                return None
+            description = " ".join(" ".join(below).split()) or None
+            options.append((number, found.group(3).strip(), marked, description))
+            gap = 0
+            below = []
+            if number == 1:
+                break
+        elif line and not _BORDER_RE.fullmatch(line):
+            # An input prompt or an assistant line between the options and the bottom: prose with a
+            # numbered list above the input box, not a menu.
+            if line.startswith(_INPUT_PROMPTS) or _ASSISTANT_MARK_RE.match(line):
+                return None
+            gap += 1
+            if gap > max_gap:
+                return None
+            below.insert(0, line)
+        index -= 1
+    if not options or options[-1][0] != 1:
+        return None
+    options.reverse()
+    return options, index
+
+
+def _plain_options(
+    lines: list[str], last: int
+) -> tuple[list[tuple[int, str, bool, str | None]], int, list[str]] | None:
+    """A menu without numbers above a picker footer: the block of lines ending at `last` (up to an
+    empty line or a border, at most MENU_PLAIN_OPTIONS) with exactly one selection-marked line. An
+    unmarked first line ending in `?` or `:` is the question. Returns (options numbered by position
+    top down as (number, text, marked), the index of the first line, question lines), or None."""
+    index = last
+    block: list[str] = []
+    while index >= 0 and lines[index] and not _BORDER_RE.fullmatch(lines[index]):
+        if _ASSISTANT_MARK_RE.match(lines[index]) or len(block) >= MENU_PLAIN_OPTIONS + MENU_QUESTION_LINES:
+            return None
+        block.insert(0, lines[index])
+        index -= 1
+    first = index + 1
+    question: list[str] = []
+    while len(block) > 1 and not _MARKED_LINE_RE.fullmatch(block[0]) and block[0].endswith(("?", ":")):
+        question.append(block.pop(0))
+        if len(question) >= MENU_QUESTION_LINES:
+            break
+    marked = [_MARKED_LINE_RE.fullmatch(line) for line in block]
+    if len(block) < 2 or len(block) > MENU_PLAIN_OPTIONS or sum(m is not None for m in marked) != 1:
+        return None
+    options: list[tuple[int, str, bool, str | None]] = [
+        (position, (mark.group(1) if mark is not None else line).strip(), mark is not None, None)
+        for position, line, mark in ((index + 1, block[index], marked[index]) for index in range(len(block)))
+    ]
+    return options, first, question
+
+
+def _find_menu(lines: list[str]) -> dict[str, object] | None:
+    footer, last = _menu_footer(lines)
+    picker = _picker_footer(footer)
+    numbered = _numbered_options(lines, last, MENU_GAP_LINES_PICKER if picker else MENU_GAP_LINES)
+    question: list[str] = []
+    if numbered is not None:
+        options, first = numbered
+    else:
+        plain = _plain_options(lines, last) if picker else None
+        if plain is None:
+            return None
+        options, first, question = plain
+    marked = [number for number, _, mark, _ in options if mark]
+    if not marked and not footer:
+        return None
+    if numbered is not None and not picker and _input_box(lines, first, last):
+        return None
+    if not question:
+        probe = first - 1
+        while probe >= 0 and (not lines[probe] or _BORDER_RE.fullmatch(lines[probe])):
+            probe -= 1
+        while (
+            probe >= 0
+            and lines[probe]
+            and not _BORDER_RE.fullmatch(lines[probe])
+            and len(question) < MENU_QUESTION_LINES
+        ):
+            line = lines[probe]
+            if MENU_FOOTER_RE.search(line) or line.startswith(_INPUT_PROMPTS):
+                break
+            assistant = _ASSISTANT_MARK_RE.match(line)
+            question.insert(0, line[assistant.end() :] if assistant else line)
+            first = probe
+            if assistant:
+                break
+            probe -= 1
+    return {
+        "question": " ".join(" ".join(question).split()) or None,
+        "options": [(number, " ".join(text.split())) for number, text, _, _ in options],
+        "descriptions": [description for _, _, _, description in options],
+        "selected": marked[0] if marked else None,
+        "footer": " ".join(" ".join(footer).split()) or None,
+        "numbered": numbered is not None,
+        "first": first,
+        "last": last,
+    }
+
+
+def find_menu(screen: str) -> dict[str, object] | None:
+    """An interactive menu at the bottom of the screen (Claude Code's questions with choices, its
+    permission dialogs, other pickers), or None. Either a run of consecutive numbered options
+    `1.`..`99.` (an optional `❯ > › ▶` marks the selected one; up to MENU_GAP_LINES description lines
+    between options, MENU_GAP_LINES_PICKER under a picker footer) with only borders, empty lines,
+    Claude Code's input status line (INPUT_STATUS_RE, skipped) and key hints (MENU_FOOTER_RE) below
+    it, and either a selection marker or key hints; a marked line alone between two borders is an
+    input box (a draft such as `❯ 2. fix it`), never an option, and so are options inside a box
+    whose first line starts with an input prompt without a picker footer (a multi-line draft
+    `> 1. fix the parser` / `2. update tests`, also ending in an empty line or under a `> notes`
+    line, `_input_box`); or, under a
+    picker footer (up/down plus enter or esc hints), a block of up to MENU_PLAIN_OPTIONS lines
+    without numbers, exactly one of them selection-marked (`numbered` False; the options are then
+    numbered by position and a digit key does not choose them). Prose with a numbered list above an
+    input box is no menu. Returns `question` (up to MENU_QUESTION_LINES lines directly above the
+    options, stopping at an assistant line), `options` [(number, text)], `descriptions` (per
+    option, its lines below it joined, or None), `selected` (a number or None), `footer`, `numbered`
+    and the line range `first`..`last`. The hub runs this same function
+    for what it reads back."""
+    return _find_menu(_menu_lines(screen))
+
+
+def shows_picker(screen: str) -> bool:
+    """The bottom of the screen has a picker footer (`_picker_footer`): a menu is open, whether or
+    not `find_menu` can read it. `keys` without a bound menu is refused then (`menu_unreadable`):
+    the selection mark of an unread menu is no input draft, and Enter would choose an option nobody
+    heard."""
+    return _picker_footer(_menu_footer(_menu_lines(screen))[0])
+
+
+def dialog_bound(screen: str, claude_pane: bool = True) -> bool:
+    """A permission dialog's answer options are at the bottom of the screen: `dialog_hash` sees a
+    dialog, `find_menu` reads a menu there (numbered options with nothing but borders, the input
+    status line and key hints under them), and the line `shows_dialog` recognised is part of that
+    menu (its question or an option). Assistant prose that starts a line with "Do you want to ...?"
+    or lists "1. Yes ... 2. No" above an idle input box is no bound dialog: in `answer` mode keys
+    then follow the rules without a bound menu (`keys_problem` with `menu_bound` False, no picker
+    footer, no draft, no vim normal mode). In a pane without Claude Code (`claude_pane` False) only
+    a dialog under a picker footer binds: shell output can print any dialog text."""
+    if not claude_pane and not shows_picker(screen):
+        return False
+    tail = _screen_tail(screen)
+    anchor = _dialog_anchor(tail)
+    if anchor is None:
+        return False
+    lines = _menu_lines(screen)
+    menu = _find_menu(lines)
+    if menu is None:
+        return False
+    first, last = menu["first"], menu["last"]
+    assert isinstance(first, int)
+    assert isinstance(last, int)
+    return tail[anchor] in lines[first : last + 1]
+
+
+def keys_problem(keys: list[str], menu_bound: bool, answer: bool = False) -> str | None:
+    """Why a `keys` request may not be pressed as it is, or None; the hub runs the same function
+    before it reads back. A FINAL_KEYS key (a choice, Enter, Escape, y, n) may only be the last key
+    (`key_order`): what follows it would land on whatever screen the choice opens, which nobody
+    checked. In a permission dialog (`answer` True) the MODE_KEYS are final too: Shift+Tab is itself
+    a choice in Claude Code's edit dialog ("allow all edits during this session") and closes it, so
+    a key after it would answer a queued dialog nobody heard or submit a draft. Without a bound menu or permission dialog (`menu_bound` False), no MODE_KEYS
+    (`mode_keys`) and no HISTORY_KEYS before Enter (`history_submit`: that recalls and submits an
+    earlier prompt or shell command nobody heard)."""
+    if any(key in FINAL_KEYS or (answer and key in MODE_KEYS) for key in keys[:-1]):
+        return "key_order"
+    if not menu_bound:
+        if any(key in MODE_KEYS for key in keys):
+            return "mode_keys"
+        if keys and keys[-1] == "Enter" and any(key in HISTORY_KEYS for key in keys):
+            return "history_submit"
+    return None
+
+
+def menu_hash(screen: str) -> str | None:
+    """What identifies the menu `find_menu` sees, so keys go only into the menu the owner heard: a
+    hash of its question, options and descriptions with the selection marker (a selection moved at
+    the keyboard changes it), each line cleaned and with its whitespace collapsed. None when no menu
+    is on the screen. Hub and dispatcher run this function on the same kind of capture."""
+    lines = _menu_lines(screen)
+    menu = _find_menu(lines)
+    if menu is None:
+        return None
+    first, last = menu["first"], menu["last"]
+    assert isinstance(first, int)
+    assert isinstance(last, int)
+    block = "\n".join(" ".join(clean_text(line, 400).split()) for line in lines[first : last + 1] if line)
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()[:24]
+
+
+def bound_menu_hash(screen: str, claude_pane: bool) -> str | None:
+    """`menu_hash` as `keys` binds to it: in a pane without Claude Code (`claude_pane` False) only a
+    menu under a picker footer (`shows_picker`) binds, None otherwise. Shell output ending in
+    `1. Yes` / `❯ 2. No` above the shell prompt (read as an option's description) is no menu: Up
+    Enter there reruns the previous command. Hub and dispatcher run this same function."""
+    if not claude_pane and not shows_picker(screen):
+        return None
+    return menu_hash(screen)
+
+
 # --- options and policy ----------------------------------------------------------------------
 
 
@@ -465,6 +801,35 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
             if len(args) != 5 or (args[4] != NO_DIALOG and not DIALOG_HASH_RE.fullmatch(args[4])):
                 raise RefusedError("bad_request")
         else:
+            raise RefusedError("bad_request")
+    if verb == "keys":
+        if not 6 <= len(args) <= 5 + MAX_KEYS or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
+            raise RefusedError("bad_request")
+        if args[2] != SEND_NO_SESSION and not UUID_RE.fullmatch(args[2]):
+            raise RefusedError("bad_request")
+        if args[3] == SEND_ANSWER:
+            if args[4] != NO_DIALOG and not DIALOG_HASH_RE.fullmatch(args[4]):
+                raise RefusedError("bad_request")
+        elif args[3] == KEYS_MENU:
+            if args[4] != NO_MENU and not DIALOG_HASH_RE.fullmatch(args[4]):
+                raise RefusedError("bad_request")
+        else:
+            raise RefusedError("bad_request")
+        if any(key not in KEY_NAMES for key in args[5:]):
+            raise RefusedError("bad_request")
+    if verb == "resize":
+        if (
+            len(args) != 5
+            or not PANE_ID_RE.fullmatch(args[0])
+            or not all(DECIMAL_RE.fullmatch(a) for a in (args[1], args[3], args[4]))
+        ):
+            raise RefusedError("bad_request")
+        if args[2] != SEND_NO_SESSION and not UUID_RE.fullmatch(args[2]):
+            raise RefusedError("bad_request")
+        if (
+            not RESIZE_COLUMNS[0] <= int(args[3]) <= RESIZE_COLUMNS[1]
+            or not RESIZE_ROWS[0] <= int(args[4]) <= RESIZE_ROWS[1]
+        ):
             raise RefusedError("bad_request")
     if verb == "usage":
         if len(args) != 2 or not NUMBER_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
@@ -708,6 +1073,8 @@ def verb_list(policy: Policy, env: dict[str, str]) -> dict[str, object]:
                 "active": _flag(pane["pane_active"]),
                 "attached": _flag(pane["session_attached"]),
                 "activity": _int(pane["window_activity"]),
+                "width": _int(pane["pane_width"]),
+                "height": _int(pane["pane_height"]),
                 "claude": claude_view(entry) if entry is not None else None,
             }
         )
@@ -730,6 +1097,9 @@ def verb_capture(policy: Policy, env: dict[str, str], pane_id: str, lines: int) 
         "paneId": pane_id,
         "session": clean_text(pane["session_name"], NAME_MAX),
         "window": _int(pane["window_index"]),
+        "paneWidth": _int(pane["pane_width"]),
+        "paneHeight": _int(pane["pane_height"]),
+        "alternateOn": _flag(pane["alternate_on"]),
     }
 
 
@@ -844,6 +1214,105 @@ def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: objec
     if code != 0:
         raise RefusedError("pasted_no_enter")
     return {"sent": True, "bytes": len(data), "enter": True}
+
+
+def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str, object]:
+    """Presses 1 to MAX_KEYS keys from KEY_NAMES in a pane (one `send-keys` without `-l`), after
+    rechecking the pane, its process and Claude Code session, and the screen the owner heard: in
+    `menu` mode no permission dialog may show (`permission_prompt`) and the menu must be the one read
+    back (`menu_changed`, `none` when there was none; then also no draft and no vim normal mode); in
+    `answer` mode the permission dialog must be the one read back (`dialog_changed`), and only with
+    --allow-permission-answers, and when its answer options are not at the bottom of the screen
+    (`dialog_bound` False: prose that looks like a dialog) the unbound rules apply as in `menu none`; `answer none` (a permission wait only the registry shows, no dialog
+    on the screen to bind to) is refused whatever the keys (`dialog_not_visible`). Without a bound
+    menu, a screen with a picker footer is refused (`menu_unreadable`). `keys_problem` limits the
+    order of the keys (`key_order`, `mode_keys`, `history_submit`; in `answer` mode Tab and Shift+Tab
+    count as final keys too), and every check runs before the one `send-keys`, so a key that ends the
+    selection is the last one pressed. In `menu` mode a bound menu with a draft on the screen and no
+    picker footer is refused (`draft_present`: the options may be the draft's own lines), and in a
+    pane without Claude Code only a menu under a picker footer binds (`bound_menu_hash`), so shell
+    output that looks like a menu gets the unbound rules."""
+    if not policy.allow_send:
+        raise RefusedError("not_allowed")
+    pane_id, pane_pid, session_id, mode, bound = args[:5]
+    keys = args[5:]
+    if mode == SEND_ANSWER and bound == NO_DIALOG:
+        # A permission answer is bound only by a dialog on the screen. A registry-only wait (a stale
+        # entry, or a dialog shows_dialog cannot see) may show an input box, where Enter submits a
+        # draft, Up Enter an earlier prompt and Shift+Tab cycles the permission mode: nothing goes in.
+        raise RefusedError("dialog_not_visible")
+    problem = keys_problem(keys, menu_bound=bound != NO_MENU, answer=mode == SEND_ANSWER)
+    if problem is not None:
+        raise RefusedError(problem)
+    pane, entry, screen = _send_state(policy, env, pane_id)
+    if pane is None:
+        raise RefusedError("gone")
+    if pane["pane_pid"] != pane_pid or not _same_session(entry, session_id):
+        raise RefusedError("changed")
+    if session_id == SEND_NO_SESSION and not policy.send_to_any_pane:
+        raise RefusedError("not_claude")
+    asks = _asks_permission(entry, screen)
+    if mode == SEND_ANSWER:
+        if not policy.allow_permission_answers:
+            raise RefusedError("permission_prompt")
+        if not asks or (dialog_hash(screen) or NO_DIALOG) != bound:
+            raise RefusedError("dialog_changed")
+        if not dialog_bound(screen, claude_pane=entry is not None):
+            # The dialog hash matched prose ("Do you want to ...?" above an idle input box), not
+            # answer options at the bottom: the keys land at an input, so the unbound rules apply.
+            problem = keys_problem(keys, menu_bound=False)
+            if problem is not None:
+                raise RefusedError(problem)
+            if shows_picker(screen):
+                raise RefusedError("menu_unreadable")
+            if shows_draft(screen):
+                raise RefusedError("draft_present")
+            if shows_vim_normal(screen):
+                raise RefusedError("vim_normal")
+    elif asks:
+        raise RefusedError("permission_prompt")
+    else:
+        current = bound_menu_hash(screen, claude_pane=entry is not None)
+        if (current or NO_MENU) != bound:
+            raise RefusedError("menu_changed")
+        if current is not None and shows_draft(screen) and not shows_picker(screen):
+            # Defence in depth: a "menu" without a picker footer over a draft in the input box may be
+            # the draft's own numbered lines, where Enter submits it and Shift+Tab cycles the mode.
+            raise RefusedError("draft_present")
+        if current is None and shows_picker(screen):
+            raise RefusedError("menu_unreadable")
+        if current is None and entry is not None:
+            if shows_draft(screen):
+                raise RefusedError("draft_present")
+            if shows_vim_normal(screen):
+                raise RefusedError("vim_normal")
+    code, _, _ = run_tmux(["send-keys", "-t", pane_id, *keys], policy, env)
+    if code != 0:
+        raise RefusedError("tmux_failed")
+    return {"sent": True, "keys": len(keys)}
+
+
+def verb_resize(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str, object]:
+    """Resizes the window of a pane (`resize-window -x -y`, which also sets that window's
+    `window-size` to manual; `set-option -w -u window-size` in that window undoes it) within
+    RESIZE_COLUMNS and RESIZE_ROWS, after rechecking the pane, its process and the Claude Code
+    session the owner heard (`changed`; `none` only with --send-to-any-pane, else `not_claude`)."""
+    if not policy.allow_send:
+        raise RefusedError("not_allowed")
+    pane_id, pane_pid, session_id, columns, rows = args
+    panes = [p for p in list_panes(policy, env) if policy.allows(p["session_name"])]
+    pane = next((p for p in panes if p["pane_id"] == pane_id), None)
+    if pane is None:
+        raise RefusedError("gone")
+    entry = join_registry(panes, read_registry(claude_home(policy, env)), env).get(pane_id)
+    if pane["pane_pid"] != pane_pid or not _same_session(entry, session_id):
+        raise RefusedError("changed")
+    if session_id == SEND_NO_SESSION and not policy.send_to_any_pane:
+        raise RefusedError("not_claude")
+    code, _, err = run_tmux(["resize-window", "-t", pane_id, "-x", columns, "-y", rows], policy, env)
+    if code != 0:
+        raise RefusedError("gone" if "can't find" in err.lower() else "tmux_failed")
+    return {"resized": True, "columns": int(columns), "rows": int(rows)}
 
 
 # --- usage -------------------------------------------------------------------------------------
@@ -1101,6 +1570,10 @@ def respond(argv: list[str], env: dict[str, str], stdin: object = None) -> Itera
             body = verb_list(policy, env)
         elif verb == "send":
             body = verb_send(policy, env, args, stdin)
+        elif verb == "keys":
+            body = verb_keys(policy, env, args)
+        elif verb == "resize":
+            body = verb_resize(policy, env, args)
         elif verb == "usage":
             lines = verb_usage(policy, env, args, stdin)
             body = {"stream": "usage"}

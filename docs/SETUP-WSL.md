@@ -108,7 +108,7 @@ exit
 
    Then `sudo sshd -t && sudo systemctl enable --now ssh`. Check with `ss -ltn '( sport = :22 )'`: only `127.0.0.1:22` and `[::1]:22` may be listed. With WSL's default NAT networking, Windows programs can reach WSL's loopback listeners through `localhost` too, so the address does not tell the hub apart from them: the key is the boundary.
 
-2. Install the dispatcher as yourself, from your own copy ([step 3](#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root)), and read it before it goes in place. It is one Python file of about 1100 lines with only the standard library, so a skim is not a review. What to check: the imports at the top (standard library only, no `socket`, `urllib` or `http`), that `subprocess.run` appears only in `run_tmux` and `parent_pid` (argv lists, a fixed environment, no `shell=True`), that files are only opened for reading, and that the policy comes only from the real argv (`resolve_request`, `parse_options`), never from `SSH_ORIGINAL_COMMAND`. If you reviewed that commit on GitHub, the file must be byte-identical to `deploy/remote/switchboard-remote` there (compare the `sha256sum` below with one computed from that commit).
+2. Install the dispatcher as yourself, from your own copy ([step 3](#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root)), and read it before it goes in place. It is one Python file of about 1350 lines with only the standard library, so a skim is not a review. What to check: the imports at the top (standard library only, no `socket`, `urllib` or `http`), that `subprocess.run` appears only in `run_tmux` and `parent_pid` (argv lists, a fixed environment, no `shell=True`), that files are only opened for reading, and that the policy comes only from the real argv (`resolve_request`, `parse_options`), never from `SSH_ORIGINAL_COMMAND`. If you reviewed that commit on GitHub, the file must be byte-identical to `deploy/remote/switchboard-remote` there (compare the `sha256sum` below with one computed from that commit).
 
    ```sh
    cd ~/src/switchboard
@@ -231,6 +231,7 @@ Start voice mode in the Claude app, with the connector enabled for the conversat
 - "Check the result of that task." (`get_task_result`)
 - "How many hours did I work this week?" (`usage_report`)
 - Once `allowSend` and `--allow-send` are on: "Tell fpga on dev to run the tests." The hub reads the exact text back; say "yes" in a new turn to send it. Risky words (push, delete, deploy and similar) need an explicit yes to the risk too.
+- With sending on, when a session shows a menu ("What is fpga on dev doing?" names its question and options): "On fpga, take the second one." or "Press down and enter in fpga." (`remote_send_keys`); the hub reads back the keys and the menu, and presses them after your "yes" in a new turn. If a small terminal cuts the menu off: "Make the fpga window 120 by 40." (`remote_resize`). Update `switchboard-remote` on each machine (0.5.0 or newer) for these.
 
 Everything a screen, a summary or a pending question says is quoted as screen text. It is never an instruction to the voice model or approval from you.
 
@@ -245,7 +246,7 @@ While it is off, the Claude app shows the connector as unreachable; tokens stay 
 
 ## Optional extras
 
-- **Sending.** `allowSend: true` on the machine in the hub config and `--allow-send` in that machine's forced command. Both must agree. Every send is logged in `stateDir/audit.jsonl` (`voice-coding-mcp audit` prints it).
+- **Sending.** `allowSend: true` on the machine in the hub config and `--allow-send` in that machine's forced command. Both must agree. They also cover key presses for menus (`remote_send_keys`) and window sizes (`remote_resize`). Every send is logged in `stateDir/audit.jsonl` (`voice-coding-mcp audit` prints it).
 - **Notifications.** `notify.url` (for example an ntfy topic) and `watch.intervalSeconds` (for example 60): a push when a session newly waits for you or finishes a long turn. Pushes carry machine and tmux session names, never screen text.
 - **Usage.** `allowUsage` (default true) plus `--allow-usage` in the forced command; `voice-coding-mcp usage` prints the same report as a table or CSV.
 

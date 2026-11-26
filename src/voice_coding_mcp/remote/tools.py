@@ -1,5 +1,5 @@
-"""The remote tools behind `list_remote_sessions`, `remote_status`, `pending_input`, `remote_send` and
-`remote_send_confirm` (docs/SWITCHBOARD.md, "Tools").
+"""The remote tools behind `list_remote_sessions`, `remote_status`, `pending_input`, `remote_send`,
+`remote_send_keys`, `remote_resize` and `remote_send_confirm` (docs/SWITCHBOARD.md, "Tools").
 
 Each call has a total deadline of `tasks.syncWaitSeconds - 3` seconds for its synchronous part; a
 summary that is not ready by then continues as a `remote` task whose number is returned.
@@ -7,6 +7,8 @@ summary that is not ready by then continues as a `remote` task whose number is r
 `remote_send` only prepares: it checks everything, classifies the risk and keeps a confirmation in
 memory; `remote_send_confirm` rechecks the pane and sends through the dispatcher's `send` verb, which
 checks everything again on the machine. The text goes to the dispatcher on stdin, never in a command.
+`remote_send_keys` and `remote_resize` prepare the same way, and `remote_send_confirm` presses the keys
+(dispatcher `keys`, key names from a fixed list) or resizes the window (dispatcher `resize`).
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import asyncio
 import contextlib
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ..clock import now_ms
@@ -26,8 +28,25 @@ from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from .audit import AuditLog
 from .config import MachineConfig
-from .dispatcher import NO_DIALOG, SEND_ANSWER, SEND_CHECK_LINES, SEND_MESSAGE
+from .dispatcher import (
+    KEY_NAMES,
+    KEYS_MENU,
+    MAX_KEYS,
+    NO_DIALOG,
+    NO_MENU,
+    RESIZE_COLUMNS,
+    RESIZE_ROWS,
+    SEND_ANSWER,
+    SEND_CHECK_LINES,
+    SEND_MESSAGE,
+    bound_menu_hash,
+    dialog_bound,
+    keys_problem,
+    shows_draft,
+    shows_picker,
+)
 from .inventory import Inventory, resolve_machine
+from .menu import footer_block, screen_menu
 from .pending import (
     PendingChecker,
     PendingCheckerOptions,
@@ -36,26 +55,34 @@ from .pending import (
     waiting_for_text,
     waits_for_permission,
 )
-from .protocol import CaptureResponse, PaneInfo, SendResponse
+from .protocol import CaptureResponse, KeysResponse, PaneInfo, ResizeResponse, SendResponse, VersionResponse
 from .redact import clean_name, clean_screen
 from .send import (
+    KEYS,
     PERMISSION_ANSWER_RE,
+    RESIZE,
     Confirmation,
     ConfirmationStore,
     RiskClassifier,
     ScreenEcho,
+    chosen_option,
     dialog_hash,
+    key_words,
     normalize_text,
+    parse_keys,
     shows_dialog,
     text_problem,
 )
 from .speech import (
+    cut_note,
     format_confirm_outcome,
+    format_keys_readback,
     format_list,
     format_machine_problem,
     format_pending,
     format_pending_task,
     format_readback,
+    format_resize_readback,
     format_status,
     format_target_problem,
     pane_label,
@@ -79,6 +106,25 @@ MIN_SEND_SECONDS = 2.0
 EXPIRED = "That confirmation has expired. Ask me to prepare the message again."
 EARLY = "I have not heard your answer yet. Read the message to the owner first. Nothing was sent."
 NEEDS_RISKY_OK = "This one needs an explicit yes to the risky part. Nothing was sent."
+VERSION_CACHE_MS = 5 * 60 * 1000
+"""How long a machine's verb list (dispatcher `version`) is trusted before a key press or resize is
+prepared again."""
+_SPOKEN_KEYS = key_words(
+    [name for name in KEY_NAMES if not name.isdigit() and name not in ("y", "n")] + ["the numbers 1 to 9", "y", "n"]
+)
+KEYS_ORDER_REFUSAL = (
+    "I press a number, enter, escape, y or n only as the last key: anything after it would land on "
+    "the next screen, which I have not read. Ask for the rest once I have read that screen."
+)
+KEYS_ANSWER_ORDER_REFUSAL = (
+    "In a permission question, tab and shift tab can choose an answer themselves, so I press them only "
+    "as the last key: anything after them would land on the next screen, which I have not read."
+)
+KEYS_REFUSAL = {
+    "empty": f"Which keys should I press? I can press {_SPOKEN_KEYS}.",
+    "too_many": f"That is too many keys at once; I press at most {MAX_KEYS}.",
+    "unknown": f"I can only press {_SPOKEN_KEYS}.",
+}
 UNREACHED_ERRORS = ("refused", "host_key", "auth")
 """ssh failed before it connected: nothing was typed. Every other failure after the request was
 handed over (also `dispatcher_missing`, which an unexpected banner can cause) is an unknown outcome."""
@@ -160,6 +206,7 @@ class RemoteTools:
             )
         )
         self._background: set[asyncio.Task[str | None]] = set()
+        self._verbs: dict[str, tuple[int, frozenset[str]]] = {}
         self._pending = PendingChecker(
             PendingCheckerOptions(
                 inventory=self.inventory,
@@ -251,30 +298,62 @@ class RemoteTools:
             if captured.detail == "gone":
                 return ToolAnswer(f"{label}: that pane is gone. Ask me to list the sessions again.", True)
             return ToolAnswer(f"{name} is not reachable: {unreachable_reason(captured.error, captured.detail)}.", True)
-        screen = clean_screen(captured.text)
+        screen = clean_screen(captured.text).rstrip("\n ")
         self._logger.info(
-            "tool call", {"tool": "remote_status", "machine": name, "paneId": pane.pane_id, "screenChars": len(screen)}
+            "tool call",
+            {
+                "tool": "remote_status",
+                "machine": name,
+                "paneId": pane.pane_id,
+                "screenChars": len(screen),
+                "paneHeight": captured.pane_height,
+                "alternateOn": captured.alternate_on,
+            },
         )
-        return await self._describe(name, pane, label, screen, deadline)
+        note = ""
+        rows = captured.pane_height
+        if captured.alternate_on and rows is not None:
+            # The alternate screen has no scrollback: a menu taller than the pane is cut at its top.
+            # Not said when the whole menu was found below a free top row. A picker footer whose menu
+            # cannot be read is a cut menu at any height (a 32-line menu in a 24-row pane).
+            unread = screen_menu(screen) is None
+            cut = unread and shows_picker(screen)
+            if cut or (rows < RESIZE_ROWS[0] and (unread or len(screen.lstrip("\n").split("\n")) >= rows)):
+                note = cut_note(rows, found.item.allow_send and rows < RESIZE_ROWS[1], menu_cut=cut)
+        answer = await self._describe(name, pane, label, screen, deadline)
+        return ToolAnswer(answer.text + note, answer.is_error) if note else answer
+
+    def _log_answer(self, machine: str, pane: PaneInfo, path: str, reason: str | None = None) -> None:
+        """Which path answered `remote_status` (no screen text)."""
+        fields: dict[str, object] = {"tool": "remote_status", "machine": machine, "paneId": pane.pane_id, "path": path}
+        if reason is not None:
+            fields["reason"] = reason
+        self._logger.info("remote_status answer", fields)
 
     async def _describe(self, machine: str, pane: PaneInfo, label: str, screen: str, deadline: _Deadline) -> ToolAnswer:
-        line = last_meaningful_line(screen)
+        menu = screen_menu(screen)
+        # A menu that cannot be read still has its question and options above the key hints.
+        line = (footer_block(screen) if menu is None else None) or last_meaningful_line(screen)
 
-        def heuristic() -> str:
-            return format_status(label, pane, summary=None, line=line)
+        def heuristic(reason: str) -> str:
+            self._log_answer(machine, pane, "heuristic", reason)
+            return format_status(label, pane, summary=None, line=line, menu=menu)
 
-        if not self._summarizer.enabled or not screen.strip():
-            return ToolAnswer(heuristic())
+        if not screen.strip():
+            return ToolAnswer(heuristic("empty"))
+        if not self._summarizer.enabled:
+            return ToolAnswer(heuristic("disabled"))
         key = f"{machine}:{pane.pane_id}"
         cached = self._summarizer.cached(key, screen_hash(screen))
         if cached is not None:
             self.echo.observe(cached)
-            return ToolAnswer(format_status(label, pane, summary=cached, line=line))
+            self._log_answer(machine, pane, "cached")
+            return ToolAnswer(format_status(label, pane, summary=cached, line=line, menu=menu))
         lock_key = f"remote:{key}"
         lease = self._manager.claim_slot(lock_key)
         if lease is None:
             # No queueing for a status read: the heuristic answers at once.
-            return ToolAnswer(heuristic())
+            return ToolAnswer(heuristic("locked" if self._manager.is_locked(lock_key) else "no_slot"))
         run = asyncio.ensure_future(self._summarizer.summarize(key, screen, lease))
         self._background.add(run)
         run.add_done_callback(self._background.discard)
@@ -284,8 +363,11 @@ class RemoteTools:
                 await asyncio.wait_for(asyncio.shield(run), budget)
         if run.done():
             summary = run.result()
+            if summary is None:
+                return ToolAnswer(heuristic("failed"))
             self.echo.observe(summary)
-            return ToolAnswer(format_status(label, pane, summary=summary, line=line))
+            self._log_answer(machine, pane, "summary")
+            return ToolAnswer(format_status(label, pane, summary=summary, line=line, menu=menu))
 
         async def finish(abort: asyncio.Event) -> str:
             try:
@@ -293,15 +375,18 @@ class RemoteTools:
             except asyncio.CancelledError:
                 lease.abort.set()
                 raise
+            if summary is None:
+                return heuristic("failed")
             self.echo.observe(summary)
-            return format_status(label, pane, summary=summary, line=line)
+            self._log_answer(machine, pane, "summary", "task")
+            return format_status(label, pane, summary=summary, line=line, menu=menu)
 
         started = self._manager.start_job(
             label=f"status of {clean_name(pane.session)} on {machine}", machine=machine, lock_key=lock_key, job=finish
         )
         if isinstance(started, StartFailed):
             lease.abort.set()
-            return ToolAnswer(f"{heuristic()} ({format_for_voice(started)})")
+            return ToolAnswer(f"{heuristic('no_task')} ({format_for_voice(started)})")
         return ToolAnswer(format_pending_task(label, started.task.id))
 
     # --- remote_send and remote_send_confirm ------------------------------------------------------
@@ -368,7 +453,8 @@ class RemoteTools:
             return refuse(
                 f"{name} is not reachable: {unreachable_reason(captured.error, captured.detail)}.", "unreachable"
             )
-        ask = screen_ask(clean_screen(captured.text)) if claude is not None else None
+        screen = clean_screen(captured.text)
+        ask = screen_ask(screen) if claude is not None else None
         # At least as broad as the dispatcher's own check (the same `shows_dialog` on the same lines),
         # so a send is prepared as a permission answer exactly when the dispatcher will see one.
         permission = (
@@ -395,8 +481,11 @@ class RemoteTools:
             )
         elif claude is not None:
             if claude.status == "waiting":
-                question = (ask.text if ask is not None and ask.kind == "question" else None) or waiting_for_text(
-                    claude.waiting_for
+                menu = screen_menu(screen)
+                question = (
+                    (ask.text if ask is not None and ask.kind == "question" else None)
+                    or (menu.question if menu is not None else None)
+                    or waiting_for_text(claude.waiting_for)
                 )
             elif ask is not None and ask.kind == "question":
                 question = ask.text
@@ -440,6 +529,315 @@ class RemoteTools:
         )
         return ToolAnswer(format_readback(item, question=question, dropped=dropped))
 
+    async def _lacks_verb(self, name: str, verb: str, deadline: _Deadline) -> bool:
+        """The machine's dispatcher is known to lack `verb` (an older version). A failed `version`
+        call says nothing: the confirm step then reports what the dispatcher answers."""
+        cached = self._verbs.get(name)
+        if cached is not None and self._now() - cached[0] <= VERSION_CACHE_MS:
+            return verb not in cached[1]
+        result = await self.inventory.version(name, budget_seconds=deadline.left())
+        if not result.ok or not isinstance(result.data, VersionResponse):
+            return False
+        verbs = frozenset(result.data.verbs)
+        self._verbs[name] = (self._now(), verbs)
+        return verb not in verbs
+
+    async def remote_send_keys(
+        self, machine: str | None, target: str | None, keys: Sequence[str], caller: Caller
+    ) -> ToolAnswer:
+        """Prepares pressing keys (from a fixed list) in a pane, usually to answer a menu: checks,
+        reads back the keys and the menu or question on the screen, stores a confirmation. Sends
+        nothing."""
+        deadline = self._deadline()
+        found = resolve_machine(self.inventory.machines, machine)
+        if not isinstance(found, MatchOk):
+            return ToolAnswer(
+                format_machine_problem(
+                    machine, [m.name for m in self.inventory.machines], ambiguous=found.reason == "ambiguous"
+                ),
+                True,
+            )
+        config = found.item
+        name = config.name
+
+        def refuse(message: str, reason: str) -> ToolAnswer:
+            self._logger.info(
+                "tool call",
+                self._log_fields(
+                    {"tool": "remote_send_keys", "machine": name, "refused": reason, "count": len(keys)},
+                    target=target,
+                ),
+            )
+            return ToolAnswer(message, True)
+
+        if not config.allow_send:
+            return refuse(f"Sending is not enabled for {name}.", "not_enabled")
+        parsed = parse_keys(keys)
+        if isinstance(parsed, str):
+            return refuse(KEYS_REFUSAL[parsed], f"keys_{parsed}")
+        if keys_problem(parsed, menu_bound=True) == "key_order":
+            return refuse(KEYS_ORDER_REFUSAL, "key_order")
+        # The version probe runs alongside the list, not as a third round trip before the capture.
+        view, lacks_keys = await asyncio.gather(
+            self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left()),
+            self._lacks_verb(name, "keys", deadline),
+        )
+        if not view.ok:
+            return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
+        resolved = resolve_target(view, target)
+        if not isinstance(resolved, Resolved):
+            return refuse(format_target_problem(name, resolved), "target")
+        pane = resolved.pane
+        place = send_place(name, pane, resolved.name_window)
+        claude = pane.claude
+        if claude is None and not config.send_to_any_pane:
+            return refuse(f"{place} is not running Claude Code, so I will not press keys in it.", "not_claude")
+        if lacks_keys:
+            return refuse(f"switchboard-remote on {name} is too old to press keys. Update it there.", "old_dispatcher")
+        captured = await self.inventory.capture(name, pane.pane_id, SEND_CAPTURE_LINES, budget_seconds=deadline.left())
+        if not isinstance(captured, CaptureResponse):
+            if captured.detail == "gone":
+                return refuse(f"{place}: that pane is gone. Ask me to list the sessions again.", "gone")
+            return refuse(
+                f"{name} is not reachable: {unreachable_reason(captured.error, captured.detail)}.", "unreachable"
+            )
+        screen = clean_screen(captured.text)
+        ask = screen_ask(screen) if claude is not None else None
+        menu = screen_menu(screen)
+        # The same checks as remote_send: the dispatcher's `shows_dialog` on the same lines.
+        permission = (
+            (claude is not None and claude.status == "waiting" and waits_for_permission(claude.waiting_for))
+            or (ask is not None and ask.kind == "permission")
+            or shows_dialog(captured.text)
+        )
+        question: str | None
+        bound: str | None = None
+        # Keys land at a menu or permission dialog the owner heard; otherwise (`unbound`) at an
+        # input, where the stricter rules of `keys_problem` hold.
+        unbound = False
+        if permission:
+            if not config.allow_permission_answers:
+                return refuse(
+                    f"{place} is waiting for a permission decision, and answering those by voice is turned off. "
+                    "Approve it at the keyboard or in the Claude app.",
+                    "permission_prompt",
+                )
+            question = (ask.text if ask is not None and ask.kind == "permission" else None) or waiting_for_text(
+                claude.waiting_for if claude else None
+            )
+            if dialog_hash(captured.text) is None:
+                # The registry says it waits for permission, but no dialog is on the screen to bind
+                # the keys to (a stale entry, or a dialog shows_dialog cannot see): Enter would submit
+                # a draft, Up and Enter an earlier prompt, Shift+Tab would change the permission
+                # mode. No keys at all; the dispatcher refuses the same (`dialog_not_visible`).
+                return refuse(
+                    f"{place} is waiting for a permission decision, but the permission question is not "
+                    "visible on its screen, so I will not press keys there. Check it at the keyboard.",
+                    "dialog_not_visible",
+                )
+            # Prose that looks like a dialog ("Do you want to ...?" above an idle input box) has no
+            # answer options at the bottom, and shell output may print any dialog: the dispatcher
+            # applies the unbound rules there too.
+            unbound = not dialog_bound(captured.text, claude_pane=claude is not None)
+            if not unbound and keys_problem(parsed, menu_bound=True, answer=True) == "key_order":
+                # Shift+Tab is itself a choice in Claude Code's edit dialog (allow all edits this
+                # session) and closes it; a key after it would answer a queued dialog nobody heard.
+                # The dispatcher refuses the same (`key_order`). Unbound, `mode_keys` refuses them.
+                return refuse(KEYS_ANSWER_ORDER_REFUSAL, "key_order")
+        else:
+            # In a shell pane only a menu under a picker footer binds: shell output can print a fake
+            # menu above its prompt, where Up Enter reruns the previous command.
+            bound = bound_menu_hash(captured.text, claude_pane=claude is not None)
+            unbound = bound is None
+            if bound is not None and shows_draft(captured.text) and not shows_picker(captured.text):
+                # A "menu" over a draft without a picker footer may be the draft's own lines. The
+                # dispatcher refuses the same (`draft_present`).
+                return refuse(
+                    f"Something is already typed in the input of {place}, so I will not press keys there. "
+                    "Send or clear it at the keyboard first.",
+                    "draft_present",
+                )
+            question = (menu.question if menu is not None else None) or (
+                ask.text if ask is not None and ask.kind == "question" else None
+            )
+            if question is None and claude is not None and claude.status == "waiting":
+                question = waiting_for_text(claude.waiting_for)
+        if unbound:
+            if shows_picker(captured.text):
+                # A menu is open but cannot be read (a short full-screen pane may cut its top): its
+                # selection mark is no draft, and Enter would choose an option nobody heard. The
+                # dispatcher refuses the same (`menu_unreadable`).
+                taller = (
+                    " If it is cut off, I can make the pane taller."
+                    if captured.alternate_on
+                    and captured.pane_height is not None
+                    and captured.pane_height < RESIZE_ROWS[1]
+                    else ""
+                )
+                return refuse(
+                    f"{place} shows a menu I cannot read, so I will not press keys in it.{taller} "
+                    "Ask me what its screen says, or answer it at the keyboard.",
+                    "menu_unreadable",
+                )
+            problem = keys_problem(parsed, menu_bound=False)
+            if problem == "mode_keys":
+                # Tab and Shift+Tab at a Claude Code input switch modes (Shift+Tab cycles the
+                # permission mode up to accept edits or bypass), a broader grant than answering one
+                # dialog: only into a menu the owner heard or a permission dialog.
+                return refuse(
+                    f"There is no menu on the screen of {place}; tab and shift tab there would change "
+                    "Claude Code's mode, so I will not press them.",
+                    "mode_keys",
+                )
+            if problem == "history_submit":
+                # Up or Down at an input recalls an earlier prompt or shell command; Enter would
+                # submit text that was never read back or risk-checked.
+                return refuse(
+                    f"There is no menu on the screen of {place}; up or down and then enter would send "
+                    "an earlier prompt or command again without me reading it to you, so I will not "
+                    "press them. Tell me the message instead.",
+                    "history_submit",
+                )
+        if unbound:
+            # The keys land at an input, not at the menu find_menu may still read there (shell
+            # output, prose above the input): no option is read back as chosen.
+            menu = None
+        # Also for a permission dialog: find_menu reads its options, so the owner hears which one.
+        chosen = chosen_option(menu, parsed)
+        context = question
+        if chosen is None and menu is not None:
+            # Which option the keys choose is not known: every option counts as the question's.
+            context = " ".join([question or "", *(text for _, text in menu.options)]).strip() or None
+        risky = self._risk.classify(
+            chosen[1] if chosen is not None else "",
+            question=context,
+            echoed=False,
+            permission_answer=permission,
+            shell=claude is None,
+        )
+        item, dropped = self.confirmations.add(
+            client=caller.fingerprint,
+            client_name=caller.name,
+            machine=name,
+            session=clean_name(pane.session, 64),
+            place=place,
+            pane_id=pane.pane_id,
+            pane_pid=pane.pane_pid,
+            session_id=claude.session_id if claude is not None else None,
+            text=" ".join(parsed),
+            risky=risky,
+            permission_answer=permission,
+            dialog=dialog_hash(captured.text) if permission else None,
+            kind=KEYS,
+            keys=parsed,
+            menu=bound,
+        )
+        self._logger.info(
+            "tool call",
+            self._log_fields(
+                {
+                    "tool": "remote_send_keys",
+                    "machine": name,
+                    "paneId": pane.pane_id,
+                    "keys": parsed,
+                    "confirmation": item.id,
+                    "risky": risky,
+                    "permissionAnswer": permission,
+                    "menu": menu is not None,
+                    "dropped": [d.id for d in dropped],
+                },
+                target=target,
+            ),
+        )
+        return ToolAnswer(
+            format_keys_readback(
+                item, menu=menu, question=question, chosen=chosen, dropped=dropped, dialog_shown=not unbound
+            )
+        )
+
+    async def remote_resize(
+        self, machine: str | None, target: str | None, columns: int, rows: int, caller: Caller
+    ) -> ToolAnswer:
+        """Prepares resizing the window of a pane (for a menu cut off by a short pane). Sends nothing."""
+        deadline = self._deadline()
+        found = resolve_machine(self.inventory.machines, machine)
+        if not isinstance(found, MatchOk):
+            return ToolAnswer(
+                format_machine_problem(
+                    machine, [m.name for m in self.inventory.machines], ambiguous=found.reason == "ambiguous"
+                ),
+                True,
+            )
+        config = found.item
+        name = config.name
+
+        def refuse(message: str, reason: str) -> ToolAnswer:
+            self._logger.info(
+                "tool call",
+                self._log_fields({"tool": "remote_resize", "machine": name, "refused": reason}, target=target),
+            )
+            return ToolAnswer(message, True)
+
+        if not config.allow_send:
+            return refuse(f"Sending is not enabled for {name}, and resizing goes with it.", "not_enabled")
+        if not (RESIZE_COLUMNS[0] <= columns <= RESIZE_COLUMNS[1] and RESIZE_ROWS[0] <= rows <= RESIZE_ROWS[1]):
+            return refuse(
+                f"I can set {RESIZE_COLUMNS[0]} to {RESIZE_COLUMNS[1]} columns and {RESIZE_ROWS[0]} to "
+                f"{RESIZE_ROWS[1]} rows.",
+                "bad_size",
+            )
+        view, lacks_resize = await asyncio.gather(
+            self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left()),
+            self._lacks_verb(name, "resize", deadline),
+        )
+        if not view.ok:
+            return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
+        resolved = resolve_target(view, target)
+        if not isinstance(resolved, Resolved):
+            return refuse(format_target_problem(name, resolved), "target")
+        pane = resolved.pane
+        if pane.claude is None and not config.send_to_any_pane:
+            return refuse(
+                f"{send_place(name, pane, resolved.name_window)} is not running Claude Code, so I will not resize it.",
+                "not_claude",
+            )
+        if lacks_resize:
+            return refuse(
+                f"switchboard-remote on {name} is too old to resize windows. Update it there.", "old_dispatcher"
+            )
+        item, dropped = self.confirmations.add(
+            client=caller.fingerprint,
+            client_name=caller.name,
+            machine=name,
+            session=clean_name(pane.session, 64),
+            place=send_place(name, pane, resolved.name_window),
+            pane_id=pane.pane_id,
+            pane_pid=pane.pane_pid,
+            session_id=pane.claude.session_id if pane.claude is not None else None,
+            text=f"{columns}x{rows}",
+            risky=[],
+            permission_answer=False,
+            kind=RESIZE,
+            size=(columns, rows),
+        )
+        self._logger.info(
+            "tool call",
+            self._log_fields(
+                {
+                    "tool": "remote_resize",
+                    "machine": name,
+                    "paneId": pane.pane_id,
+                    "columns": columns,
+                    "rows": rows,
+                    "confirmation": item.id,
+                    "dropped": [d.id for d in dropped],
+                },
+                target=target,
+            ),
+        )
+        current = (pane.width, pane.height) if pane.width is not None and pane.height is not None else None
+        return ToolAnswer(format_resize_readback(item, current=current, dropped=dropped))
+
     async def remote_send_confirm(self, confirmation_id: str, risky_ok: bool, caller: Caller) -> ToolAnswer:
         """Sends a prepared message after the owner said yes to its read-back."""
         deadline = self._deadline()
@@ -462,6 +860,7 @@ class RemoteTools:
             {
                 "tool": "remote_send_confirm",
                 "confirmation": key,
+                "kind": item.kind,
                 "machine": item.machine,
                 "paneId": item.pane_id,
                 "outcome": outcome,
@@ -491,25 +890,39 @@ class RemoteTools:
         left = min(float(self._remote.ssh.command_timeout_seconds), deadline.left())
         if left < MIN_SEND_SECONDS:
             return "not_sent:slow", None
-        mode = [SEND_ANSWER, item.dialog or NO_DIALOG] if item.permission_answer else [SEND_MESSAGE]
-        result = await self.inventory.transport(item.machine).call(
-            "send",
-            [item.pane_id, str(item.pane_pid), item.session_id or "none", *mode],
-            timeout_seconds=left,
-            stdin=item.text.encode("utf-8"),
-        )
+        verb = "send"
+        stdin: bytes | None = None
+        session = item.session_id or "none"
+        if item.kind == KEYS:
+            verb = "keys"
+            bound = (
+                [SEND_ANSWER, item.dialog or NO_DIALOG] if item.permission_answer else [KEYS_MENU, item.menu or NO_MENU]
+            )
+            args = [item.pane_id, str(item.pane_pid), session, *bound, *item.keys]
+        elif item.kind == RESIZE and item.size is not None:
+            verb = "resize"
+            args = [item.pane_id, str(item.pane_pid), session, str(item.size[0]), str(item.size[1])]
+        else:
+            mode = [SEND_ANSWER, item.dialog or NO_DIALOG] if item.permission_answer else [SEND_MESSAGE]
+            args = [item.pane_id, str(item.pane_pid), session, *mode]
+            stdin = item.text.encode("utf-8")
+        result = await self.inventory.transport(item.machine).call(verb, args, timeout_seconds=left, stdin=stdin)
         self._logger.info(
             "remote call",
             {
                 "machine": item.machine,
-                "verb": "send",
+                "verb": verb,
                 "ok": result.ok,
                 "error": result.error,
                 "detail": result.detail,
                 "ms": result.elapsed_ms,
             },
         )
-        if result.ok and isinstance(result.data, SendResponse) and result.data.sent:
+        data = result.data
+        if result.ok and (
+            (isinstance(data, SendResponse | KeysResponse) and data.sent)
+            or (isinstance(data, ResizeResponse) and data.resized)
+        ):
             return "sent", None
         if result.ok:
             return "unknown", None

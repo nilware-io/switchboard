@@ -1,5 +1,7 @@
 """`stateDir/audit.jsonl`: one line per `remote_send_confirm` that reached the send step, also when
-sending failed (docs/SWITCHBOARD.md, "Audit").
+sending failed (docs/SWITCHBOARD.md, "Audit"). Messages are `remote_send` lines, keys
+`remote_send_keys` lines (with the key names, which come from a fixed list) and window sizes
+`remote_resize` lines.
 
 The file is 0600, opened in append mode and fsynced per line. The text itself is stored only as an
 HMAC-SHA256 with a random key in `stateDir/audit.key` (0600), because a plain hash of a short text
@@ -21,13 +23,14 @@ from typing import Any
 from ..clock import now_ms, to_iso
 from ..json_file import ensure_dir
 from .redact import redact
-from .send import Confirmation
+from .send import KEYS, RESIZE, Confirmation
 
 AUDIT_FILE = "audit.jsonl"
 KEY_FILE = "audit.key"
 KEY_BYTES = 32
 WARN_BYTES = 10 * 1024 * 1024
 MAX_LINE_BYTES = 64 * 1024
+EVENTS = {KEYS: "remote_send_keys", RESIZE: "remote_resize"}
 
 
 def audit_path(state_dir: str) -> str:
@@ -87,7 +90,7 @@ class AuditLog:
         key = load_key(self.state_dir)
         line: dict[str, Any] = {
             "time": to_iso(self.now()),
-            "event": "remote_send",
+            "event": EVENTS.get(item.kind, "remote_send"),
             "client": item.client,
             "clientName": item.client_name,
             "machine": item.machine,
@@ -101,6 +104,11 @@ class AuditLog:
             "textChars": len(item.text),
             "outcome": outcome,
         }
+        if item.kind == KEYS:
+            line["keys"] = list(item.keys)
+            line["menuBound"] = item.menu is not None
+        if item.kind == RESIZE and item.size is not None:
+            line["size"] = {"columns": item.size[0], "rows": item.size[1]}
         if self.log_prompts:
             line["text"] = redact(item.text)
         data = (json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -151,6 +159,7 @@ def read_audit(state_dir: str, limit: int | None = None) -> tuple[list[dict[str,
 
 AUDIT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("time", "time"),
+    ("event", "event"),
     ("machine", "machine"),
     ("session", "session"),
     ("paneId", "pane"),
@@ -158,6 +167,7 @@ AUDIT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("risky", "risky"),
     ("riskyOk", "risky ok"),
     ("textChars", "chars"),
+    ("keys", "keys"),
     ("clientName", "client"),
 )
 
