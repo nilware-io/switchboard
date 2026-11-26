@@ -4,8 +4,9 @@
 `Transport.call` never raises. Every failure maps to a fixed code that the speech layer turns into
 words: `timeout`, `host_key`, `auth`, `refused`, `dispatcher_missing`, `bad_response`,
 `refused_by_policy` (the dispatcher said no; its own code is in `detail`) or `other`. Processes run
-from argv (never a shell) in a new session and are killed as a process group on timeout; stdout is
-capped and stderr is kept only as a short tail for the error mapping, never logged.
+from argv (never a shell) in a new session and are killed as a process group on timeout and when
+the call is cancelled; stdout is capped and stderr is kept only as a short tail for the error
+mapping, never logged.
 """
 
 from __future__ import annotations
@@ -116,6 +117,12 @@ async def run_process(
                 await process.wait()
     except TimeoutError:
         timed_out = True
+    except asyncio.CancelledError:
+        # The caller is gone (a watcher tick stopped at shutdown): kill the group at once, without
+        # waiting, so no ssh or dispatcher outlives it.
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, signal.SIGKILL)
+        raise
     if timed_out or overflow or process.returncode is None:
         await _kill_group(process)
     tail = bytes(err[-STDERR_TAIL_BYTES:]).decode("utf-8", "replace")

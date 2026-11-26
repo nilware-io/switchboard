@@ -14,7 +14,14 @@ import pytest
 
 from tests.remote.helpers import SESSION_A, SESSION_B, SESSION_C, RemoteWorld, pane
 from tests.remote.test_tools import Ctx, build, populate
-from voice_coding_mcp.remote.pending import CAPTURE_LINES, MAX_CAPTURES, ScreenAsk, screen_ask
+from voice_coding_mcp.remote.pending import (
+    CAPTURE_LINES,
+    MAX_CAPTURES,
+    TITLE_LINES,
+    ScreenAsk,
+    is_status_label,
+    screen_ask,
+)
 
 DIALOG = "\n".join(
     [
@@ -88,6 +95,52 @@ def test_no_question_when_the_last_line_says_something_else() -> None:
     assert screen_ask("\n\n\n") is None
 
 
+INPUT_BOX = "\n╭──────────────────────────────╮\n│ >                            │\n╰──────────────────────────────╯\n  ? for shortcuts"
+
+
+def test_a_closing_question_in_prose_is_a_question_not_a_permission() -> None:
+    assert screen_ask("⏺ Done. Do you want to see the full diff?" + INPUT_BOX) == ScreenAsk(
+        "question", "Done. Do you want to see the full diff?"
+    )
+    # Starting its line is not enough without the dialog's numbered options.
+    assert screen_ask("⏺ Done.\n  Do you want to see the full diff?" + INPUT_BOX) == ScreenAsk(
+        "question", "Do you want to see the full diff?"
+    )
+
+
+def test_a_finished_message_that_quotes_a_dialog_question_waits_for_nobody() -> None:
+    assert screen_ask("⏺ I asked earlier: do you want to proceed? You said yes, so all done." + INPUT_BOX) is None
+    assert screen_ask("⏺ I asked earlier: do you want to proceed? You said yes, so all done.") is None
+
+
+def test_numbered_choices_in_assistant_text_are_not_a_dialog() -> None:
+    prose = "⏺ Pick one:\n 1. Yes, rewrite\n 2. No, keep it"
+    assert screen_ask(prose + INPUT_BOX) is None
+    # Also at the very bottom of the screen: the assistant marker shows it is a message.
+    assert screen_ask(prose) is None
+    assert screen_ask(prose + "\n 3. Something else?" + INPUT_BOX) == ScreenAsk("question", "3. Something else?")
+
+
+def test_numbered_options_count_inside_a_box_or_above_the_footer() -> None:
+    boxed = "⏺ Working on it.\n╭────╮\n│ Allow this? │\n│ ❯ 1. Yes │\n│   2. No │\n╰────╯\n  esc to cancel"
+    assert screen_ask(boxed) == ScreenAsk("permission", "Allow this?")
+    assert screen_ask("Allow this?\n 1. Yes\n 2. No\n  esc to cancel") == ScreenAsk("permission", "Allow this?")
+    # Options without a box, followed by an input box, are text above the input box.
+    assert screen_ask("Allow this?\n 1. Yes\n 2. No" + INPUT_BOX) is None
+
+
+def test_a_dialog_title_never_takes_assistant_lines() -> None:
+    # The dialog's top border has scrolled out of the tail: the walk stops at the assistant line.
+    no_top = "⏺ I fixed the parser and all 41 tests pass.\n" + "\n".join(DIALOG.split("\n")[2:])
+    assert screen_ask(no_top) == ScreenAsk("permission", "Bash command git push origin main")
+    no_title = "⏺ I fixed the parser.\n│ Do you want to proceed? │\n│ ❯ 1. Yes │\n│   2. No │\n╰──╯"
+    assert screen_ask(no_title) == ScreenAsk("permission", "Do you want to proceed?")
+    # The walk is bounded: at most TITLE_LINES lines above the question.
+    lines = ["earlier text", "more text"] + [f"│ detail {i} │" for i in range(TITLE_LINES)]
+    lines += ["│ Do you want to proceed? │", "│ 1. Yes │", "│ 2. No │"]
+    assert screen_ask("\n".join(lines)) == ScreenAsk("permission", "detail 0 detail 1")
+
+
 def test_only_the_tail_of_the_screen_counts() -> None:
     old = DIALOG + "\n" + "\n".join(f"line {i}" for i in range(CAPTURE_LINES))
     assert screen_ask(old) is None
@@ -105,6 +158,13 @@ def test_questions_are_redacted_and_clipped() -> None:
     assert asked is not None
     assert asked.text is not None
     assert len(asked.text) == 100
+
+
+def test_status_labels_and_questions_in_waiting_for() -> None:
+    for label in ("permission prompt", "user answer", "your answer", "tool_approval", "input"):
+        assert is_status_label(label)
+    for question in ("Should I push?", "use token=[secret] now", "Bash command git push origin main"):
+        assert not is_status_label(question)
 
 
 # --- the tool -------------------------------------------------------------------------------------
@@ -125,8 +185,8 @@ async def test_registry_waits_on_every_machine(ctx: Ctx) -> None:
     assert not answer.is_error
     assert answer.text == (
         "2 sessions need you.\n"
-        'On dev, work-api asks for permission: "permission prompt".\n'
-        'On dev, notes asks: "user answer".\n'
+        "On dev, work-api asks for permission.\n"
+        "On dev, notes asks you something.\n"
         "Approve it at the keyboard or in the Claude app.\n"
         "buildbox could not be checked: the connection timed out."
     )
@@ -271,7 +331,8 @@ async def test_two_claude_panes_in_a_session_are_named_by_window(tmp_path: Path)
     c = await build(tmp_path, world, summary=False)
     try:
         answer = await c.tools.pending_input("dev")
-        assert answer.text == '1 session needs you.\nOn dev, fpga window 1 asks: "your answer".'
+        # "your answer" is a status label, not a question: it is not quoted.
+        assert answer.text == "1 session needs you.\nOn dev, fpga window 1 asks you something."
     finally:
         await c.manager.shutdown("test finished")
 
@@ -313,7 +374,7 @@ async def test_local_sessions_outside_tmux_from_the_hub_registry(tmp_path: Path)
         answer = await c.tools.pending_input(None)
         assert answer.text == (
             "1 session needs you.\n"
-            'On this machine, session "billing fix" in alpha asks for permission: "permission prompt".\n'
+            'On this machine, session "billing fix" in alpha asks for permission.\n'
             "Approve it at the keyboard or in the Claude app.\n"
             "buildbox could not be checked: the connection timed out."
         )

@@ -20,6 +20,8 @@ from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Fie
 from pydantic.alias_generators import to_camel
 
 MACHINE_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+RESERVED_MACHINE_NAME = "local"
+"""Keys of the hub's own registry sessions start with it (`pending.LOCAL`)."""
 HOST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 HOST_IPV6_RE = re.compile(r"[0-9A-Fa-f:]{2,39}")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
@@ -165,6 +167,8 @@ def check_remote(remote: RemoteConfig, *, allow_non_loopback: bool, state_dir: s
         path = f"remote.machines.{index}"
         if machine.name in seen:
             problems.append(f"{path}.name: duplicate machine name {machine.name}")
+        if machine.name == RESERVED_MACHINE_NAME:
+            problems.append(f"{path}.name: {RESERVED_MACHINE_NAME} is reserved for the hub's own sessions")
         seen.add(machine.name)
         if machine.transport == "ssh":
             for key, value in (("host", machine.host), ("user", machine.user), ("identityFile", machine.identity_file)):

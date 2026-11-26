@@ -115,6 +115,8 @@ def test_valid_hosts(tmp_path: Path) -> None:
 
 def test_cross_machine_rules(tmp_path: Path) -> None:
     assert "duplicate machine name dev" in error(tmp_path, {"machines": [machine("dev"), machine("dev")]})
+    # The hub's own registry sessions are keyed `local|...`: a machine of that name would mix with them.
+    assert "remote.machines.0.name: local is reserved" in error(tmp_path, {"machines": [machine("local")]})
     local = {"name": "dev", "transport": "local", "sessions": ["fpga"]}
     two_local = [local, {**local, "name": "other"}]
     assert "at most one machine may use transport local" in error(tmp_path, {"machines": two_local})

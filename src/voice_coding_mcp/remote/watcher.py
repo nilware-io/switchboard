@@ -83,6 +83,9 @@ class Watcher:
         self._busy: dict[str, int] = {}
         """Session key: when its current busy turn started (ms)."""
         self._fails: dict[str, int] = {}
+        self._deferred: dict[str, str] = {}
+        """Session key: a "finished its turn" push held back for one tick, because a screen-only wait
+        of the same session was still being confirmed (one push per event)."""
         self._loop: asyncio.Task[None] | None = None
         self._load()
 
@@ -104,10 +107,15 @@ class Watcher:
     async def _run(self) -> None:
         while True:
             await asyncio.sleep(self._watch.interval_seconds)
-            try:
-                await self.tick()
-            except Exception as err:
-                self._opts.logger.error("watch tick failed", {"error": err})
+            await self.safe_tick()
+
+    async def safe_tick(self) -> None:
+        """A tick of the loop: a failure is logged by its type only (its text may come from a
+        machine) and the loop goes on."""
+        try:
+            await self.tick()
+        except Exception as err:
+            self._opts.logger.error("watch tick failed", {"error": type(err).__name__})
 
     # --- state file ---------------------------------------------------------------------------
 
@@ -171,7 +179,10 @@ class Watcher:
         self._announced = {key for key in self._announced if still(key)}
         self._seen = {key: count for key, count in self._seen.items() if still(key)}
 
-        pushes += self._turns(report, now, pushed_sessions, unknown)
+        deferred, self._deferred = self._deferred, {}
+        pushes += [text for key, text in deferred.items() if key not in pushed_sessions]
+        confirming = {current[key].session.key for key in self._seen if key in current}
+        pushes += self._turns(report, now, pushed_sessions, unknown, confirming)
         pushes += self._reachability(report)
 
         if (frozenset(self._announced), frozenset(self._down)) != before:
@@ -180,9 +191,18 @@ class Watcher:
             await self._opts.send(text)
         return pushes
 
-    def _turns(self, report: PendingReport, now: int, pushed: set[str], unknown: Callable[[str], bool]) -> list[str]:
+    def _turns(
+        self,
+        report: PendingReport,
+        now: int,
+        pushed: set[str],
+        unknown: Callable[[str], bool],
+        confirming: set[str],
+    ) -> list[str]:
         """ "finished its turn" pushes for sessions that were busy at least `longTurnMinutes` and are
-        now idle or waiting. A session that just pushed a wait gets no second push for the same change."""
+        now idle or waiting. A session that just pushed a wait gets no second push for the same change;
+        one whose screen-only wait is still being confirmed (`confirming`) has its push held back a
+        tick, and dropped when that wait then pushes."""
         pushes: list[str] = []
         present: set[str] = set()
         for session in report.sessions:
@@ -201,6 +221,9 @@ class Watcher:
             minutes = (end - start) // MINUTE_MS
             limit = self._watch.long_turn_minutes
             if limit > 0 and minutes >= limit and session.key not in pushed:
+                if session.key in confirming:
+                    self._deferred[session.key] = turn_text(session, minutes)
+                    continue
                 pushes.append(turn_text(session, minutes))
                 self._opts.logger.info("watch push", {"event": "turn", "machine": session.machine or "local"})
         for key in list(self._busy):

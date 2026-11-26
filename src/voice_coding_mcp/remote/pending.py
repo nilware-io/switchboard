@@ -23,6 +23,7 @@ from ..log import Logger
 from ..projects import is_inside
 from ..sessions import LiveSession, read_live_sessions
 from ..text import clip
+from .config import RESERVED_MACHINE_NAME
 from .inventory import Inventory, MachineView
 from .protocol import CaptureResponse, PaneInfo
 from .redact import clean_name, clean_screen, redact
@@ -34,22 +35,37 @@ MAX_CAPTURES = 6
 """Panes captured per machine for one check; waiting panes go first."""
 QUESTION_MAX = 100
 MIN_CAPTURE_BUDGET_SECONDS = 0.5
-LOCAL = "local"
-"""Session keys of the hub's own registry start with this word (machine names cannot contain `|`)."""
+LOCAL = RESERVED_MACHINE_NAME
+"""Session keys of the hub's own registry start with this word (no machine may be named so, and
+machine names cannot contain `|`)."""
 
 PendingKind = Literal["permission", "question"]
 PendingSource = Literal["registry", "screen"]
 
-_DIALOG_RE = re.compile(r"\bdo you want to\b[^?]{0,200}\?", re.I)
+_DIALOG_RE = re.compile(r"^do you want to\b[^?]{0,200}\?", re.I)
+"""Claude Code's dialog question: it starts its line (after box edges), never inside prose."""
 _GENERIC_DIALOG_RE = re.compile(r"^do you want to proceed\s*\?", re.I)
+_OPTION_RE = re.compile(r"^(?:[❯>›▶]\s*)?[1-9][.)]\s")
 _YES_RE = re.compile(r"^(?:[❯>›▶]\s*)?1[.)]\s*yes\b", re.I)
 _NO_RE = re.compile(r"^(?:[❯>›▶]\s*)?[2-9][.)]\s*no\b", re.I)
 _MARKER_RE = re.compile(r"^[⏺●•◆✻*]\s*")
+"""Claude Code's mark at the start of an assistant message (or tool call)."""
+_BOX_EDGES = ("│", "┃", "║")
+TITLE_LINES = 6
+"""Non-empty lines above a dialog's question or options that may belong to the dialog."""
+_LABEL_RE = re.compile(r"[A-Za-z][A-Za-z _-]{0,39}")
+LABEL_WORDS = 3
 
 
 def waits_for_permission(waiting_for: str | None) -> bool:
     """A registry `waitingFor` that names a permission decision."""
     return "permission" in (waiting_for or "").lower()
+
+
+def is_status_label(waiting_for: str) -> bool:
+    """A `waitingFor` that reads as a status label ("permission prompt", "user answer") rather than
+    a question: at most LABEL_WORDS words of letters, no question mark. Such a label is not quoted."""
+    return _LABEL_RE.fullmatch(waiting_for.strip()) is not None and len(waiting_for.split()) <= LABEL_WORDS
 
 
 @dataclass(frozen=True)
@@ -66,52 +82,118 @@ def _question_text(value: str | None) -> str | None:
     return clip(text, QUESTION_MAX) if text else None
 
 
-def _tail(screen: str) -> list[str]:
-    lines = [strip_box(raw) for raw in screen.split("\n")]
-    while lines and not lines[-1]:
+def _waiting_for_text(value: str | None) -> str | None:
+    """`waitingFor` as a quotable question, or None when it is empty or only a status label."""
+    text = _question_text(value)
+    return None if text is None or is_status_label(text) else text
+
+
+@dataclass(frozen=True)
+class _Line:
+    text: str
+    """Without surrounding whitespace and box edges."""
+    boxed: bool
+    """The raw line started with a box edge (`│`): inside a drawn box."""
+
+
+def _tail(screen: str) -> list[_Line]:
+    lines = [_Line(strip_box(raw), raw.strip().startswith(_BOX_EDGES)) for raw in screen.split("\n")]
+    while lines and not lines[-1].text:
         lines.pop()
     return lines[-CAPTURE_LINES:]
 
 
-def _dialog_title(lines: Sequence[str], anchor: int, question: str | None) -> str | None:
-    """What a permission dialog asks: a specific question line ("Do you want to make this edit to
-    parser.py?") as is, else the first two lines of the dialog above it ("Bash command",
-    "git push origin main"), else the question line."""
-    if question and not _GENERIC_DIALOG_RE.match(question):
-        return question
+def _above(lines: Sequence[_Line], anchor: int) -> tuple[list[str], bool]:
+    """The content lines of a dialog above `anchor` (top first): non-empty lines up to its top border,
+    at most TITLE_LINES. The flag says the walk ran into an assistant line (`⏺ ...`), which is never
+    part of a dialog; that line is left out."""
     content: list[str] = []
     for line in reversed(lines[:anchor]):
-        if not line:
+        if not line.text:
             continue
-        if is_border(line):
+        if is_border(line.text):
             break
-        content.append(line)
+        if _MARKER_RE.match(line.text):
+            content.reverse()
+            return content, True
+        content.append(line.text)
+        if len(content) >= TITLE_LINES:
+            break
     content.reverse()
-    if content:
-        return " ".join(content[:2])
-    return question
+    return content, False
+
+
+def _options_end(lines: Sequence[_Line], yes: int) -> int | None:
+    """After a `1. Yes` line at `yes`: the index of the last line of its option block when one of the
+    options is a `2.`..`9.` `No`, else None. Empty lines inside the block are skipped."""
+    last, has_no = yes, False
+    for index in range(yes + 1, len(lines)):
+        text = lines[index].text
+        if not text:
+            continue
+        if not _OPTION_RE.match(text):
+            break
+        last = index
+        has_no = has_no or _NO_RE.match(text) is not None
+    return last if has_no else None
+
+
+def _at_footer(lines: Sequence[_Line], end: int) -> bool:
+    """Only borders, status lines and empty lines follow line `end` (Claude Code's dialog takes the
+    place of the input box; numbered options above an input box are assistant text)."""
+    return all(
+        not is_input_line(line.text) and (is_border(line.text) or is_status_line(line.text))
+        for line in lines[end + 1 :]
+    )
+
+
+def _title(content: Sequence[str], question: str | None) -> str | None:
+    """A specific question line ("Do you want to make this edit to parser.py?") as is, else the first
+    two content lines of the dialog ("Bash command", "git push origin main"), else the question."""
+    if question and not _GENERIC_DIALOG_RE.match(question):
+        return question
+    parts = [_MARKER_RE.sub("", line).strip() for line in content[:2]]
+    title = " ".join(part for part in parts if part)
+    return title or question
+
+
+def _dialog(lines: Sequence[_Line]) -> ScreenAsk | None:
+    """Claude Code's permission dialog: a line that starts with "Do you want to ...?" directly followed
+    by a `1. Yes` option and a later `2.`..`9.` `No` option; or such numbered options alone when they
+    sit inside a box or directly above the footer and not under an assistant line."""
+    for index, line in enumerate(lines):
+        found = _DIALOG_RE.match(line.text)
+        if found is None:
+            continue
+        yes = next((i for i in range(index + 1, len(lines)) if lines[i].text), None)
+        if yes is None or not _YES_RE.match(lines[yes].text) or _options_end(lines, yes) is None:
+            continue
+        content, _ = _above(lines, index)
+        return ScreenAsk("permission", _question_text(_title(content, found.group(0))))
+    for index, line in enumerate(lines):
+        if not _YES_RE.match(line.text):
+            continue
+        end = _options_end(lines, index)
+        if end is None or not (line.boxed or _at_footer(lines, end)):
+            continue
+        content, assistant = _above(lines, index)
+        if assistant:
+            continue
+        return ScreenAsk("permission", _question_text(_title(content, None)))
+    return None
 
 
 def screen_ask(screen: str) -> ScreenAsk | None:
-    """A permission dialog ("Do you want to proceed?", or numbered options with Yes and No) or a
-    question (the last assistant line above the input box ends with `?`) in the last
-    CAPTURE_LINES lines of a cleaned screen, else None."""
+    """A permission dialog (see `_dialog`) or a question (the last assistant line above the input box
+    ends with `?`) in the last CAPTURE_LINES lines of a cleaned screen, else None. Prose that only
+    mentions "do you want to" or lists numbered choices is a question or nothing, never a dialog."""
     lines = _tail(screen)
-    anchor: int | None = None
-    question: str | None = None
-    for index, line in enumerate(lines):
-        found = _DIALOG_RE.search(line)
-        if found is not None:
-            anchor, question = index, found.group(0)
-            break
-    if anchor is None:
-        yes = next((i for i, line in enumerate(lines) if _YES_RE.match(line)), None)
-        if yes is not None and any(_NO_RE.match(line) for line in lines[yes + 1 :]):
-            anchor = yes
-    if anchor is not None:
-        return ScreenAsk("permission", _question_text(_dialog_title(lines, anchor, question)))
-    inputs = [i for i, line in enumerate(lines) if is_input_line(line)]
-    above = lines[: inputs[-1]] if inputs else lines
+    dialog = _dialog(lines)
+    if dialog is not None:
+        return dialog
+    texts = [line.text for line in lines]
+    inputs = [i for i, text in enumerate(texts) if is_input_line(text)]
+    above = texts[: inputs[-1]] if inputs else texts
     for line in reversed(above):
         if is_border(line) or is_status_line(line) or is_input_line(line):
             continue
@@ -308,7 +390,7 @@ class PendingChecker:
                             session=tracked,
                             label=label,
                             kind=kind,
-                            question=text or _question_text(claude.waiting_for),
+                            question=text or _waiting_for_text(claude.waiting_for),
                             source="registry",
                             permission_answers=machine.allow_permission_answers,
                         )
@@ -380,7 +462,7 @@ class PendingChecker:
             session=tracked,
             label=label,
             kind=kind,
-            question=_question_text(session.waiting_for),
+            question=_waiting_for_text(session.waiting_for),
             source="registry",
             permission_answers=False,
         )

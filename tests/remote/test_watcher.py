@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import config_data
+from tests.helpers import LogCapture, config_data
 from tests.remote.helpers import SESSION_A, SESSION_B, RemoteWorld, pane
 from tests.remote.test_tools import build
 from voice_coding_mcp import http as http_module
@@ -238,6 +238,52 @@ async def test_a_long_turn_that_ends_in_a_new_wait_pushes_only_the_wait(rig: Rig
     assert await _tick(rig, w, report([], [tracked(status="busy", at=T0)]), T0) == []
     waiting = entry(tracked(status="waiting"))
     assert await _tick(rig, w, report([waiting]), T0 + 30 * MINUTE_MS) == ["fpga on dev needs a decision."]
+
+
+async def test_a_long_turn_that_ends_in_a_screen_only_wait_pushes_once(rig: Rig) -> None:
+    """The wait needs a second tick to be confirmed; the turn push waits for it and is then dropped."""
+    w = rig.watcher()
+    assert await _tick(rig, w, report([], [tracked(status="busy", at=T0)]), T0) == []
+    idle = tracked(status="idle", at=T0 + 29 * MINUTE_MS)
+    asks = entry(idle, kind="question", source="screen")
+    assert await _tick(rig, w, report([asks]), T0 + 30 * MINUTE_MS) == []
+    assert await _tick(rig, w, report([asks]), T0 + 31 * MINUTE_MS) == ["fpga on dev asks you something."]
+    assert await _tick(rig, w, report([asks]), T0 + 32 * MINUTE_MS) == []
+
+
+async def test_a_held_back_turn_push_is_sent_when_the_screen_wait_goes_away(rig: Rig) -> None:
+    w = rig.watcher()
+    assert await _tick(rig, w, report([], [tracked(status="busy", at=T0)]), T0) == []
+    idle = tracked(status="idle", at=T0 + 29 * MINUTE_MS)
+    asks = entry(idle, kind="question", source="screen")
+    assert await _tick(rig, w, report([asks]), T0 + 30 * MINUTE_MS) == []
+    assert await _tick(rig, w, report([], [idle]), T0 + 31 * MINUTE_MS) == [
+        "fpga on dev finished its turn after 29 minutes."
+    ]
+    assert await _tick(rig, w, report([], [idle]), T0 + 32 * MINUTE_MS) == []
+
+
+async def test_a_failed_tick_logs_only_the_error_type(tmp_path: Path) -> None:
+    log = LogCapture()
+
+    async def check() -> PendingReport:
+        raise ValueError("from the screen: token=s3cr3tvalue")
+
+    async def send(text: str) -> None:
+        raise AssertionError(text)
+
+    w = Watcher(
+        WatcherOptions(
+            watch=WatchConfig(interval_seconds=60),
+            check=check,
+            send=send,
+            state_dir=str(tmp_path / "state"),
+            logger=log.logger,
+        )
+    )
+    await w.safe_tick()
+    assert [r["error"] for r in log.records if r["msg"] == "watch tick failed"] == ["ValueError"]
+    assert "s3cr3tvalue" not in log.text()
 
 
 async def test_a_session_that_ended_is_forgotten(rig: Rig) -> None:

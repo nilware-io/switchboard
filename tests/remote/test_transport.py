@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import is_alive
+from tests.helpers import is_alive, until
 from tests.remote.helpers import RemoteWorld, pane
 from voice_coding_mcp.remote.config import MachineConfig, RemoteConfig, SshConfig
 from voice_coding_mcp.remote.protocol import CaptureResponse, ListResponse, VersionResponse
@@ -171,6 +171,26 @@ async def test_run_process_kills_leftover_children_on_timeout(tmp_path: Path) ->
             break
         await asyncio.sleep(0.05)
     assert not is_alive(child)
+
+
+async def test_run_process_kills_the_process_group_when_cancelled(tmp_path: Path) -> None:
+    """A watcher tick stopped at shutdown cancels its calls: no ssh child or grandchild outlives it."""
+    pid_file = tmp_path / "pids"
+    script = (
+        "import os,subprocess,sys,time\n"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+        f"open({str(pid_file)!r},'w').write(f'{{os.getpid()}} {{p.pid}}')\n"
+        "time.sleep(60)"
+    )
+    call = asyncio.ensure_future(run_process([sys.executable, "-c", script], dict(os.environ), timeout_seconds=30))
+    await until(lambda: pid_file.exists() and len(pid_file.read_text().split()) == 2)
+    pids = [int(pid) for pid in pid_file.read_text().split()]
+    started = time.monotonic()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert time.monotonic() - started < 1
+    await until(lambda: not any(is_alive(pid) for pid in pids))
 
 
 CRASH = (
