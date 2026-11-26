@@ -193,7 +193,11 @@ def run(
 
 
 def main() -> int:
-    return run(sys.argv[1:], dict(os.environ))
+    try:
+        return run(sys.argv[1:], dict(os.environ))
+    except Exception:  # stderr reaches the machine: never a traceback with hub paths
+        print("switchboard relay: internal error", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

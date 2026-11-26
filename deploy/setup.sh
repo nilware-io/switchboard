@@ -330,7 +330,7 @@ if [[ ${VCM_AGENT_RELAY:-0} == 1 ]]; then
 	sshd -t
 	sshd -T -C "user=$RELAY_USER,host=relay-check,addr=192.0.2.1" | grep -Ex 'disableforwarding yes|permittty no' \
 		| wc -l | grep -qx 2 || die "the sshd drop-in for $RELAY_USER is not in effect"
-	systemctl reload ssh 2>/dev/null || systemctl reload sshd
+	systemctl try-reload-or-restart ssh 2>/dev/null || systemctl try-reload-or-restart sshd 2>/dev/null || true
 	echo "Relay ready. Add one key line per machine to $RELAY_KEYS_DIR/authorized_keys (format in"
 	echo "$APP_DIR/deploy/relay/authorized_keys.example), add the machines to the config, restart the"
 	echo "hub (it binds the relay socket only at start), then run: voice-coding-mcp remote-check"
