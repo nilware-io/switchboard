@@ -25,12 +25,16 @@ from ..sessions import LiveSession, read_live_sessions
 from ..text import clip
 from .config import RESERVED_MACHINE_NAME
 from .inventory import Inventory, MachineView
+from .menu import screen_menu
 from .protocol import CaptureResponse, PaneInfo
 from .redact import clean_name, clean_screen, redact
 from .summarize import is_border, is_input_line, is_status_line, strip_box
 
 CAPTURE_LINES = 15
 """Screen lines a question check reads (the tail of the pane)."""
+WAITING_CAPTURE_LINES = 40
+"""Screen lines captured for a registry `waiting` pane: a menu with its question can be taller than
+CAPTURE_LINES (the dialog and question heuristics still look at the last CAPTURE_LINES)."""
 MAX_CAPTURES = 6
 """Panes captured per machine for one check; waiting panes go first."""
 QUESTION_MAX = 100
@@ -327,7 +331,9 @@ class PendingChecker:
             budget = left()
             if budget < MIN_CAPTURE_BUDGET_SECONDS:
                 return None
-            result = await inventory.capture(machine, pane.pane_id, CAPTURE_LINES, budget_seconds=budget)
+            waiting = pane.claude is not None and pane.claude.status == "waiting"
+            lines = WAITING_CAPTURE_LINES if waiting else CAPTURE_LINES
+            result = await inventory.capture(machine, pane.pane_id, lines, budget_seconds=budget)
             if isinstance(result, CaptureResponse):
                 return result
             return "gone" if result.detail == "gone" else None
@@ -377,7 +383,8 @@ class PendingChecker:
                 response = captured.get((machine.name, pane.pane_id))
                 if response == "gone":
                     continue
-                ask = screen_ask(clean_screen(response.text)) if isinstance(response, CaptureResponse) else None
+                screen = clean_screen(response.text) if isinstance(response, CaptureResponse) else None
+                ask = screen_ask(screen) if screen is not None else None
                 if claude.status == "idle" and ((checked and response is None) or pane in plan.skipped):
                     # Only an idle pane depends on its screen; a waiting one is known from the registry.
                     missed = True
@@ -385,6 +392,10 @@ class PendingChecker:
                 if claude.status == "waiting":
                     kind: PendingKind = "permission" if waits_for_permission(claude.waiting_for) else "question"
                     text = ask.text if ask is not None and ask.kind == kind and ask.text else None
+                    if text is None and kind == "question" and screen is not None:
+                        # A menu (Claude Code asking with choices): its question sits above the options.
+                        menu = screen_menu(screen)
+                        text = _question_text(menu.question) if menu is not None else None
                     entries.append(
                         PendingEntry(
                             key=f"{tracked.key}|{kind}",

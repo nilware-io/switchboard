@@ -18,6 +18,7 @@ from voice_coding_mcp.remote.pending import (
     CAPTURE_LINES,
     MAX_CAPTURES,
     TITLE_LINES,
+    WAITING_CAPTURE_LINES,
     ScreenAsk,
     is_status_label,
     screen_ask,
@@ -190,10 +191,10 @@ async def test_registry_waits_on_every_machine(ctx: Ctx) -> None:
         "Approve it at the keyboard or in the Claude app.\n"
         "buildbox could not be checked: the connection timed out."
     )
-    # Only the two waiting panes were captured, with the short tail; never the busy one or a shell.
+    # Only the two waiting panes were captured (with room for a menu); never the busy one or a shell.
     captures = [call["argv"] for call in ctx.world.tmux_calls() if "capture-pane" in call["argv"]]
     assert sorted(argv[argv.index("-t") + 1] for argv in captures) == ["%3", "%4"]
-    assert all(argv[-1] == f"-{CAPTURE_LINES}" for argv in captures)
+    assert all(argv[-1] == f"-{WAITING_CAPTURE_LINES}" for argv in captures)
     # The Claude Code session name ("billing fix") is not how a pane is named here.
     assert "billing fix" not in answer.text
 

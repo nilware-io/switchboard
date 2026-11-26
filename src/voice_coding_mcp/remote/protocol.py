@@ -18,7 +18,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 from ..usage.records import UsageBatch, UsageStreamError, parse_lines
 
 DISPATCHER_PROGRAM = "switchboard-remote"
-VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage")
+VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage", "keys", "resize")
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -94,6 +94,9 @@ class PaneInfo(_Response):
     active: bool = False
     attached: bool = False
     activity: int | None = None
+    width: int | None = None
+    """Pane size in columns and rows (dispatcher 0.5.0 and newer)."""
+    height: int | None = None
     claude: ClaudeInfo | None = None
 
 
@@ -107,6 +110,11 @@ class CaptureResponse(_Response):
     pane_id: str = Field(alias="paneId")
     session: Name
     window: int | None = None
+    pane_width: int | None = Field(default=None, alias="paneWidth")
+    pane_height: int | None = Field(default=None, alias="paneHeight")
+    alternate_on: bool = Field(default=False, alias="alternateOn")
+    """The pane shows its alternate screen (a full-screen program), which has no scrollback: only
+    the visible rows can be captured (dispatcher 0.5.0 and newer)."""
 
 
 class VersionResponse(_Response):
@@ -121,6 +129,17 @@ class SendResponse(_Response):
     bytes: int = Field(ge=0)
     enter: bool = True
     """False for a permission answer: the choice number was typed, Enter was not pressed."""
+
+
+class KeysResponse(_Response):
+    sent: bool
+    keys: int = Field(ge=0)
+
+
+class ResizeResponse(_Response):
+    resized: bool
+    columns: int = Field(ge=0)
+    rows: int = Field(ge=0)
 
 
 class UsageResponse(BaseModel):
@@ -139,6 +158,8 @@ RESPONSE_MODELS: dict[str, type[_Response]] = {
     "list": ListResponse,
     "capture": CaptureResponse,
     "send": SendResponse,
+    "keys": KeysResponse,
+    "resize": ResizeResponse,
 }
 
 

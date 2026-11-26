@@ -16,17 +16,25 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ..clock import SECOND_MS
-from .dispatcher import PERMISSION_ANSWER_RE, dialog_hash, shows_dialog, text_problem
+from .dispatcher import KEY_NAMES, MAX_KEYS, PERMISSION_ANSWER_RE, dialog_hash, menu_hash, shows_dialog, text_problem
+from .menu import ScreenMenu
 
 __all__ = [
+    "KEYS",
     "PERMISSION_ANSWER_RE",
+    "RESIZE",
     "RISKY",
+    "TEXT",
     "Confirmation",
     "ConfirmationStore",
     "RiskClassifier",
     "ScreenEcho",
+    "chosen_option",
     "dialog_hash",
+    "key_words",
+    "menu_hash",
     "normalize_text",
+    "parse_keys",
     "shows_dialog",
     "text_problem",
 ]
@@ -87,6 +95,82 @@ _CONTEXT_SAYS = {
     PERMISSION: "this answers a permission question",
     SHELL: "this types into a plain shell, not into Claude Code",
 }
+
+
+TEXT = "text"
+KEYS = "keys"
+RESIZE = "resize"
+"""Confirmation kinds: a message (`remote_send`), keys (`remote_send_keys`), a window size
+(`remote_resize`). All are confirmed with `remote_send_confirm`."""
+
+_KEY_ALIASES: dict[str, str] = {
+    **{name.lower(): name for name in KEY_NAMES},
+    "return": "Enter",
+    "esc": "Escape",
+    "shift tab": "BTab",
+    "shift+tab": "BTab",
+    "shift-tab": "BTab",
+    "backtab": "BTab",
+    "arrow up": "Up",
+    "arrow down": "Down",
+    "arrow left": "Left",
+    "arrow right": "Right",
+    "up arrow": "Up",
+    "down arrow": "Down",
+    "left arrow": "Left",
+    "right arrow": "Right",
+}
+_KEY_SPOKEN: dict[str, str] = {"BTab": "shift tab", **{name: name.lower() for name in KEY_NAMES if name != "BTab"}}
+
+
+def parse_keys(values: Sequence[str]) -> list[str] | Literal["empty", "too_many", "unknown"]:
+    """The dispatcher's key names (`dispatcher.KEY_NAMES`) for spoken or written key names, matched
+    case-insensitively against a fixed list of names and aliases ("esc", "return", "shift tab");
+    anything else, such as `C-c`, `M-x`, free text, control characters or tmux commands, is
+    `unknown`."""
+    if not values:
+        return "empty"
+    if len(values) > MAX_KEYS:
+        return "too_many"
+    keys: list[str] = []
+    for value in values:
+        printable = isinstance(value, str) and value.isprintable()
+        name = _KEY_ALIASES.get(" ".join(value.split()).lower()) if printable else None
+        if name is None:
+            return "unknown"
+        keys.append(name)
+    return keys
+
+
+def key_words(keys: Sequence[str]) -> str:
+    """ "down, down and enter"."""
+    words = [_KEY_SPOKEN.get(key, key) for key in keys]
+    if len(words) <= 1:
+        return "".join(words)
+    return ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def chosen_option(menu: ScreenMenu | None, keys: Sequence[str]) -> tuple[int, str] | None:
+    """The option the keys should choose in `menu`: moving the selection with Up and Down, then
+    Enter, or a choice number. None when it cannot be told (no selection mark, a move past the first
+    or last option, which may wrap around, or any other key first)."""
+    if menu is None:
+        return None
+    options = dict(menu.options)
+    selected = menu.selected
+    for key in keys:
+        if key.isdigit():
+            number = int(key)
+            return (number, options[number]) if number in options else None
+        if key == "Up" and selected is not None and selected - 1 in options:
+            selected -= 1
+        elif key == "Down" and selected is not None and selected + 1 in options:
+            selected += 1
+        elif key == "Enter" and selected is not None:
+            return selected, options[selected]
+        else:
+            return None
+    return None
 
 
 def normalize_text(text: str) -> str:
@@ -230,6 +314,15 @@ class Confirmation:
     registry-only permission wait). The dispatcher types the digit only into that dialog."""
     created_ms: int
     expires_ms: int
+    kind: str = TEXT
+    """TEXT, KEYS or RESIZE."""
+    keys: tuple[str, ...] = ()
+    """For KEYS: the dispatcher's key names, in order."""
+    menu: str | None = None
+    """For KEYS outside a permission dialog: `dispatcher.menu_hash` of the menu the read-back named
+    (None: no menu was on the screen). The dispatcher presses the keys only on that screen."""
+    size: tuple[int, int] | None = None
+    """For RESIZE: (columns, rows)."""
 
 
 LookupProblem = Literal["unknown", "expired", "mismatch", "early"]
@@ -280,6 +373,10 @@ class ConfirmationStore:
         risky: Sequence[str],
         permission_answer: bool,
         dialog: str | None = None,
+        kind: str = TEXT,
+        keys: Sequence[str] = (),
+        menu: str | None = None,
+        size: tuple[int, int] | None = None,
     ) -> tuple[Confirmation, list[Confirmation]]:
         """The new confirmation and the ones of the same client it dropped (oldest first)."""
         self._expire()
@@ -312,6 +409,10 @@ class ConfirmationStore:
             dialog=dialog,
             created_ms=now,
             expires_ms=now + self._ttl_ms,
+            kind=kind,
+            keys=tuple(keys),
+            menu=menu,
+            size=size,
         )
         self._items[new_id] = item
         return item, dropped

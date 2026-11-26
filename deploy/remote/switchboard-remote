@@ -26,7 +26,11 @@ Test only (refused unless SWITCHBOARD_REMOTE_TEST=1 is in the environment): --tm
 Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none> message`
 or `send <paneId> <panePid> <sessionId|none> answer <dialogHash|none>` (text on stdin, only with
 --allow-send; the mode says what the owner confirmed: a message, or the answer to one permission
-dialog), `usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
+dialog), `keys <paneId> <panePid> <sessionId|none> menu <menuHash|none> <key>...` or
+`keys <paneId> <panePid> <sessionId|none> answer <dialogHash|none> <key>...` (1 to MAX_KEYS key names
+from KEY_NAMES, only with --allow-send; bound to the menu or permission dialog the owner heard),
+`resize <paneId> <panePid> <columns> <rows>` (the pane's window, only with --allow-send),
+`usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
 only with --allow-usage). Every response is one JSON document on stdout,
 `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`, except a
 successful `usage`, which is JSON lines (a header document, then file headers and token records
@@ -53,9 +57,9 @@ import unicodedata
 from collections.abc import Iterator
 from typing import BinaryIO
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 PROTOCOL = 1
-VERBS = ("version", "list", "capture", "send", "usage")
+VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize")
 PROGRAM = "switchboard-remote"
 
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}")
@@ -80,6 +84,17 @@ owner heard, identified by `dialog_hash`)."""
 DIALOG_HASH_RE = re.compile(r"[0-9a-f]{24}")
 NO_DIALOG = "none"
 """The dialog hash of a permission wait that only the registry shows (nothing on the screen)."""
+KEYS_MENU = "menu"
+"""The `keys` mode for anything but a permission dialog: bound to `menu_hash` of the screen the owner
+heard (`none`: no menu was on it). The other mode is SEND_ANSWER, bound to `dialog_hash`."""
+NO_MENU = "none"
+KEY_NAMES = ("Up", "Down", "Left", "Right", "Enter", "Escape", "Tab", "BTab", *"123456789", "y", "n")
+"""The only keys `keys` presses: tmux key names (and single characters tmux types as they are), never
+free text, modifiers (`C-c`, `M-x`) or tmux commands."""
+MAX_KEYS = 10
+RESIZE_COLUMNS = (80, 300)
+RESIZE_ROWS = (24, 120)
+"""Inclusive bounds of `resize`."""
 
 MAX_SESSION_GLOBS = 64
 MAX_LINES = 500
@@ -120,6 +135,9 @@ LIST_FIELDS = (
     "pane_active",
     "session_attached",
     "window_activity",
+    "pane_width",
+    "pane_height",
+    "alternate_on",
 )
 LIST_FORMAT = "\t".join("#{" + name + "}" for name in LIST_FIELDS)
 
@@ -297,6 +315,116 @@ def shows_vim_normal(screen: str) -> bool:
     return any(_VIM_NORMAL_RE.search(line) for line in _screen_tail(screen))
 
 
+_MENU_OPTION_RE = re.compile(r"(?:([❯>›▶])\s*)?([1-9])[.)]\s+(\S.*)")
+MENU_FOOTER_RE = re.compile(
+    r"↑\s*/?\s*↓|←\s*/?\s*→|\benter\s+(?:to\s+)?(?:confirm|select|submit|choose)\b"
+    r"|\besc\s+(?:to\s+)?(?:cancel|not now|go back|exit|close)\b|\btab\s+to\s+[a-z]",
+    re.I,
+)
+"""The key hints under an interactive menu ("↑/↓ choose · enter confirm · esc not now")."""
+_ASSISTANT_MARK_RE = re.compile(r"[⏺●]\s*")
+MENU_GAP_LINES = 4
+"""Non-option lines (an option's description) allowed between two options, or under the last one."""
+MENU_QUESTION_LINES = 3
+
+
+def _menu_lines(screen: str) -> list[str]:
+    return [line.strip().strip(_BOX_EDGES).strip() for line in screen.split("\n")]
+
+
+def _find_menu(lines: list[str]) -> dict[str, object] | None:
+    index = len(lines) - 1
+    footer: list[str] = []
+    while index >= 0 and (
+        not lines[index] or _BORDER_RE.fullmatch(lines[index]) or MENU_FOOTER_RE.search(lines[index])
+    ):
+        if lines[index] and not _BORDER_RE.fullmatch(lines[index]):
+            footer.insert(0, lines[index])
+        index -= 1
+    last = index
+    options: list[tuple[int, str, bool]] = []
+    gap = 0
+    while index >= 0:
+        line = lines[index]
+        found = _MENU_OPTION_RE.fullmatch(line)
+        if found is not None:
+            number = int(found.group(2))
+            if (options and number != options[-1][0] - 1) or (not options and number < 2):
+                return None
+            options.append((number, found.group(3).strip(), found.group(1) is not None))
+            gap = 0
+            if number == 1:
+                break
+        elif line and not _BORDER_RE.fullmatch(line):
+            # An input prompt or an assistant line between the options and the bottom: prose with a
+            # numbered list above the input box, not a menu.
+            if line.startswith(_INPUT_PROMPTS) or _ASSISTANT_MARK_RE.match(line):
+                return None
+            gap += 1
+            if gap > MENU_GAP_LINES:
+                return None
+        index -= 1
+    if not options or options[-1][0] != 1:
+        return None
+    marked = [number for number, _, mark in options if mark]
+    if not marked and not footer:
+        return None
+    first = index
+    question: list[str] = []
+    probe = index - 1
+    while probe >= 0 and (not lines[probe] or _BORDER_RE.fullmatch(lines[probe])):
+        probe -= 1
+    while (
+        probe >= 0 and lines[probe] and not _BORDER_RE.fullmatch(lines[probe]) and len(question) < MENU_QUESTION_LINES
+    ):
+        line = lines[probe]
+        if MENU_FOOTER_RE.search(line) or line.startswith(_INPUT_PROMPTS):
+            break
+        assistant = _ASSISTANT_MARK_RE.match(line)
+        question.insert(0, line[assistant.end() :] if assistant else line)
+        first = probe
+        if assistant:
+            break
+        probe -= 1
+    options.reverse()
+    return {
+        "question": " ".join(" ".join(question).split()) or None,
+        "options": [(number, " ".join(text.split())) for number, text, _ in options],
+        "selected": marked[0] if marked else None,
+        "footer": " ".join(" ".join(footer).split()) or None,
+        "first": first,
+        "last": last,
+    }
+
+
+def find_menu(screen: str) -> dict[str, object] | None:
+    """An interactive menu at the bottom of the screen (Claude Code's questions with choices, its
+    permission dialogs, other numbered pickers), or None. A run of consecutive numbered options
+    `1.`..`9.` (an optional `❯ > › ▶` marks the selected one; up to MENU_GAP_LINES description lines
+    between options) with only borders, empty lines and key hints (MENU_FOOTER_RE) below it, and
+    either a selection marker or key hints. Prose with a numbered list above an input box is no
+    menu. Returns `question` (up to MENU_QUESTION_LINES lines directly above the options, stopping
+    at an assistant line), `options` [(number, text)], `selected` (a number or None), `footer` and
+    the line range `first`..`last`. The hub runs this same function for what it reads back."""
+    return _find_menu(_menu_lines(screen))
+
+
+def menu_hash(screen: str) -> str | None:
+    """What identifies the menu `find_menu` sees, so keys go only into the menu the owner heard: a
+    hash of its question, options and descriptions with the selection marker (a selection moved at
+    the keyboard changes it), each line cleaned and with its whitespace collapsed. None when no menu
+    is on the screen. Hub and dispatcher run this function on the same kind of capture."""
+    lines = _menu_lines(screen)
+    menu = _find_menu(lines)
+    if menu is None:
+        return None
+    first, last = menu["first"], menu["last"]
+    assert isinstance(first, int)
+    assert isinstance(last, int)
+    block = "\n".join(" ".join(clean_text(line, 400).split()) for line in lines[first : last + 1] if line)
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()[:24]
+
+
 # --- options and policy ----------------------------------------------------------------------
 
 
@@ -465,6 +593,29 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
             if len(args) != 5 or (args[4] != NO_DIALOG and not DIALOG_HASH_RE.fullmatch(args[4])):
                 raise RefusedError("bad_request")
         else:
+            raise RefusedError("bad_request")
+    if verb == "keys":
+        if not 6 <= len(args) <= 5 + MAX_KEYS or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
+            raise RefusedError("bad_request")
+        if args[2] != SEND_NO_SESSION and not UUID_RE.fullmatch(args[2]):
+            raise RefusedError("bad_request")
+        if args[3] == SEND_ANSWER:
+            if args[4] != NO_DIALOG and not DIALOG_HASH_RE.fullmatch(args[4]):
+                raise RefusedError("bad_request")
+        elif args[3] == KEYS_MENU:
+            if args[4] != NO_MENU and not DIALOG_HASH_RE.fullmatch(args[4]):
+                raise RefusedError("bad_request")
+        else:
+            raise RefusedError("bad_request")
+        if any(key not in KEY_NAMES for key in args[5:]):
+            raise RefusedError("bad_request")
+    if verb == "resize":
+        if len(args) != 4 or not PANE_ID_RE.fullmatch(args[0]) or not all(DECIMAL_RE.fullmatch(a) for a in args[1:]):
+            raise RefusedError("bad_request")
+        if (
+            not RESIZE_COLUMNS[0] <= int(args[2]) <= RESIZE_COLUMNS[1]
+            or not RESIZE_ROWS[0] <= int(args[3]) <= RESIZE_ROWS[1]
+        ):
             raise RefusedError("bad_request")
     if verb == "usage":
         if len(args) != 2 or not NUMBER_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
@@ -708,6 +859,8 @@ def verb_list(policy: Policy, env: dict[str, str]) -> dict[str, object]:
                 "active": _flag(pane["pane_active"]),
                 "attached": _flag(pane["session_attached"]),
                 "activity": _int(pane["window_activity"]),
+                "width": _int(pane["pane_width"]),
+                "height": _int(pane["pane_height"]),
                 "claude": claude_view(entry) if entry is not None else None,
             }
         )
@@ -730,6 +883,9 @@ def verb_capture(policy: Policy, env: dict[str, str], pane_id: str, lines: int) 
         "paneId": pane_id,
         "session": clean_text(pane["session_name"], NAME_MAX),
         "window": _int(pane["window_index"]),
+        "paneWidth": _int(pane["pane_width"]),
+        "paneHeight": _int(pane["pane_height"]),
+        "alternateOn": _flag(pane["alternate_on"]),
     }
 
 
@@ -844,6 +1000,66 @@ def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: objec
     if code != 0:
         raise RefusedError("pasted_no_enter")
     return {"sent": True, "bytes": len(data), "enter": True}
+
+
+def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str, object]:
+    """Presses 1 to MAX_KEYS keys from KEY_NAMES in a pane (one `send-keys` without `-l`), after
+    rechecking the pane, its process and Claude Code session, and the screen the owner heard: in
+    `menu` mode no permission dialog may show (`permission_prompt`) and the menu must be the one read
+    back (`menu_changed`, `none` when there was none; then also no draft and no vim normal mode); in
+    `answer` mode the permission dialog must be the one read back (`dialog_changed`), and only with
+    --allow-permission-answers."""
+    if not policy.allow_send:
+        raise RefusedError("not_allowed")
+    pane_id, pane_pid, session_id, mode, bound = args[:5]
+    keys = args[5:]
+    pane, entry, screen = _send_state(policy, env, pane_id)
+    if pane is None:
+        raise RefusedError("gone")
+    if pane["pane_pid"] != pane_pid or not _same_session(entry, session_id):
+        raise RefusedError("changed")
+    if session_id == SEND_NO_SESSION and not policy.send_to_any_pane:
+        raise RefusedError("not_claude")
+    asks = _asks_permission(entry, screen)
+    if mode == SEND_ANSWER:
+        if not policy.allow_permission_answers:
+            raise RefusedError("permission_prompt")
+        if not asks or (dialog_hash(screen) or NO_DIALOG) != bound:
+            raise RefusedError("dialog_changed")
+    elif asks:
+        raise RefusedError("permission_prompt")
+    else:
+        current = menu_hash(screen)
+        if (current or NO_MENU) != bound:
+            raise RefusedError("menu_changed")
+        if current is None and entry is not None:
+            if shows_draft(screen):
+                raise RefusedError("draft_present")
+            if shows_vim_normal(screen):
+                raise RefusedError("vim_normal")
+    code, _, _ = run_tmux(["send-keys", "-t", pane_id, *keys], policy, env)
+    if code != 0:
+        raise RefusedError("tmux_failed")
+    return {"sent": True, "keys": len(keys)}
+
+
+def verb_resize(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str, object]:
+    """Resizes the window of a pane (`resize-window -x -y`, which also sets that window's
+    `window-size` to manual) within RESIZE_COLUMNS and RESIZE_ROWS, after rechecking the pane and its
+    process."""
+    if not policy.allow_send:
+        raise RefusedError("not_allowed")
+    pane_id, pane_pid, columns, rows = args
+    panes = [p for p in list_panes(policy, env) if policy.allows(p["session_name"])]
+    pane = next((p for p in panes if p["pane_id"] == pane_id), None)
+    if pane is None:
+        raise RefusedError("gone")
+    if pane["pane_pid"] != pane_pid:
+        raise RefusedError("changed")
+    code, _, err = run_tmux(["resize-window", "-t", pane_id, "-x", columns, "-y", rows], policy, env)
+    if code != 0:
+        raise RefusedError("gone" if "can't find" in err.lower() else "tmux_failed")
+    return {"resized": True, "columns": int(columns), "rows": int(rows)}
 
 
 # --- usage -------------------------------------------------------------------------------------
@@ -1101,6 +1317,10 @@ def respond(argv: list[str], env: dict[str, str], stdin: object = None) -> Itera
             body = verb_list(policy, env)
         elif verb == "send":
             body = verb_send(policy, env, args, stdin)
+        elif verb == "keys":
+            body = verb_keys(policy, env, args)
+        elif verb == "resize":
+            body = verb_resize(policy, env, args)
         elif verb == "usage":
             lines = verb_usage(policy, env, args, stdin)
             body = {"stream": "usage"}

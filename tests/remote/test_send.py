@@ -343,6 +343,7 @@ def test_audit_text_only_with_log_prompts_and_redacted(tmp_path: Path) -> None:
     table = format_audit_table(rows, with_text=True)
     assert table.splitlines()[0].split() == [
         "time",
+        "event",
         "machine",
         "session",
         "pane",
@@ -351,6 +352,7 @@ def test_audit_text_only_with_log_prompts_and_redacted(tmp_path: Path) -> None:
         "risky",
         "ok",
         "chars",
+        "keys",
         "client",
         "text",
     ]

@@ -125,7 +125,7 @@ async def ctx(real_tmp: Path, request: pytest.FixtureRequest) -> AsyncIterator[C
 # --- tool list ------------------------------------------------------------------------------------
 
 
-async def test_has_the_sixteen_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
+async def test_has_the_eighteen_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
     tools = (await ctx.client.list_tools()).tools
     by_name = {t.name: t for t in tools}
     assert sorted(by_name) == [
@@ -137,8 +137,10 @@ async def test_has_the_sixteen_tools_with_the_design_annotations_and_server_inst
         "list_sessions",
         "list_tasks",
         "pending_input",
+        "remote_resize",
         "remote_send",
         "remote_send_confirm",
+        "remote_send_keys",
         "remote_status",
         "resume_task_in_remote_control",
         "run_task",
@@ -160,6 +162,8 @@ async def test_has_the_sixteen_tools_with_the_design_annotations_and_server_inst
         "list_remote_sessions",
         "pending_input",
         "remote_send",
+        "remote_send_keys",
+        "remote_resize",
         "usage_report",
     ]:
         assert annotations(name) == {"readOnlyHint": True}

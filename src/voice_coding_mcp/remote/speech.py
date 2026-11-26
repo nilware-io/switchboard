@@ -12,10 +12,11 @@ from collections.abc import Sequence
 
 from ..text import plural
 from .inventory import MachineView
+from .menu import ScreenMenu
 from .pending import PendingEntry, PendingReport, waits_for_permission
 from .protocol import ClaudeInfo, PaneInfo
 from .redact import clean_name, redact
-from .send import Confirmation, risk_words, yes_phrase
+from .send import KEYS, RESIZE, Confirmation, key_words, risk_words, yes_phrase
 from .targets import Ambiguous, NoTarget, NotFound
 from .transport import TransportError
 
@@ -119,13 +120,48 @@ def status_fact(pane: PaneInfo) -> str:
     return f"{claude_label(pane)} is {state_words(pane.claude)}."
 
 
-def format_status(label: str, pane: PaneInfo, *, summary: str | None, line: str | None) -> str:
+MENU_WORDS_MAX = 400
+
+
+def menu_words(menu: ScreenMenu, limit: int = MENU_WORDS_MAX) -> str:
+    """'A menu on the screen asks: "<question>". Options: 1 "Small", selected; 2 "Medium".', the
+    options cut (with "and N more") so the whole stays within about `limit` characters. Screen text,
+    so quoted and redacted."""
+    head = (
+        f"A menu on the screen asks: {quote(redact(menu.question))}." if menu.question else "The screen shows a menu."
+    )
+    parts: list[str] = []
+    used = len(head) + len(" Options: ")
+    for index, (number, text) in enumerate(menu.options):
+        item = f"{number} {quote(redact(text))}" + (", selected" if number == menu.selected else "")
+        rest = len(menu.options) - index
+        if parts and used + len(item) + 2 > limit:
+            parts.append(f"and {rest} more")
+            break
+        parts.append(item)
+        used += len(item) + 2
+    return f"{head} Options: {'; '.join(parts)}."
+
+
+def format_status(
+    label: str, pane: PaneInfo, *, summary: str | None, line: str | None, menu: ScreenMenu | None = None
+) -> str:
     fact = status_fact(pane)
     if summary:
         return f"{label}: {fact} A summary of the screen: {quote(summary)}"
+    if menu is not None:
+        return f"{label}: {fact} {menu_words(menu)}"
     if line:
         return f"{label}: {fact} The screen says: {quote(redact(line))}"
     return f"{label}: {fact} The screen is empty."
+
+
+def cut_note(rows: int, can_resize: bool) -> str:
+    """Appended when the pane is on its alternate screen (no scrollback) and short."""
+    more = " I can make it bigger if you want." if can_resize else ""
+    return (
+        f" The pane is only {rows} rows high and shows a full-screen program, so part of a menu may be cut off.{more}"
+    )
 
 
 def format_pending_task(label: str, task_id: int) -> str:
@@ -267,6 +303,56 @@ def format_readback(item: Confirmation, *, question: str | None, dropped: Sequen
     return " ".join(parts)
 
 
+def format_keys_readback(
+    item: Confirmation,
+    *,
+    menu: ScreenMenu | None,
+    question: str | None,
+    chosen: tuple[int, str] | None,
+    dropped: Sequence[Confirmation],
+) -> str:
+    """What `remote_send_keys` returns: the keys, the target, the menu or question on its screen
+    (labelled as the screen's), the option the keys should choose, the risk and the yes phrase."""
+    parts: list[str] = []
+    if dropped:
+        places = ", ".join(sorted({d.place for d in dropped}))
+        parts.append(f"I dropped the earlier message for {places}.")
+    keys = key_words(item.keys)
+    if item.permission_answer:
+        asked = f" It asks for permission: {quote(question)}." if question else " It shows a permission question."
+        parts.append(f"Ready to press {keys} in {item.place}.{asked}")
+    elif menu is not None:
+        parts.append(f"Ready to press {keys} in {item.place}. {menu_words(menu)}")
+    elif question:
+        parts.append(f"Ready to press {keys} in {item.place}, which asks: {quote(question)}.")
+    else:
+        parts.append(f"Ready to press {keys} in {item.place}. I see no menu on its screen.")
+    if chosen is not None:
+        parts.append(f"That should choose {chosen[0]}, {quote(redact(chosen[1]))}.")
+    if item.risky:
+        parts.append(f"Careful, {risk_words(item.risky)}. To press them anyway, say {yes_phrase(item.risky)}.")
+    else:
+        parts.append("Say yes to press them.")
+    parts.append(f"(confirmation {item.id}, do not read this number aloud)")
+    return " ".join(parts)
+
+
+def format_resize_readback(
+    item: Confirmation, *, current: tuple[int, int] | None, dropped: Sequence[Confirmation]
+) -> str:
+    parts: list[str] = []
+    if dropped:
+        places = ", ".join(sorted({d.place for d in dropped}))
+        parts.append(f"I dropped the earlier message for {places}.")
+    assert item.size is not None
+    columns, rows = item.size
+    now = f" It is now {current[0]} by {current[1]}." if current is not None else ""
+    parts.append(f"Ready to resize the window of {item.place} to {columns} columns by {rows} rows.{now}")
+    parts.append("Say yes to resize it.")
+    parts.append(f"(confirmation {item.id}, do not read this number aloud)")
+    return " ".join(parts)
+
+
 _NOT_SENT: dict[str, str] = {
     "gone": "Not sent: the pane is gone.",
     "changed": "Not sent: that pane now runs a different session.",
@@ -285,8 +371,41 @@ _NOT_SENT: dict[str, str] = {
 }
 
 
+_NOT_DONE_KEYS: dict[str, str] = {
+    "menu_changed": "Not pressed: the menu on that screen changed since I read it to you. Ask me to read it again.",
+    "bad_request": "Not pressed: switchboard-remote on {machine} is too old to press keys. Update it there.",
+}
+_NOT_DONE_RESIZE: dict[str, str] = {
+    "bad_request": "Not resized: switchboard-remote on {machine} is too old to resize windows. Update it there.",
+}
+
+
 def format_confirm_outcome(item: Confirmation, outcome: str, detail: str | None) -> str:
     """The spoken result of `remote_send_confirm` for an audit outcome."""
+    machine = item.machine
+    code = outcome.removeprefix("not_sent:")
+    if item.kind == KEYS:
+        if outcome == "sent":
+            return f"Pressed {key_words(item.keys)} in {item.place}."
+        if outcome == "unknown":
+            session = item.place.removesuffix(f" on {machine}")
+            return f"I do not know whether the keys arrived, {machine} stopped answering. Ask me what {session} is doing before pressing them again."
+        if code in _NOT_DONE_KEYS:
+            return _NOT_DONE_KEYS[code].format(machine=machine)
+        return "Not pressed: " + _confirm_problem(item, outcome).removeprefix("Not sent: ")
+    if item.kind == RESIZE:
+        if outcome == "sent":
+            assert item.size is not None
+            return f"Resized the window of {item.place} to {item.size[0]} by {item.size[1]}."
+        if outcome == "unknown":
+            return f"I do not know whether the window was resized, {machine} stopped answering."
+        if code in _NOT_DONE_RESIZE:
+            return _NOT_DONE_RESIZE[code].format(machine=machine)
+        return "Not resized: " + _confirm_problem(item, outcome).removeprefix("Not sent: ")
+    return _confirm_problem(item, outcome)
+
+
+def _confirm_problem(item: Confirmation, outcome: str) -> str:
     machine = item.machine
     if outcome == "sent":
         return f"Sent to {item.place}."

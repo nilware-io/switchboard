@@ -37,6 +37,9 @@ def pane(
     command: str = "node",
     active: bool = True,
     attached: bool = False,
+    width: int = 80,
+    height: int = 24,
+    alternate: bool = False,
 ) -> dict[str, Any]:
     """One fake tmux pane (tmux format names)."""
     return {
@@ -52,6 +55,9 @@ def pane(
         "pane_active": 1 if active else 0,
         "session_attached": 1 if attached else 0,
         "window_activity": 1764160000,
+        "pane_width": width,
+        "pane_height": height,
+        "alternate_on": 1 if alternate else 0,
     }
 
 
