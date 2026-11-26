@@ -65,16 +65,34 @@ def summary_input(screen: str) -> str:
     return f"{SUMMARY_INTRO}\n{boundary}\n{screen}\n{boundary}\n"
 
 
+def strip_box(raw: str) -> str:
+    """A screen line without surrounding whitespace and box edges."""
+    return raw.strip().strip("│┃║|").strip()
+
+
+def is_border(line: str) -> bool:
+    """Empty, or only box-drawing and rule characters (a box edge, a `────` separator)."""
+    return all(ch in _BORDER_CHARS for ch in line)
+
+
+def is_input_line(line: str) -> bool:
+    """An input prompt (Claude Code's `>`, a shell's `$`), with or without typed text after it."""
+    return bool(line) and line[0] in _PROMPT_CHARS
+
+
+def is_status_line(line: str) -> bool:
+    """A status bar line such as `? for shortcuts` or `esc to interrupt`."""
+    return _STATUS_RE.search(line) is not None
+
+
 def last_meaningful_line(screen: str) -> str | None:
     """The last line that is not empty, a box border, a status bar or an empty input prompt,
     stripped of box edges and clipped to HEURISTIC_MAX_CHARS."""
     for raw in reversed(screen.split("\n")):
-        line = raw.strip().strip("│┃║|").strip()
-        if not line or all(ch in _BORDER_CHARS for ch in line):
+        line = strip_box(raw)
+        if is_border(line) or is_status_line(line):
             continue
-        if _STATUS_RE.search(line):
-            continue
-        if line[0] in _PROMPT_CHARS and not line[1:].strip():
+        if is_input_line(line) and not line[1:].strip():
             continue
         return clip(" ".join(line.split()), HEURISTIC_MAX_CHARS)
     return None

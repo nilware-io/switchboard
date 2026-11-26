@@ -206,3 +206,37 @@ def test_identity_file_checks(tmp_path: Path) -> None:
         "not a regular file" in w
         for w in remote_warnings(config.remote, uid=os.getuid(), home=str(own), other_homes=[])
     )
+
+
+# --- watch ----------------------------------------------------------------------------------------
+
+
+def test_watch_defaults_off(tmp_path: Path) -> None:
+    watch = parse(tmp_path, {}).watch
+    assert (watch.interval_seconds, watch.long_turn_minutes, watch.notify_unreachable, watch.include_question) == (
+        0,
+        10,
+        False,
+        False,
+    )
+
+
+def test_watch_needs_notify_url(tmp_path: Path) -> None:
+    assert "watch.intervalSeconds: the watcher needs notify.url" in error(tmp_path, {}, watch={"intervalSeconds": 60})
+    on = parse(tmp_path, {}, watch={"intervalSeconds": 60}, notify={"url": "https://ntfy.example.com/topic"})
+    assert on.watch.interval_seconds == 60
+
+
+@pytest.mark.parametrize(
+    ("watch", "where"),
+    [
+        ({"intervalSeconds": 10}, "watch.intervalSeconds"),
+        ({"intervalSeconds": 3601}, "watch.intervalSeconds"),
+        ({"longTurnMinutes": -1}, "watch.longTurnMinutes"),
+        ({"longTurnMinutes": 1441}, "watch.longTurnMinutes"),
+        ({"includeQuestion": "yes"}, "watch.includeQuestion"),
+        ({"includeResult": True}, "watch.includeResult"),
+    ],
+)
+def test_watch_field_rules(tmp_path: Path, watch: dict[str, Any], where: str) -> None:
+    assert where in error(tmp_path, {}, watch=watch, notify={"url": "https://ntfy.example.com/topic"})

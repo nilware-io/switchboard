@@ -1,4 +1,5 @@
-"""The remote tools behind `list_remote_sessions` and `remote_status` (docs/SWITCHBOARD.md, "Tools").
+"""The remote tools behind `list_remote_sessions`, `remote_status` and `pending_input`
+(docs/SWITCHBOARD.md, "Tools").
 
 Each call has a total deadline of `tasks.syncWaitSeconds - 3` seconds for its synchronous part; a
 summary that is not ready by then continues as a `remote` task whose number is returned.
@@ -16,13 +17,16 @@ from dataclasses import dataclass, field
 from ..config import Config
 from ..log import Logger
 from ..projects import MatchOk
+from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from .inventory import Inventory, resolve_machine
+from .pending import PendingChecker, PendingCheckerOptions, PendingReport
 from .protocol import CaptureResponse, PaneInfo
 from .redact import clean_name, clean_screen
 from .speech import (
     format_list,
     format_machine_problem,
+    format_pending,
     format_pending_task,
     format_status,
     format_target_problem,
@@ -54,6 +58,9 @@ class RemoteToolsOptions:
     """Default: one per configured machine (`make_transport`)."""
     summarizer: Summarizer | None = None
     now: Callable[[], int] | None = None
+    claude_home: str | None = None
+    """The hub's own Claude Code home for `pending_input`'s local sessions. Default:
+    `claude.configDir`, else `~/.claude` (as the upstream session tools)."""
 
 
 class _Deadline:
@@ -86,6 +93,14 @@ class RemoteTools:
             )
         )
         self._background: set[asyncio.Task[str | None]] = set()
+        self._pending = PendingChecker(
+            PendingCheckerOptions(
+                inventory=self.inventory,
+                logger=self._logger,
+                project_roots=config.project_roots,
+                claude_home=options.claude_home or claude_home_dir(config.claude.config_dir),
+            )
+        )
 
     def _deadline(self) -> _Deadline:
         wait = self._config.tasks.sync_wait_seconds
@@ -108,6 +123,37 @@ class RemoteTools:
             "tool call", {"tool": "list_remote_sessions", "machines": len(views), "reachable": sum(v.ok for v in views)}
         )
         return ToolAnswer(format_list(views, total_machines=len(machines)))
+
+    async def pending_input(self, machine: str | None) -> ToolAnswer:
+        """Which sessions wait on the owner: every machine plus the hub's own registry, or one machine."""
+        if machine is not None and machine.strip():
+            found = resolve_machine(self.inventory.machines, machine)
+            if not isinstance(found, MatchOk):
+                return ToolAnswer(
+                    format_machine_problem(
+                        machine, [m.name for m in self.inventory.machines], ambiguous=found.reason == "ambiguous"
+                    ),
+                    True,
+                )
+            report = await self._pending.check([found.item.name], include_local=False, left=self._deadline().left)
+        else:
+            report = await self.collect_pending()
+        self._logger.info(
+            "tool call",
+            {
+                "tool": "pending_input",
+                "machines": len(report.views),
+                "reachable": sum(v.ok for v in report.views),
+                "waiting": len(report.entries),
+            },
+        )
+        return ToolAnswer(format_pending(report))
+
+    async def collect_pending(self) -> PendingReport:
+        """The `pending_input` fast path over every machine and the hub's own registry (also used by
+        the notification watcher)."""
+        names = [m.name for m in self.inventory.machines]
+        return await self._pending.check(names, include_local=True, left=self._deadline().left)
 
     async def remote_status(self, machine: str | None, target: str | None, lines: int | None) -> ToolAnswer:
         deadline = self._deadline()

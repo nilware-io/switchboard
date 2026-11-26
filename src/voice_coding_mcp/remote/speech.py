@@ -12,6 +12,7 @@ from collections.abc import Sequence
 
 from ..text import plural
 from .inventory import MachineView
+from .pending import PendingEntry, PendingReport, waits_for_permission
 from .protocol import ClaudeInfo, PaneInfo
 from .redact import clean_name, redact
 from .targets import Ambiguous, NoTarget, NotFound
@@ -43,7 +44,7 @@ def quote(text: str) -> str:
 
 
 def is_permission(claude: ClaudeInfo) -> bool:
-    return "permission" in (claude.waiting_for or "").lower()
+    return waits_for_permission(claude.waiting_for)
 
 
 def state_words(claude: ClaudeInfo) -> str:
@@ -164,3 +165,43 @@ def format_machine_problem(spoken: str | None, candidates: Sequence[str], *, amb
     if ambiguous:
         return f"{quote(clean_name(spoken))} matches several machines: {names}. Which one?"
     return f"No machine matches {quote(clean_name(spoken))}. Machines: {names}."
+
+
+PENDING_SHOWN = 8
+
+
+def _pending_line(entry: PendingEntry) -> str:
+    if entry.kind == "permission":
+        head = f"{entry.label} asks for permission"
+    else:
+        head = f"{entry.label} asks" if entry.question else f"{entry.label} asks you something"
+    return f"{head}: {quote(entry.question)}." if entry.question else f"{head}."
+
+
+def format_pending(report: PendingReport) -> str:
+    """ "2 sessions need you." then one line per waiting session (permission first), the hint to
+    approve permissions at the keyboard, and the machines that could not be checked."""
+    entries = sorted(report.entries, key=lambda e: e.kind != "permission")
+    unreachable = [view for view in report.views if not view.ok]
+    lines: list[str] = []
+    if not entries:
+        lines.append(
+            "Nobody is waiting for you on the machines I could check."
+            if unreachable or report.partial
+            else "Nobody is waiting for you."
+        )
+    else:
+        need = "needs" if len(entries) == 1 else "need"
+        lines.append(f"{plural(len(entries), 'session')} {need} you.")
+        lines += [_pending_line(entry) for entry in entries[:PENDING_SHOWN]]
+        if len(entries) > PENDING_SHOWN:
+            lines.append(f"And {len(entries) - PENDING_SHOWN} more.")
+        asks = [e for e in entries if e.kind == "permission" and not e.permission_answers]
+        if asks:
+            it = "it" if len(asks) == 1 else "them"
+            lines.append(f"Approve {it} at the keyboard or in the Claude app.")
+    for view in unreachable:
+        lines.append(f"{view.machine.name} could not be checked: {unreachable_reason(view.error, view.detail)}.")
+    for name in report.partial:
+        lines.append(f"Some sessions on {name} could not be checked.")
+    return "\n".join(lines)

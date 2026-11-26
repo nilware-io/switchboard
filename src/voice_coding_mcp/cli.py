@@ -429,7 +429,15 @@ async def start_server(config: Config, logger: Logger, env: Mapping[str, str] | 
     except BaseException:
         await _shutdown(manager, notifier, "server failed to start")
         raise
-    app = create_app(CreateAppOptions(config=config, logger=logger, store=store, manager=manager))
+    app = create_app(
+        CreateAppOptions(
+            config=config,
+            logger=logger,
+            store=store,
+            manager=manager,
+            send_text=notifier.send_text if notifier is not None else None,
+        )
+    )
     server = _Server(
         uvicorn.Config(
             app,

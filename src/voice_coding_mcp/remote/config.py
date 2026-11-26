@@ -140,6 +140,22 @@ class RemoteConfig(_Section):
     summary: SummaryConfig = Field(default_factory=SummaryConfig)
 
 
+def _interval(value: int) -> int:
+    if value != 0 and not 30 <= value <= 3600:
+        raise ValueError("must be 0 (off) or 30 to 3600")
+    return value
+
+
+class WatchConfig(_Section):
+    """The notification watcher (docs/SWITCHBOARD.md, "Notification watcher")."""
+
+    interval_seconds: Annotated[Int, AfterValidator(_interval)] = 0
+    """0 is off. Needs `notify.url` (checked in `config.parse_config`)."""
+    long_turn_minutes: Annotated[Int, Field(ge=0, le=1440)] = 10
+    notify_unreachable: bool = False
+    include_question: bool = False
+
+
 def check_remote(remote: RemoteConfig, *, allow_non_loopback: bool, state_dir: str) -> list[str]:
     """Rules across fields and sections, as `path: message` lines (empty when valid)."""
     problems: list[str] = []

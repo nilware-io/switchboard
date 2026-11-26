@@ -56,5 +56,6 @@
     "ssh": { "bin": "ssh", "connectTimeoutSeconds": 5, "commandTimeoutSeconds": 10 },
     "captureLines": 60,
     "summary": { "enabled": true, "model": "haiku", "timeoutSeconds": 15 }
-  }
+  },
+  "watch": { "intervalSeconds": 0, "longTurnMinutes": 10, "notifyUnreachable": false, "includeQuestion": false }
 }

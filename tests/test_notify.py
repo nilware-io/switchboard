@@ -75,6 +75,31 @@ class TestCreateNotifier:
         assert calls[0].headers["Authorization"] == "Bearer tok"
         assert calls[0].headers["content-type"] == "text/plain; charset=utf-8"
 
+    async def test_send_text_posts_the_text_as_is_and_logs_no_text(self) -> None:
+        calls: list[httpx2.Request] = []
+        lines: list[str] = []
+        logger = create_logger(level="debug", write=lines.append)
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            calls.append(request)
+            return httpx2.Response(200 if len(calls) == 1 else 500, text="ok")
+
+        async with client(handler) as http:
+            notify = create_notifier(config(), logger, client=http)
+            assert notify is not None
+            await notify.send_text("fpga on dev needs a decision.")
+            await notify.send_text("fpga on dev asks you something.")
+            await notify.aclose()
+            await notify.send_text("after close")
+        assert [c.content for c in calls] == [b"fpga on dev needs a decision.", b"fpga on dev asks you something."]
+        assert calls[0].headers["Authorization"] == "Bearer tok"
+        assert calls[0].headers["content-type"] == "text/plain; charset=utf-8"
+        joined = "\n".join(lines)
+        assert "fpga" not in joined
+        assert '"kind":"text"' in joined
+        assert '"status":500' in joined
+        assert '"error":"closed"' in joined
+
     async def test_only_logs_failures_without_the_url_path_query_or_headers(self) -> None:
         lines: list[str] = []
         logger = create_logger(level="debug", write=lines.append)

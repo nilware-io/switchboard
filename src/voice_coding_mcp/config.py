@@ -26,7 +26,7 @@ from pydantic.alias_generators import to_camel
 
 from .json_file import loads_json
 from .projects import is_inside
-from .remote.config import RemoteConfig, check_remote, remote_warnings
+from .remote.config import RemoteConfig, WatchConfig, check_remote, remote_warnings
 from .urls import is_loopback_ip, parse_url
 
 DEFAULT_CONFIG_PATH = "/etc/voice-coding-mcp/config.json"
@@ -249,6 +249,7 @@ class _ConfigFile(_Section):
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     log_prompts: bool = False
     remote: RemoteConfig = Field(default_factory=RemoteConfig)
+    watch: WatchConfig = Field(default_factory=WatchConfig)
 
 
 @dataclass(frozen=True)
@@ -276,6 +277,8 @@ class Config:
     """Host (with port when not default) that the `Host` header must match."""
     remote: RemoteConfig = field(default_factory=RemoteConfig)
     """Machines reached through the Switchboard dispatcher (docs/SWITCHBOARD.md)."""
+    watch: WatchConfig = field(default_factory=WatchConfig)
+    """The Switchboard notification watcher (off unless `intervalSeconds` > 0)."""
 
 
 # --- checks ----------------------------------------------------------------------------------
@@ -361,6 +364,8 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
     remote_problems = check_remote(
         parsed.remote, allow_non_loopback=parsed.listen.allow_non_loopback, state_dir=parsed.state_dir
     )
+    if parsed.watch.interval_seconds > 0 and parsed.notify.url is None:
+        remote_problems.append("watch.intervalSeconds: the watcher needs notify.url")
     if remote_problems:
         raise ConfigError("Invalid config:\n" + "\n".join(remote_problems))
 
@@ -384,6 +389,7 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
         resource_url=f"{issuer}/mcp",
         public_host=public_host,
         remote=parsed.remote,
+        watch=parsed.watch,
     )
 
 

@@ -36,8 +36,11 @@ async def build(
     summary: bool = True,
     sync_wait: int = 20,
     dev_sessions: list[str] | None = None,
+    claude_home: str | None = None,
     **remote: Any,
 ) -> Ctx:
+    """RemoteTools on the fake world. The hub's own Claude Code home is `claude_home` (default an
+    empty directory under `tmp`), never the real one."""
     projects = tmp / "projects"
     projects.mkdir(exist_ok=True)
     record = str(tmp / "record.jsonl")
@@ -72,7 +75,10 @@ async def build(
         )
     )
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp)}
-    tools = RemoteTools(RemoteToolsOptions(config=config, manager=manager, logger=silent_logger, base_env=env))
+    hub_home = claude_home or str(tmp / "hub-claude")
+    tools = RemoteTools(
+        RemoteToolsOptions(config=config, manager=manager, logger=silent_logger, base_env=env, claude_home=hub_home)
+    )
     return Ctx(world=world, tools=tools, manager=manager, config=config, record=record)
 
 

@@ -1,6 +1,6 @@
 # Switchboard design
 
-Status: M1 (`list_remote_sessions`, `remote_status`) implemented; M2 to M5 designed, not yet implemented. This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
+Status: M1 (`list_remote_sessions`, `remote_status`) and M2 (`pending_input`, the notification watcher) implemented; M3 to M5 designed, not yet implemented. This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
 
 ## Goal
 
@@ -51,7 +51,7 @@ One hub, one public address, one OAuth pairing. Remote machines need no inbound 
 
 ## Config
 
-New top-level sections. All keys are camelCase in the file, snake_case in Python, like upstream. Unknown keys are errors. Defaults shown. Implemented in M1: `remote.machines`, `remote.ssh`, `remote.captureLines`, `remote.summary`. `remote.send`, `watch` and `usage` are still unknown keys (rejected) until their milestones (M3, M2, M4) add them; the machine flags `allowSend`, `allowPermissionAnswers` and `sendToAnyPane` are validated from M1 on but have no effect before M3.
+New top-level sections. All keys are camelCase in the file, snake_case in Python, like upstream. Unknown keys are errors. Defaults shown. Implemented in M1: `remote.machines`, `remote.ssh`, `remote.captureLines`, `remote.summary`; in M2: `watch`. `remote.send` and `usage` are still unknown keys (rejected) until their milestones (M3, M4) add them; the machine flags `allowSend`, `allowPermissionAnswers` and `sendToAnyPane` are validated from M1 on but have no effect before M3.
 
 ```json
 {
@@ -179,7 +179,7 @@ New top-level sections. All keys are camelCase in the file, snake_case in Python
 | `usage.maxTranscriptMegabytes` | `512` | Transcripts larger than this are skipped and reported as skipped |
 | `usage.prices` | `{}` | Per model prefix, USD per million tokens: `{"claude-opus-": {"input": n, "output": n, "cacheWrite5m": n, "cacheWrite1h": n, "cacheRead": n}}`. Longest matching prefix wins. The built-in table (filled in M4 from Anthropic's published API prices on the day it is written, with that date in a comment) is used for prefixes not configured. A model without a price is reported as "unpriced" with its tokens, never guessed |
 
-Config validation additionally rejects: two machines with the same `name`, more than 32 machines, more than one `local` machine, a `local` machine together with `listen.allowNonLoopback`, `host`, `user`, `identityFile`, `knownHostsFile` or an explicit `dispatcher` on a `local` machine, an `ssh` machine without `host`, `user` or `identityFile`, `allowPermissionAnswers` without `allowSend`, `sendToAnyPane` without `allowSend`, `claudeHome` on an `ssh` machine, and (M2) `watch.intervalSeconds` > 0 without `notify.url`.
+Config validation additionally rejects: two machines with the same `name`, more than 32 machines, more than one `local` machine, a `local` machine together with `listen.allowNonLoopback`, `host`, `user`, `identityFile`, `knownHostsFile` or an explicit `dispatcher` on a `local` machine, an `ssh` machine without `host`, `user` or `identityFile`, `allowPermissionAnswers` without `allowSend`, `sendToAnyPane` without `allowSend`, `claudeHome` on an `ssh` machine, and `watch.intervalSeconds` > 0 without `notify.url` (M2).
 
 `config.example.json` gets the `dev` machine first, then one SSH machine, both with placeholder values.
 
@@ -398,6 +398,16 @@ On buildbox, api asks: "should I keep the old endpoint for one more release?"
 
 None: "Nobody is waiting for you." Unreachable machines, and machines whose captures missed the deadline, are added at the end: "buildbox could not be checked." Local registry sessions are named "on this machine". The answer never offers to answer a permission question for the owner; it says "approve it at the keyboard or in the Claude app" unless `allowPermissionAnswers` is on for that machine.
 
+As implemented (M2, `remote/pending.py`, formatting in `speech.py`):
+
+- Each machine runs its own pipeline: `list`, then its captures in parallel, so a slow machine does not hold the captures of the others. Every call takes its budget from the tool deadline; a capture with less than 0.5 s left is not started.
+- Captures (`capture <pane> 15`, the last 15 non-blank lines are examined) are made for `waiting` panes too, first, so a permission wait can quote the dialog ("Bash command git push origin main") instead of a bare `waitingFor`; then for `idle` panes, at most 6 per machine in all. Busy panes and panes without Claude Code are never captured. A registry wait keeps its kind from `waitingFor`; its text comes from the screen when the screen shows the same kind, else from `waitingFor`.
+- Dialog heuristic: a line matching "Do you want to ...?" or a "1. Yes" option followed by a "2.".."9." "No" option. Text: a specific question line ("Do you want to make this edit to parser.py?") as is; for the generic "Do you want to proceed?" the first two content lines between the dialog's top border and the question ("Bash command", "git push origin main"). Question heuristic: the last line above the input box (a line starting with `>`, `$`, `❯` ...) that is not a border or status line, without its `⏺` marker, ends in `?`.
+- A pane that is gone by the capture is left out (it waits for nobody). An idle pane that could not be captured, or was not captured because of the cap, makes the answer say "Some sessions on dev could not be checked."; an unreachable machine reads "buildbox could not be checked: the connection timed out." (the reason as in `list_remote_sessions`). With either and nobody waiting: "Nobody is waiting for you on the machines I could check."
+- Order: permission waits first, then questions, at most 8 lines, then "And N more." The approval hint is one sentence after the list ("Approve it at the keyboard or in the Claude app.", "them" for several).
+- Local registry sessions (only when no `machine` is given): entries without a `tmux` field, not `entrypoint` `sdk-cli` (the hub's own headless runs, which never wait), with a cwd strictly inside `projectRoots`; only registry `waiting` counts (there is no screen to read). Spoken as `On this machine, session "billing fix" in alpha` (the Claude Code name in quotes, when there is one) or `On this machine, alpha`.
+- Questions and `waitingFor` are cleaned (control and format characters), redacted and clipped to 100 characters before they are quoted.
+
 ### `remote_send` and `remote_send_confirm`
 
 Two steps, so a misheard or hallucinated instruction is read back before anything reaches a pane.
@@ -464,6 +474,14 @@ Each tick runs the `pending_input` fast path and keeps, per machine, the set of 
 - with `notifyUnreachable`: once after 3 failed ticks in a row, once when it answers again.
 
 Pushes contain the machine name and the tmux session name only (owner-chosen, allow-listed names; never the Claude Code session name, which a session can set itself). With `watch.includeQuestion` the question (`waitingFor` or the heuristic line, redacted, quoted, at most 120 characters) is appended; pane text and summaries are never pushed. The watcher never sends anything into a pane and never prepares a confirmation. A public ntfy server lets anyone who knows the topic read the pushes: the setup guide recommends a long random topic or an access token in `notify.headers`. Long headless tasks keep upstream's "Task 7 in ... finished."; remote jobs push "Task 12 (status of fpga on dev) finished." without their result, also with `notify.includeResult` (see [Tools](#tools)). The seen-set is kept in memory plus `stateDir/watch.json` so a restart does not repeat pushes for entries already announced. `notify.py` gets `send_text(text)` next to the task notification, through the same client and URL.
+
+As implemented (M2, `remote/watcher.py`):
+
+- Push texts: "fpga on dev needs a decision.", "fpga on dev asks you something.", with `includeQuestion` `fpga on dev needs a decision: "Bash command git push origin main"`; "fpga on dev finished its turn after 25 minutes."; "Machine buildbox cannot be reached." and "Machine buildbox answers again."; a local session reads "A session in alpha on this machine needs a decision." (project folder, owner-chosen). When several Claude Code panes share a tmux session the window index is added ("fpga window 2 on dev").
+- A wait whose machine did not answer, or whose pane could not be captured this tick, counts as still there: it neither re-pushes when it is seen again nor loses its debounce count.
+- Turn tracking starts at the registry `statusUpdatedAt` of the busy state (else the first tick that saw it busy) and ends at the `statusUpdatedAt` of the new state (else now). A session that ends while busy is forgotten; one on an unreachable machine is kept. When the same change already pushed a new wait, the "finished its turn" push is left out (one push per event).
+- `stateDir/watch.json` (0600, written atomically only when it changes): `{"version": 1, "announced": [<wait keys>], "unreachable": [<machine names>]}`. Keys are `<machine>|<pane id>|<session id>|<kind>` or `local|<session id>|<kind>`, no text. A broken file is ignored. Debounce counts and turn start times are in memory only.
+- Wiring: `create_app` builds the watcher when `watch.intervalSeconds` > 0 and the CLI passes the notifier's `send_text`; it starts with the app's lifespan and stops before the idle close. A tick that fails is logged and the loop goes on.
 
 ## Redaction
 
@@ -619,11 +637,19 @@ Done as listed, with these notes:
 - Verified on the WSL box (tmux 3.4) with `SB_LIVE_TMUX=1`: `list` and `capture` against an isolated `tmux -L sb-test-<random>` server, killed afterwards. Not verified yet (owner, with real keys): the forced command through a real sshd on localhost, and whether the installed `claude` accepts `--no-session-persistence` (`claude --help`).
 - Review fixes: remote job pushes never attach the result (it is screen text), also with `notify.includeResult`; the hub's allow-list filter is tested with a dispatcher that allows more (`--sessions '*'`) and also checks the session a `capture` reports; the `SWITCHBOARD_REMOTE_TEST_TMUX` hook is tested to be ignored without `SWITCHBOARD_REMOTE_TEST=1`; a crashed dispatcher maps to `other`, not `dispatcher_missing`; a cut pane list is spoken; the status label leaves out the window for the session's only Claude Code pane; the live test passes `TMUX_TMPDIR` on. Left as is: the dispatcher's name cleaning can merge two sessions whose names differ only in removed characters (both stay inside the allow-list).
 
-### M2: `pending_input` and the notification watcher
+### M2: `pending_input` and the notification watcher (implemented)
 
 - `pending.py` (registry plus heuristics, hub-local registry), tool `pending_input`.
 - `watcher.py`, `watch` config, `notify.send_text`, `stateDir/watch.json`.
 - Tests for transitions, debounce, restart dedupe, unreachable pushes, push text without pane content.
+
+Done as listed, with these notes:
+
+- `LiveSession` (upstream `sessions.py`) also reads `cwd`, `tmux` and `entrypoint` from the registry, for the local part of `pending_input`.
+- The line heuristics of `summarize.py` are shared with `pending.py` (`strip_box`, `is_border`, `is_input_line`, `is_status_line`).
+- Deviations from the plan above, recorded in the sections: waiting panes are captured too (to quote the dialog); per-machine pipelining of list and captures; unreachable reasons are spoken; one approval hint per answer; no double push for a long turn that ends in a wait.
+- Push content follows `watch.includeQuestion`, as designed (the review split it from `notify.includeResult`); pane text and summaries are never pushed.
+- Not verified against a real Claude Code yet (owner): the exact layout of the permission dialog and of the input box and footer in the installed version (the heuristics are written against the 2.x layout described above), and the `waitingFor` values Claude Code writes (permission waits are recognised by the word "permission").
 
 ### M3: `remote_send` with confirmation and audit
 
