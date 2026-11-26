@@ -89,6 +89,9 @@ KEYS_MENU = "menu"
 heard (`none`: no menu was on it). The other mode is SEND_ANSWER, bound to `dialog_hash`."""
 NO_MENU = "none"
 KEY_NAMES = ("Up", "Down", "Left", "Right", "Enter", "Escape", "Tab", "BTab", *"123456789", "y", "n")
+MODE_KEYS = ("Tab", "BTab")
+"""Keys that switch modes at a Claude Code input (Shift+Tab cycles its permission mode up to accept
+edits or bypass permissions): `keys` presses them only into a bound menu or permission dialog."""
 """The only keys `keys` presses: tmux key names (and single characters tmux types as they are), never
 free text, modifiers (`C-c`, `M-x`) or tmux commands."""
 MAX_KEYS = 10
@@ -1008,11 +1011,13 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
     `menu` mode no permission dialog may show (`permission_prompt`) and the menu must be the one read
     back (`menu_changed`, `none` when there was none; then also no draft and no vim normal mode); in
     `answer` mode the permission dialog must be the one read back (`dialog_changed`), and only with
-    --allow-permission-answers."""
+    --allow-permission-answers. MODE_KEYS go only into a bound menu or a dialog (`mode_keys`)."""
     if not policy.allow_send:
         raise RefusedError("not_allowed")
     pane_id, pane_pid, session_id, mode, bound = args[:5]
     keys = args[5:]
+    if mode == KEYS_MENU and bound == NO_MENU and any(key in MODE_KEYS for key in keys):
+        raise RefusedError("mode_keys")
     pane, entry, screen = _send_state(policy, env, pane_id)
     if pane is None:
         raise RefusedError("gone")
@@ -1046,7 +1051,7 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
 def verb_resize(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str, object]:
     """Resizes the window of a pane (`resize-window -x -y`, which also sets that window's
     `window-size` to manual) within RESIZE_COLUMNS and RESIZE_ROWS, after rechecking the pane and its
-    process."""
+    process, and that it runs Claude Code unless --send-to-any-pane (`not_claude`)."""
     if not policy.allow_send:
         raise RefusedError("not_allowed")
     pane_id, pane_pid, columns, rows = args
@@ -1056,6 +1061,10 @@ def verb_resize(policy: Policy, env: dict[str, str], args: list[str]) -> dict[st
         raise RefusedError("gone")
     if pane["pane_pid"] != pane_pid:
         raise RefusedError("changed")
+    if not policy.send_to_any_pane:
+        entry = join_registry(panes, read_registry(claude_home(policy, env)), env).get(pane_id)
+        if entry is None:
+            raise RefusedError("not_claude")
     code, _, err = run_tmux(["resize-window", "-t", pane_id, "-x", columns, "-y", rows], policy, env)
     if code != 0:
         raise RefusedError("gone" if "can't find" in err.lower() else "tmux_failed")

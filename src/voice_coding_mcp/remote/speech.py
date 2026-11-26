@@ -8,9 +8,10 @@ to 40 characters.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
-from ..text import plural
+from ..text import clip, plural
 from .inventory import MachineView
 from .menu import ScreenMenu
 from .pending import PendingEntry, PendingReport, waits_for_permission
@@ -140,7 +141,34 @@ def menu_words(menu: ScreenMenu, limit: int = MENU_WORDS_MAX) -> str:
             break
         parts.append(item)
         used += len(item) + 2
-    return f"{head} Options: {'; '.join(parts)}."
+    hints = footer_words(menu.footer)
+    tail = f" Its key hints also say: {quote(hints)}." if hints else ""
+    return f"{head} Options: {'; '.join(parts)}.{tail}"
+
+
+FOOTER_WORDS_MAX = 120
+_HINT_SPLIT_RE = re.compile(r"\s*(?:·|•|\||\s{2,})\s*")
+_USUAL_HINT_RE = re.compile(r"(?:↑\s*/?\s*↓|(?:enter|return|esc|escape)\b)", re.I)
+_ARROW_WORDS = (("↑/↓", "up/down"), ("←/→", "left/right"), ("↑", "up"), ("↓", "down"), ("←", "left"), ("→", "right"))
+
+
+def footer_words(footer: str | None) -> str | None:
+    """The key hints of a menu footer beyond the usual up/down, enter and esc ones ("←/→ change
+    size" becomes "left/right change size"), redacted and clipped; None when there are none. Those
+    hints name keys that do something else in that menu, so the owner hears them before choosing."""
+    if not footer:
+        return None
+    extra: list[str] = []
+    for part in _HINT_SPLIT_RE.split(footer.strip()):
+        if not part or _USUAL_HINT_RE.match(part):
+            continue
+        spoken = part
+        for arrow, word in _ARROW_WORDS:
+            spoken = spoken.replace(arrow, word)
+        extra.append(" ".join(spoken.split()))
+    if not extra:
+        return None
+    return clip(redact(", ".join(extra)), FOOTER_WORDS_MAX)
 
 
 def format_status(
@@ -279,13 +307,20 @@ def _message(text: str) -> str:
     return f'"{text}"'
 
 
+_DROPPED_KIND = {KEYS: "key presses", RESIZE: "resize"}
+
+
+def dropped_words(dropped: Sequence[Confirmation]) -> str:
+    """ "I dropped the earlier message for fpga on dev." (or key presses, or resize)."""
+    kinds = sorted({_DROPPED_KIND.get(d.kind, "message") for d in dropped})
+    places = ", ".join(sorted({d.place for d in dropped}))
+    return f"I dropped the earlier {' and '.join(kinds)} for {places}."
+
+
 def format_readback(item: Confirmation, *, question: str | None, dropped: Sequence[Confirmation]) -> str:
     """What `remote_send` returns: the target, the question being answered (labelled as the screen's),
     the exact message, the risk and the yes phrase, then the confirmation id for the model."""
-    parts: list[str] = []
-    if dropped:
-        places = ", ".join(sorted({d.place for d in dropped}))
-        parts.append(f"I dropped the earlier message for {places}.")
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
     if question:
         asks = "asks for permission" if item.permission_answer else "asks"
         parts.append(
@@ -313,10 +348,7 @@ def format_keys_readback(
 ) -> str:
     """What `remote_send_keys` returns: the keys, the target, the menu or question on its screen
     (labelled as the screen's), the option the keys should choose, the risk and the yes phrase."""
-    parts: list[str] = []
-    if dropped:
-        places = ", ".join(sorted({d.place for d in dropped}))
-        parts.append(f"I dropped the earlier message for {places}.")
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
     keys = key_words(item.keys)
     if item.permission_answer:
         asked = f" It asks for permission: {quote(question)}." if question else " It shows a permission question."
@@ -340,10 +372,7 @@ def format_keys_readback(
 def format_resize_readback(
     item: Confirmation, *, current: tuple[int, int] | None, dropped: Sequence[Confirmation]
 ) -> str:
-    parts: list[str] = []
-    if dropped:
-        places = ", ".join(sorted({d.place for d in dropped}))
-        parts.append(f"I dropped the earlier message for {places}.")
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
     assert item.size is not None
     columns, rows = item.size
     now = f" It is now {current[0]} by {current[1]}." if current is not None else ""
@@ -373,10 +402,12 @@ _NOT_SENT: dict[str, str] = {
 
 _NOT_DONE_KEYS: dict[str, str] = {
     "menu_changed": "Not pressed: the menu on that screen changed since I read it to you. Ask me to read it again.",
-    "bad_request": "Not pressed: switchboard-remote on {machine} is too old to press keys. Update it there.",
+    "mode_keys": "Not pressed: there is no menu on that screen, and there tab and shift tab can switch Claude Code's modes.",
+    "bad_request": "Not pressed: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
 }
 _NOT_DONE_RESIZE: dict[str, str] = {
-    "bad_request": "Not resized: switchboard-remote on {machine} is too old to resize windows. Update it there.",
+    "not_claude": "Not resized: switchboard-remote on {machine} does not allow resizing panes without Claude Code.",
+    "bad_request": "Not resized: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
 }
 
 

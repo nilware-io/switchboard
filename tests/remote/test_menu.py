@@ -17,7 +17,7 @@ from voice_coding_mcp.remote.pending import screen_ask
 from voice_coding_mcp.remote.protocol import PaneInfo
 from voice_coding_mcp.remote.redact import clean_screen
 from voice_coding_mcp.remote.send import chosen_option, key_words, parse_keys
-from voice_coding_mcp.remote.speech import format_status, menu_words
+from voice_coding_mcp.remote.speech import footer_words, format_status, menu_words
 from voice_coding_mcp.remote.summarize import is_status_line, last_meaningful_line
 
 EXPECTED_OPTIONS = tuple(enumerate(OPTIONS, start=1))
@@ -218,9 +218,31 @@ def test_the_heuristic_names_the_question_and_every_option() -> None:
     assert text == (
         "dev, fpga: Claude Code is waiting for your answer. A menu on the screen asks: "
         '"How big should the high score table be?". Options: 1 "Small (10 entries)", selected; '
-        '2 "Medium (50 entries)"; 3 "Large (100 entries)"; 4 "Type something else".'
+        '2 "Medium (50 entries)"; 3 "Large (100 entries)"; 4 "Type something else". '
+        'Its key hints also say: "left/right change size".'
     )
     assert "choose" not in text
+
+
+@pytest.mark.parametrize(
+    ("footer", "spoken"),
+    [
+        # The owner's footer: left and right do something in that menu, so the owner hears it.
+        ("↑/↓ choose · ←/→ change size · enter confirm · esc not now", "left/right change size"),
+        ("Enter to select · Tab/Arrow keys to navigate · Esc to cancel", "Tab/Arrow keys to navigate"),
+        ("↑/↓ choose · enter confirm · esc not now", None),
+        ("Esc to cancel", None),
+        ("↑/↓ to choose  Enter to confirm  Esc to cancel", None),
+        (None, None),
+    ],
+)
+def test_the_footer_is_spoken_when_it_names_more_than_the_usual_keys(footer: str | None, spoken: str | None) -> None:
+    assert footer_words(footer) == spoken
+    text = menu_words(ScreenMenu(question="Size?", options=((1, "a"), (2, "b")), selected=1, footer=footer))
+    if spoken is None:
+        assert text == 'A menu on the screen asks: "Size?". Options: 1 "a", selected; 2 "b".'
+    else:
+        assert text.endswith(f'2 "b". Its key hints also say: "{spoken}".')
 
 
 def test_long_menus_are_cut_with_a_count() -> None:

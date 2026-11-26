@@ -52,7 +52,8 @@ async def make(tmp_path: Path) -> AsyncIterator[Make]:
 
 READBACK_MENU = (
     'A menu on the screen asks: "How big should the high score table be?". Options: 1 "Small (10 entries)", '
-    'selected; 2 "Medium (50 entries)"; 3 "Large (100 entries)"; 4 "Type something else".'
+    'selected; 2 "Medium (50 entries)"; 3 "Large (100 entries)"; 4 "Type something else". '
+    'Its key hints also say: "left/right change size".'
 )
 
 
@@ -135,7 +136,7 @@ async def test_a_new_preparation_replaces_the_old_one(make: Make) -> None:
     show(ctx, MENU)
     await prepare(ctx, ["Enter"])
     readback, _ = await prepare(ctx, ["Down", "Enter"])
-    assert readback.startswith("I dropped the earlier message for fpga on dev. Ready to press down and enter")
+    assert readback.startswith("I dropped the earlier key presses for fpga on dev. Ready to press down and enter")
     ctx.later()
     assert await ctx.confirm("4172") == (EXPIRED, True)
 
@@ -208,6 +209,7 @@ async def test_permission_answers_by_keys_are_risky_and_bound_to_the_dialog(make
     assert not error
     assert readback.startswith(
         'Ready to press down and enter in fpga on dev. It asks for permission: "Bash command git push origin main". '
+        'That should choose 2, "No, and tell Claude". '
         "Careful, this answers a question about a push, and this answers a permission question."
     )
     ctx.later()
@@ -218,6 +220,58 @@ async def test_permission_answers_by_keys_are_risky_and_bound_to_the_dialog(make
     ]
     (line,) = ctx.audit()
     assert (line["permissionAnswer"], line["riskyOk"], line["risky"]) == (True, True, ["question:push", "permission"])
+
+
+DIALOG_3 = (
+    "╭──────────────────────────────────────────────╮\n"
+    "│ Bash command                                 │\n"
+    "│   git push origin main                       │\n"
+    "│ Do you want to proceed?                      │\n"
+    "│ ❯ 1. Yes                                     │\n"
+    "│   2. Yes, and don't ask again for git push   │\n"
+    "│   3. No, and tell Claude what to do          │\n"
+    "╰──────────────────────────────────────────────╯\n"
+    "  Esc to cancel\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("keys", "says"),
+    [
+        (["Down", "Enter"], 'That should choose 2, "Yes, and don\'t ask again for git push".'),
+        (["Enter"], 'That should choose 1, "Yes".'),
+        (["3"], 'That should choose 3, "No, and tell Claude what to do".'),
+        (["Down", "Down", "Enter"], 'That should choose 3, "No, and tell Claude what to do".'),
+    ],
+)
+async def test_permission_answers_by_keys_say_which_option_they_choose(make: Make, keys: list[str], says: str) -> None:
+    ctx = await make(dev={"allowPermissionAnswers": True})
+    ctx.world.configure(forced=[*FORCED, "--allow-permission-answers"])
+    show(ctx, DIALOG_3, waiting_for="permission prompt")
+    readback, error = await prepare(ctx, keys)
+    assert not error
+    assert 'It asks for permission: "Bash command git push origin main". ' + says in readback
+    assert "Careful," in readback
+
+
+@pytest.mark.parametrize("key", ["Tab", "shift tab", "BTab", "backtab"])
+async def test_tab_and_shift_tab_without_a_menu_are_refused(make: Make, key: str) -> None:
+    """Shift+Tab at an idle Claude Code input cycles its permission mode: no voice route around the
+    permission-answer opt-in."""
+    ctx = await make(dev={"allowPermissionAnswers": True, "sendToAnyPane": True})
+    show(ctx, EMPTY_BOX, status="idle")
+    text, error = await prepare(ctx, ["Down", key])
+    assert (text, error) == (
+        "I see no menu on the screen of fpga on dev, and there tab and shift tab can switch Claude Code's modes, "
+        "so I will not press them.",
+        True,
+    )
+    assert keys_calls(ctx) == []
+    # Into a menu the owner hears they still go.
+    show(ctx, MENU)
+    readback, error = await prepare(ctx, [key])
+    assert not error
+    assert readback.startswith(f"Ready to press {'tab' if key == 'Tab' else 'shift tab'} in fpga on dev. A menu")
 
 
 async def test_a_menu_that_changed_before_confirm_is_not_pressed(make: Make) -> None:
@@ -332,7 +386,7 @@ async def test_an_older_dispatcher_is_named_at_confirm_when_version_did_not_answ
     ctx.later()
     done = await tools.remote_send_confirm("4172", False, OWNER)
     assert (done.text, done.is_error) == (
-        "Not pressed: switchboard-remote on dev is too old to press keys. Update it there.",
+        "Not pressed: switchboard-remote on dev refused the request. If it is older than 0.5.0, update it there.",
         True,
     )
 
@@ -362,6 +416,17 @@ async def test_resize_bounds_and_opt_in(make: Make) -> None:
     for columns, rows in ((79, 40), (301, 40), (120, 23), (120, 121)):
         answer = await ctx.tools.remote_resize("dev", "fpga", columns, rows, OWNER)
         assert (answer.text, answer.is_error) == ("I can set 80 to 300 columns and 24 to 120 rows.", True)
+
+
+async def test_resize_a_pane_without_claude_code_needs_send_to_any_pane(make: Make) -> None:
+    ctx = await make()
+    show(ctx, MENU)
+    answer = await ctx.tools.remote_resize("dev", "fpga:1", 120, 40, OWNER)
+    assert (answer.text, answer.is_error) == (
+        "fpga window 1 on dev is not running Claude Code, so I will not resize it.",
+        True,
+    )
+    assert not any(" resize " in c["argv"][-1] for c in ctx.world.ssh_calls())
 
 
 async def test_resize_needs_allow_send(make: Make) -> None:

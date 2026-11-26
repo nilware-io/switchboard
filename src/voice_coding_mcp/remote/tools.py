@@ -32,6 +32,7 @@ from .dispatcher import (
     KEY_NAMES,
     KEYS_MENU,
     MAX_KEYS,
+    MODE_KEYS,
     NO_DIALOG,
     NO_MENU,
     RESIZE_COLUMNS,
@@ -597,7 +598,6 @@ class RemoteTools:
             question = (ask.text if ask is not None and ask.kind == "permission" else None) or waiting_for_text(
                 claude.waiting_for if claude else None
             )
-            menu = None
         else:
             bound = menu_hash(captured.text)
             question = (menu.question if menu is not None else None) or (
@@ -605,7 +605,17 @@ class RemoteTools:
             )
             if question is None and claude is not None and claude.status == "waiting":
                 question = waiting_for_text(claude.waiting_for)
-        chosen = chosen_option(menu, parsed) if not permission else None
+            if bound is None and any(key in MODE_KEYS for key in parsed):
+                # Tab and Shift+Tab at a Claude Code input switch modes (Shift+Tab cycles the
+                # permission mode up to accept edits or bypass), a broader grant than answering one
+                # dialog: only into a menu the owner heard or a permission dialog.
+                return refuse(
+                    f"I see no menu on the screen of {place}, and there tab and shift tab can switch "
+                    "Claude Code's modes, so I will not press them.",
+                    "mode_keys",
+                )
+        # Also for a permission dialog: find_menu reads its options, so the owner hears which one.
+        chosen = chosen_option(menu, parsed)
         context = question
         if chosen is None and menu is not None:
             # Which option the keys choose is not known: every option counts as the question's.
@@ -691,6 +701,11 @@ class RemoteTools:
         if not isinstance(resolved, Resolved):
             return refuse(format_target_problem(name, resolved), "target")
         pane = resolved.pane
+        if pane.claude is None and not config.send_to_any_pane:
+            return refuse(
+                f"{send_place(name, pane, resolved.name_window)} is not running Claude Code, so I will not resize it.",
+                "not_claude",
+            )
         if await self._lacks_verb(name, "resize", deadline):
             return refuse(
                 f"switchboard-remote on {name} is too old to resize windows. Update it there.", "old_dispatcher"

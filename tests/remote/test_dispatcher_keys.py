@@ -224,6 +224,25 @@ def test_without_a_menu_draft_and_vim_are_refused(world: RemoteWorld) -> None:
     assert pressed(world) == []
 
 
+@pytest.mark.parametrize("mode_key", d.MODE_KEYS)
+def test_tab_and_shift_tab_need_a_bound_menu_or_dialog(world: RemoteWorld, mode_key: str) -> None:
+    """Shift+Tab at an idle Claude Code input cycles its permission mode (accept edits, bypass):
+    never with no menu bound, whatever the opt-ins."""
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
+    everything = [*FORCED, "--allow-permission-answers", "--send-to-any-pane"]
+    assert keys(world, mode_key, bound="menu none") == {"protocol": 1, "ok": False, "error": "mode_keys"}
+    assert keys(world, "Down", mode_key, "Enter", bound="menu none", forced=everything)["error"] == "mode_keys"
+    shell = call(world, f"keys %2 {SHELL_PID} none menu none {mode_key}", everything)
+    assert shell["error"] == "mode_keys"
+    assert pressed(world) == []
+    # Into a menu the owner heard, and into a permission dialog, they still go.
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": MENU})
+    assert keys(world, mode_key)["ok"] is True
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})
+    assert keys(world, mode_key, bound=f"answer {DIALOG_HASH}", forced=everything)["ok"] is True
+    assert pressed(world) == [["send-keys", "-t", "%1", mode_key]] * 2
+
+
 def test_a_permission_dialog_needs_answer_mode_and_the_opt_in(world: RemoteWorld) -> None:
     world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})
     assert DIALOG_HASH is not None
@@ -295,6 +314,16 @@ def test_resize_policy_and_rechecks(world: RemoteWorld) -> None:
     assert call(world, "resize %3 9100103 120 40")["error"] == "gone"
     assert call(world, "resize %9 1 120 40")["error"] == "gone"
     assert not any(argv[0] == "resize-window" for argv in tmux_argvs(world))
+
+
+def test_resize_a_pane_without_claude_code_only_with_send_to_any_pane(world: RemoteWorld) -> None:
+    assert call(world, f"resize %2 {SHELL_PID} 120 40")["error"] == "not_claude"
+    assert not any(argv[0] == "resize-window" for argv in tmux_argvs(world))
+    out = call(world, f"resize %2 {SHELL_PID} 120 40", [*FORCED, "--send-to-any-pane"])
+    assert out["ok"] is True
+    assert [argv for argv in tmux_argvs(world) if argv[0] == "resize-window"] == [
+        ["resize-window", "-t", "%2", "-x", "120", "-y", "40"]
+    ]
 
 
 def test_the_script_answers_keys_like_handle(world: RemoteWorld) -> None:
