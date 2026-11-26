@@ -572,7 +572,11 @@ class RemoteTools:
             return refuse(KEYS_REFUSAL[parsed], f"keys_{parsed}")
         if keys_problem(parsed, menu_bound=True) == "key_order":
             return refuse(KEYS_ORDER_REFUSAL, "key_order")
-        view = await self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left())
+        # The version probe runs alongside the list, not as a third round trip before the capture.
+        view, lacks_keys = await asyncio.gather(
+            self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left()),
+            self._lacks_verb(name, "keys", deadline),
+        )
         if not view.ok:
             return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
         resolved = resolve_target(view, target)
@@ -583,7 +587,7 @@ class RemoteTools:
         claude = pane.claude
         if claude is None and not config.send_to_any_pane:
             return refuse(f"{place} is not running Claude Code, so I will not press keys in it.", "not_claude")
-        if await self._lacks_verb(name, "keys", deadline):
+        if lacks_keys:
             return refuse(f"switchboard-remote on {name} is too old to press keys. Update it there.", "old_dispatcher")
         captured = await self.inventory.capture(name, pane.pane_id, SEND_CAPTURE_LINES, budget_seconds=deadline.left())
         if not isinstance(captured, CaptureResponse):
@@ -613,15 +617,15 @@ class RemoteTools:
             question = (ask.text if ask is not None and ask.kind == "permission" else None) or waiting_for_text(
                 claude.waiting_for if claude else None
             )
-            if dialog_hash(captured.text) is None and keys_problem(parsed, menu_bound=False, unbound_answer=True):
+            if dialog_hash(captured.text) is None:
                 # The registry says it waits for permission, but no dialog is on the screen to bind
                 # the keys to (a stale entry, or a dialog shows_dialog cannot see): Enter would submit
-                # a draft or an earlier prompt, Shift+Tab would change the permission mode. Only one
-                # key that submits nothing; the dispatcher refuses the same (`dialog_unreadable`).
+                # a draft, Up and Enter an earlier prompt, Shift+Tab would change the permission
+                # mode. No keys at all; the dispatcher refuses the same (`dialog_not_visible`).
                 return refuse(
-                    f"{place} is waiting for a permission decision, but I cannot see its dialog on the "
-                    "screen, so I will only press one number, y, n or escape there, and nothing else.",
-                    "dialog_unreadable",
+                    f"{place} is waiting for a permission decision, but the permission question is not "
+                    "visible on its screen, so I will not press keys there. Check it at the keyboard.",
+                    "dialog_not_visible",
                 )
         else:
             bound = menu_hash(captured.text)
@@ -737,7 +741,10 @@ class RemoteTools:
                 f"{RESIZE_ROWS[1]} rows.",
                 "bad_size",
             )
-        view = await self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left())
+        view, lacks_resize = await asyncio.gather(
+            self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left()),
+            self._lacks_verb(name, "resize", deadline),
+        )
         if not view.ok:
             return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
         resolved = resolve_target(view, target)
@@ -749,7 +756,7 @@ class RemoteTools:
                 f"{send_place(name, pane, resolved.name_window)} is not running Claude Code, so I will not resize it.",
                 "not_claude",
             )
-        if await self._lacks_verb(name, "resize", deadline):
+        if lacks_resize:
             return refuse(
                 f"switchboard-remote on {name} is too old to resize windows. Update it there.", "old_dispatcher"
             )
@@ -849,7 +856,7 @@ class RemoteTools:
             args = [item.pane_id, str(item.pane_pid), session, *bound, *item.keys]
         elif item.kind == RESIZE and item.size is not None:
             verb = "resize"
-            args = [item.pane_id, str(item.pane_pid), str(item.size[0]), str(item.size[1])]
+            args = [item.pane_id, str(item.pane_pid), session, str(item.size[0]), str(item.size[1])]
         else:
             mode = [SEND_ANSWER, item.dialog or NO_DIALOG] if item.permission_answer else [SEND_MESSAGE]
             args = [item.pane_id, str(item.pane_pid), session, *mode]

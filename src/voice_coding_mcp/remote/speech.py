@@ -122,30 +122,52 @@ def status_fact(pane: PaneInfo) -> str:
 
 
 MENU_WORDS_MAX = 400
+MENU_WORDS_DETAILED_MAX = 600
+"""The heuristic status names each option's description too, within this many characters."""
+MENU_AFTER_SUMMARY_MAX = 200
+"""After a model summary only the options, within this many characters."""
+DESCRIPTION_WORDS_MAX = 60
 
 
-def menu_words(menu: ScreenMenu, limit: int = MENU_WORDS_MAX, *, hints: bool = True) -> str:
+def _option_words(menu: ScreenMenu, limit: int, used: int, details: bool) -> tuple[list[str], bool]:
+    """(the spoken options within `limit`, with "and N more" when cut; whether all fit)."""
+    parts: list[str] = []
+    for index, (number, text) in enumerate(menu.options):
+        item = (f"{number} " if menu.numbered else "") + quote(redact(text))
+        description = menu.descriptions[index] if details and index < len(menu.descriptions) else None
+        if description:
+            item += f" (details: {quote(clip(redact(description), DESCRIPTION_WORDS_MAX))})"
+        item += ", selected" if number == menu.selected else ""
+        if parts and used + len(item) + 2 > limit:
+            parts.append(f"and {len(menu.options) - index} more")
+            return parts, False
+        parts.append(item)
+        used += len(item) + 2
+    return parts, True
+
+
+def menu_words(
+    menu: ScreenMenu, limit: int = MENU_WORDS_MAX, *, hints: bool = True, details: bool = False, question: bool = True
+) -> str:
     """'A menu on the screen asks: "<question>". Options: 1 "Small", selected; 2 "Medium".' (a menu
     without numbers: '"Small", selected; "Medium"'), the options cut (with "and N more") so the
     whole stays within about `limit` characters, then the unusual key hints unless `hints` is off.
-    Screen text, so quoted and redacted."""
-    head = (
-        f"A menu on the screen asks: {quote(redact(menu.question))}." if menu.question else "The screen shows a menu."
-    )
-    parts: list[str] = []
-    used = len(head) + len(" Options: ")
-    for index, (number, text) in enumerate(menu.options):
-        item = (f"{number} " if menu.numbered else "") + quote(redact(text))
-        item += ", selected" if number == menu.selected else ""
-        rest = len(menu.options) - index
-        if parts and used + len(item) + 2 > limit:
-            parts.append(f"and {rest} more")
-            break
-        parts.append(item)
-        used += len(item) + 2
+    With `details`, each option's description in short ('1 "A" (details: "...")'), dropped again
+    when then not every option fits. Without `question`: 'The menu's options: ...'. Screen text, so
+    quoted and redacted."""
+    if not question:
+        head = "The menu's options:"
+    elif menu.question:
+        head = f"A menu on the screen asks: {quote(redact(menu.question))}. Options:"
+    else:
+        head = "The screen shows a menu. Options:"
+    used = len(head) + 1
+    parts, fits = _option_words(menu, limit, used, details)
+    if details and not fits:
+        parts, _ = _option_words(menu, limit, used, False)
     hints_said = footer_words(menu.footer) if hints else None
     tail = f" Its key hints also say: {quote(hints_said)}." if hints_said else ""
-    return f"{head} Options: {'; '.join(parts)}.{tail}"
+    return f"{head} {'; '.join(parts)}.{tail}"
 
 
 FOOTER_WORDS_MAX = 120
@@ -178,11 +200,12 @@ def format_status(
 ) -> str:
     fact = status_fact(pane)
     if summary:
-        # The menu's own words too, so its options reach the owner whatever the summary says.
-        more = f" {menu_words(menu)}" if menu is not None else ""
+        # The summary names the question and the options already; only a short list of the menu's
+        # own options follows, so they reach the owner whatever the summary says.
+        more = f" {menu_words(menu, MENU_AFTER_SUMMARY_MAX, hints=False, question=False)}" if menu is not None else ""
         return f"{label}: {fact} A summary of the screen: {quote(summary)}{more}"
     if menu is not None:
-        return f"{label}: {fact} {menu_words(menu)}"
+        return f"{label}: {fact} {menu_words(menu, MENU_WORDS_DETAILED_MAX, details=True)}"
     if line:
         return f"{label}: {fact} The screen says: {quote(redact(line))}"
     return f"{label}: {fact} The screen is empty."
@@ -386,7 +409,8 @@ def format_resize_readback(
     parts.append(f"Ready to resize the window of {item.place} to {columns} columns by {rows} rows.{now}")
     parts.append(
         "The size stays fixed afterwards, and it also changes the other panes in that window "
-        "and every terminal attached to it."
+        "and every terminal attached to it. To undo it, run tmux set-option -w -u window-size in that "
+        "window at the keyboard, which goes back to automatic sizing."
     )
     parts.append("Say yes to resize it.")
     parts.append(f"(confirmation {item.id}, do not read this number aloud)")
@@ -417,7 +441,7 @@ _NOT_DONE_KEYS: dict[str, str] = {
     "key_order": "Not pressed: switchboard-remote on {machine} presses a number, enter, escape, y or n only as the last key.",
     "history_submit": "Not pressed: there is no menu on that screen; up or down and then enter would send an earlier prompt or command again.",
     "menu_unreadable": "Not pressed: that screen now shows a menu I cannot read. Ask me what it says.",
-    "dialog_unreadable": "Not pressed: no permission dialog is on that screen any more, and without one I press only a single number, y, n or escape.",
+    "dialog_not_visible": "Not pressed: the permission question is not visible on that screen. Check it at the keyboard.",
     "bad_request": "Not pressed: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
 }
 _NOT_DONE_RESIZE: dict[str, str] = {
@@ -442,7 +466,10 @@ def format_confirm_outcome(item: Confirmation, outcome: str, detail: str | None)
     if item.kind == RESIZE:
         if outcome == "sent":
             assert item.size is not None
-            return f"Resized the window of {item.place} to {item.size[0]} by {item.size[1]}."
+            return (
+                f"Resized the window of {item.place} to {item.size[0]} by {item.size[1]}. It stays that size "
+                "until someone runs tmux set-option -w -u window-size in that window."
+            )
         if outcome == "unknown":
             return f"I do not know whether the window was resized, {machine} stopped answering."
         if code in _NOT_DONE_RESIZE:

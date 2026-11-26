@@ -12,6 +12,7 @@ from ..text import clip
 from .dispatcher import MENU_FOOTER_RE, find_menu, shows_picker
 
 MENU_OPTION_MAX = 80
+MENU_DESCRIPTION_MAX = 80
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,8 @@ class ScreenMenu:
     numbered: bool = True
     """False for a menu without numbers: its options are numbered by position, and a digit key does
     not choose them."""
+    descriptions: tuple[str | None, ...] = ()
+    """Per option (same order), the lines under it joined and clipped to MENU_DESCRIPTION_MAX, or None."""
 
 
 QUESTION_MAX_CHARS = 200
@@ -41,13 +44,16 @@ def screen_menu(screen: str) -> ScreenMenu | None:
     options = found["options"]
     selected = found["selected"]
     footer = found["footer"]
+    descriptions = found.get("descriptions")
     assert isinstance(options, list)
+    assert isinstance(descriptions, list)
     return ScreenMenu(
         question=clip(question, QUESTION_MAX_CHARS) if isinstance(question, str) else None,
         options=tuple((int(number), clip(str(text), MENU_OPTION_MAX)) for number, text in options),
         selected=selected if isinstance(selected, int) else None,
         footer=footer if isinstance(footer, str) else None,
         numbered=found["numbered"] is not False,
+        descriptions=tuple(clip(str(text), MENU_DESCRIPTION_MAX) if text else None for text in descriptions),
     )
 
 

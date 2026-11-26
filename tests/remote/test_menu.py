@@ -36,6 +36,7 @@ def test_the_whole_menu_is_found_on_every_screen_it_fits(rows: int, alternate: b
         options=EXPECTED_OPTIONS,
         selected=1,
         footer=FOOTER.strip(),
+        descriptions=(None,) * len(OPTIONS),
     )
 
 
@@ -148,6 +149,12 @@ def test_an_assistant_line_directly_above_is_the_question() -> None:
         "❯ 1. only\n↑/↓ choose\n",
         # The draft in the input box looks like an option.
         "╭────╮\n│ ❯ 1. do this │\n╰────╯\n",
+        # A numbered list above the input box, whose draft continues it, over the status line.
+        "⏺ Pick one:\n  1. Rewrite it\n╭──────────────╮\n│ ❯ 2. keep it │\n╰──────────────╯\n"
+        "  ⏵⏵ accept edits on (shift+tab to cycle)\n",
+        "  1. Rewrite it\n────────────────\n❯ 2. keep it\n────────────────\n  ? for shortcuts\n",
+        # The status line is no menu footer.
+        "⏺ Steps:\n1. build\n2. test\n  ⏵⏵ accept edits on (shift+tab to cycle)\n",
         # An assistant line between the options and the bottom.
         "❯ 1. a\n  2. b\n⏺ Thinking about it\nesc to interrupt\n",
         "",
@@ -338,3 +345,60 @@ def test_chosen_option_follows_the_selection() -> None:
     unmarked = ScreenMenu(question=None, options=((1, "a"), (2, "b")), selected=None, footer="↑/↓")
     assert chosen_option(unmarked, ["Down", "Enter"]) is None
     assert chosen_option(unmarked, ["2"]) == (2, "b")
+
+
+def test_the_input_status_line_is_no_menu_footer() -> None:
+    assert not d.MENU_FOOTER_RE.search("⏵⏵ accept edits on (shift+tab to cycle)")
+    assert not d.MENU_FOOTER_RE.search("⏸ plan mode on (shift-tab to cycle)")
+    assert d.MENU_FOOTER_RE.search("tab to amend")
+    assert d.INPUT_STATUS_RE.search("⏵⏵ accept edits on (shift+tab to cycle)")
+
+
+def test_a_real_menu_above_the_status_line_is_still_found() -> None:
+    lines = [*menu_lines(), "  ⏵⏵ accept edits on (shift+tab to cycle)"]
+    menu = screen_menu(clean_screen("\n".join(lines)))
+    assert menu is not None
+    assert menu.options == EXPECTED_OPTIONS
+    assert menu.footer == FOOTER.strip()
+
+
+def test_menus_with_ten_or_more_options_keep_every_option() -> None:
+    options = tuple(f"Choice {i}" for i in range(1, 13))
+    menu = screen_menu(clean_screen("\n".join(menu_lines(selected=10, options=options))))
+    assert menu is not None
+    assert menu.options == tuple(enumerate(options, start=1))
+    assert menu.selected == 10
+    spoken = menu_words(menu)
+    assert '12 "Choice 12"' in spoken or "more" in spoken
+
+
+def test_a_long_menu_is_spoken_with_and_more() -> None:
+    options = tuple(f"A rather long option name, number {i}" for i in range(1, 16))
+    menu = screen_menu(clean_screen("\n".join(menu_lines(options=options))))
+    assert menu is not None
+    assert len(menu.options) == 15
+    assert menu_words(menu).endswith('more. Its key hints also say: "left/right change size".')
+
+
+def test_option_descriptions_are_kept_per_option() -> None:
+    screen = "\n".join(
+        [
+            "Which one?",
+            "❯ 1. Fast",
+            "     skips the tests",
+            "  2. Safe",
+            "     runs everything",
+            "     twice",
+            "↑/↓ choose",
+        ]
+    )
+    found = d.find_menu(screen)
+    assert found is not None
+    assert found["descriptions"] == ["skips the tests", "runs everything twice"]
+    menu = screen_menu(screen)
+    assert menu is not None
+    assert menu_words(menu, details=True) == (
+        'A menu on the screen asks: "Which one?". Options: 1 "Fast" (details: "skips the tests"), selected; '
+        '2 "Safe" (details: "runs everything twice").'
+    )
+    assert menu_words(menu) == 'A menu on the screen asks: "Which one?". Options: 1 "Fast", selected; 2 "Safe".'

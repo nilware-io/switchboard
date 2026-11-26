@@ -268,12 +268,17 @@ async def test_a_confirmed_resize_makes_a_short_alternate_pane_show_the_whole_me
     prepared = await live.tools.remote_resize("dev", "shortalt", 100, 30, OWNER)
     assert "It is now 80 by 8." in prepared.text
     done = await live.tools.remote_send_confirm("4172", False, OWNER)
-    assert (done.text, done.is_error) == ("Resized the window of shortalt on dev to 100 by 30.", False)
+    assert done.text.startswith("Resized the window of shortalt on dev to 100 by 30.")
+    assert not done.is_error
     size = tmux(live.server.base, "display-message", "-p", "-t", "shortalt", "#{window_width} #{window_height}")
     assert size.split() == ["100", "30"]
+    assert tmux(live.server.base, "show-options", "-w", "-v", "-t", "shortalt", "window-size").strip() == "manual"
     await asyncio.sleep(0.3)
     captured = d.handle([*policy(live.server), "capture", live.server.panes["shortalt"], "60"], dispatcher_env())
     assert "I can set the high score table up" in str(captured["text"]), "the line above the box is back"
     after = await live.tools.remote_status("dev", "shortalt", None)
     assert "rows high" not in after.text
     assert QUESTION in after.text
+    # The undo the read-back names: the window option is unset and the window follows the global one.
+    tmux(live.server.base, "set-option", "-w", "-u", "-t", "shortalt", "window-size")
+    assert tmux(live.server.base, "show-options", "-w", "-v", "-t", "shortalt", "window-size").strip() == ""

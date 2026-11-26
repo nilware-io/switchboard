@@ -270,29 +270,39 @@ def test_a_registry_permission_wait_counts_as_a_dialog(world: RemoteWorld) -> No
 
 @pytest.mark.parametrize(
     "names",
-    ["Up Enter", "Enter", "BTab BTab BTab", "Tab", "Down 2", "Left Escape", "Down Down"],
+    ["Up Enter", "Enter", "BTab BTab BTab", "Tab", "Down 2", "Left Escape", "Down Down", "1", "y", "n", "Escape"],
 )
 def test_a_registry_only_permission_wait_is_not_a_bound_dialog(world: RemoteWorld, names: str) -> None:
     """`answer none`: the registry says it waits for permission, the screen shows only the empty input
     box (a stale entry, or a dialog shows_dialog cannot see). Up Enter would submit an earlier prompt,
-    Enter a draft, BTab would cycle the permission mode toward bypass: only one key that submits
-    nothing goes in, whatever the opt-ins."""
+    Enter a draft, BTab would cycle the permission mode toward bypass: nothing goes in, whatever the
+    opt-ins and keys."""
     world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
     world.register("2001", os.getpid(), sessionId=SESSION_A, status="waiting", waitingFor="permission", tmux="0:@0.%1")
     everything = [*FORCED, "--allow-permission-answers", "--send-to-any-pane"]
     out = keys(world, *names.split(), bound="answer none", forced=everything)
-    assert out == {"protocol": 1, "ok": False, "error": "dialog_unreadable"}
+    assert out == {"protocol": 1, "ok": False, "error": "dialog_not_visible"}
     assert pressed(world) == []
 
 
-@pytest.mark.parametrize("name", d.UNBOUND_ANSWER_KEYS)
-def test_a_registry_only_permission_wait_takes_one_key_that_submits_nothing(world: RemoteWorld, name: str) -> None:
+def test_answer_none_is_refused_even_with_a_dialog_or_a_draft_on_the_screen(world: RemoteWorld) -> None:
+    allowed = [*FORCED, "--allow-permission-answers"]
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="waiting", waitingFor="permission", tmux="0:@0.%1")
+    for screen in (DIALOG, EMPTY_BOX.replace(">                ", "> rm -rf build   ")):
+        world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+        assert keys(world, "1", bound="answer none", forced=allowed)["error"] == "dialog_not_visible"
+    assert pressed(world) == []
+
+
+def test_answer_mode_presses_only_into_the_dialog_on_the_screen(world: RemoteWorld) -> None:
+    """A registry permission wait with the read-back dialog's hash, but the screen now shows only the
+    input box (the dialog was answered at the keyboard): `dialog_changed`."""
     world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
     world.register("2001", os.getpid(), sessionId=SESSION_A, status="waiting", waitingFor="permission", tmux="0:@0.%1")
     allowed = [*FORCED, "--allow-permission-answers"]
-    assert keys(world, name, bound="answer none", forced=allowed)["ok"] is True
-    assert pressed(world) == [["send-keys", "-t", "%1", name]]
-    assert_fixed_shapes(world)
+    for names in ("Up Enter", "BTab BTab BTab", "Enter"):
+        assert keys(world, *names.split(), bound=f"answer {DIALOG_HASH}", forced=allowed)["error"] == "dialog_changed"
+    assert pressed(world) == []
 
 
 def test_tmux_failure(world: RemoteWorld) -> None:
@@ -300,14 +310,14 @@ def test_tmux_failure(world: RemoteWorld) -> None:
         [pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": MENU}, failOn=["send-keys", "resize-window"]
     )
     assert keys(world, "Enter")["error"] == "tmux_failed"
-    assert call(world, f"resize %1 {CLAUDE_PID} 120 40")["error"] == "tmux_failed"
+    assert call(world, f"resize %1 {CLAUDE_PID} {SESSION_A} 120 40")["error"] == "tmux_failed"
 
 
 # --- resize ------------------------------------------------------------------------------------
 
 
 def test_resize_runs_resize_window(world: RemoteWorld) -> None:
-    out = call(world, f"resize %1 {CLAUDE_PID} 120 40")
+    out = call(world, f"resize %1 {CLAUDE_PID} {SESSION_A} 120 40")
     assert out == {"protocol": 1, "ok": True, "resized": True, "columns": 120, "rows": 40}
     assert [argv for argv in tmux_argvs(world) if argv[0] == "resize-window"] == [
         ["resize-window", "-t", "%1", "-x", "120", "-y", "40"]
@@ -318,16 +328,18 @@ def test_resize_runs_resize_window(world: RemoteWorld) -> None:
 @pytest.mark.parametrize(
     "args",
     [
-        "%1 9100101 79 40",
-        "%1 9100101 301 40",
-        "%1 9100101 120 23",
-        "%1 9100101 120 121",
-        "%1 9100101 120",
-        "%1 9100101 120 40 1",
-        "%1 9100101 -120 40",
-        "%1 9100101 120x40",
-        "1 9100101 120 40",
-        "%1 9100101 1e3 40",
+        f"%1 9100101 {SESSION_A} 79 40",
+        f"%1 9100101 {SESSION_A} 301 40",
+        f"%1 9100101 {SESSION_A} 120 23",
+        f"%1 9100101 {SESSION_A} 120 121",
+        f"%1 9100101 {SESSION_A} 120",
+        f"%1 9100101 {SESSION_A} 120 40 1",
+        f"%1 9100101 {SESSION_A} -120 40",
+        f"%1 9100101 {SESSION_A} 120x40",
+        f"1 9100101 {SESSION_A} 120 40",
+        f"%1 9100101 {SESSION_A} 1e3 40",
+        "%1 9100101 120 40",
+        "%1 9100101 not-a-session 120 40",
     ],
 )
 def test_resize_validation(world: RemoteWorld, args: str) -> None:
@@ -336,17 +348,26 @@ def test_resize_validation(world: RemoteWorld, args: str) -> None:
 
 
 def test_resize_policy_and_rechecks(world: RemoteWorld) -> None:
-    assert call(world, f"resize %1 {CLAUDE_PID} 120 40", SESSIONS)["error"] == "not_allowed"
-    assert call(world, "resize %1 1234 120 40")["error"] == "changed"
-    assert call(world, "resize %3 9100103 120 40")["error"] == "gone"
-    assert call(world, "resize %9 1 120 40")["error"] == "gone"
+    assert call(world, f"resize %1 {CLAUDE_PID} {SESSION_A} 120 40", SESSIONS)["error"] == "not_allowed"
+    assert call(world, f"resize %1 1234 {SESSION_A} 120 40")["error"] == "changed"
+    assert call(world, "resize %3 9100103 none 120 40")["error"] == "gone"
+    assert call(world, "resize %9 1 none 120 40")["error"] == "gone"
+    assert not any(argv[0] == "resize-window" for argv in tmux_argvs(world))
+
+
+def test_resize_rechecks_the_claude_code_session_the_owner_heard(world: RemoteWorld) -> None:
+    """The pane now runs another Claude Code session, or none, or the hub heard none and it runs one."""
+    assert call(world, f"resize %1 {CLAUDE_PID} {SESSION_B} 120 40")["error"] == "changed"
+    everything = [*FORCED, "--send-to-any-pane"]
+    assert call(world, f"resize %1 {CLAUDE_PID} none 120 40", everything)["error"] == "changed"
+    assert call(world, f"resize %2 {SHELL_PID} {SESSION_A} 120 40", everything)["error"] == "changed"
     assert not any(argv[0] == "resize-window" for argv in tmux_argvs(world))
 
 
 def test_resize_a_pane_without_claude_code_only_with_send_to_any_pane(world: RemoteWorld) -> None:
-    assert call(world, f"resize %2 {SHELL_PID} 120 40")["error"] == "not_claude"
+    assert call(world, f"resize %2 {SHELL_PID} none 120 40")["error"] == "not_claude"
     assert not any(argv[0] == "resize-window" for argv in tmux_argvs(world))
-    out = call(world, f"resize %2 {SHELL_PID} 120 40", [*FORCED, "--send-to-any-pane"])
+    out = call(world, f"resize %2 {SHELL_PID} none 120 40", [*FORCED, "--send-to-any-pane"])
     assert out["ok"] is True
     assert [argv for argv in tmux_argvs(world) if argv[0] == "resize-window"] == [
         ["resize-window", "-t", "%2", "-x", "120", "-y", "40"]
@@ -426,11 +447,6 @@ def test_keys_problem_rules() -> None:
     assert d.keys_problem(["Up", "Enter"], menu_bound=False) == "history_submit"
     assert d.keys_problem(["Up", "Tab"], menu_bound=False) == "mode_keys"
     assert d.keys_problem(["1", "2", "Enter"], menu_bound=False) == "key_order"
-    assert d.keys_problem(["2"], menu_bound=False, unbound_answer=True) is None
-    assert d.keys_problem(["Escape"], menu_bound=False, unbound_answer=True) is None
-    assert d.keys_problem(["Enter"], menu_bound=False, unbound_answer=True) == "dialog_unreadable"
-    assert d.keys_problem(["Down", "2"], menu_bound=False, unbound_answer=True) == "dialog_unreadable"
-    assert set(d.UNBOUND_ANSWER_KEYS) <= set(d.FINAL_KEYS) - {"Enter"}
     assert set(d.FINAL_KEYS) | set(d.MODE_KEYS) | set(d.HISTORY_KEYS) <= set(d.KEY_NAMES)
 
 

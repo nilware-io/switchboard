@@ -38,6 +38,8 @@ from tests.remote.test_tools import build as build_status
 from voice_coding_mcp.remote import dispatcher as d
 from voice_coding_mcp.remote.config import MachineConfig
 from voice_coding_mcp.remote.protocol import VersionResponse
+from voice_coding_mcp.remote.send import KEYS, Confirmation
+from voice_coding_mcp.remote.speech import format_confirm_outcome
 from voice_coding_mcp.remote.tools import EARLY, EXPIRED, NEEDS_RISKY_OK, RemoteTools, RemoteToolsOptions
 from voice_coding_mcp.remote.transport import Transport, TransportResult
 
@@ -263,30 +265,75 @@ async def test_permission_answers_by_keys_say_which_option_they_choose(make: Mak
     assert "Careful," in readback
 
 
-@pytest.mark.parametrize("names", [["Up", "Enter"], ["Enter"], ["BTab", "BTab", "BTab"], ["Down", "2"], ["Tab"]])
-async def test_a_registry_only_permission_wait_takes_one_key_that_submits_nothing(make: Make, names: list[str]) -> None:
+NOT_VISIBLE = (
+    "fpga on dev is waiting for a permission decision, but the permission question is not visible on its "
+    "screen, so I will not press keys there. Check it at the keyboard."
+)
+
+
+@pytest.mark.parametrize(
+    "names", [["Up", "Enter"], ["Enter"], ["BTab", "BTab", "BTab"], ["Down", "2"], ["Tab"], ["1"], ["y"], ["Escape"]]
+)
+async def test_a_registry_only_permission_wait_takes_no_keys(make: Make, names: list[str]) -> None:
     """The registry says it waits for permission, the screen shows only the empty input box (a stale
     entry, or a dialog shows_dialog cannot see): nothing binds the keys to a dialog, so Up Enter would
-    submit an earlier prompt, Enter a draft, Shift+Tab would cycle the permission mode. Only a single
-    number, y, n or escape."""
+    submit an earlier prompt, Enter a draft, Shift+Tab would cycle the permission mode toward bypass.
+    No keys at all, whatever the opt-ins."""
     ctx = await make(dev={"allowPermissionAnswers": True, "sendToAnyPane": True})
     ctx.world.configure(forced=[*FORCED, "--allow-permission-answers", "--send-to-any-pane"])
     show(ctx, EMPTY_BOX, waiting_for="permission prompt")
-    text, error = await prepare(ctx, names)
-    assert (text, error) == (
-        "fpga on dev is waiting for a permission decision, but I cannot see its dialog on the screen, "
-        "so I will only press one number, y, n or escape there, and nothing else.",
-        True,
-    )
+    assert await prepare(ctx, names) == (NOT_VISIBLE, True)
     assert len(ctx.tools.confirmations) == 0
     assert keys_calls(ctx) == []
-    readback, error = await prepare(ctx, ["1"])
+    assert pressed(ctx) == []
+
+
+async def test_a_registry_only_permission_wait_with_a_draft_takes_no_keys(make: Make) -> None:
+    ctx = await make(dev={"allowPermissionAnswers": True})
+    ctx.world.configure(forced=[*FORCED, "--allow-permission-answers"])
+    show(ctx, EMPTY_BOX.replace(">                ", "> rm -rf build   "), waiting_for="permission prompt")
+    assert await prepare(ctx, ["Enter"]) == (NOT_VISIBLE, True)
+    assert keys_calls(ctx) == []
+
+
+async def test_a_dialog_that_left_the_screen_before_confirm_is_not_pressed(make: Make) -> None:
+    ctx = await make(dev={"allowPermissionAnswers": True})
+    ctx.world.configure(forced=[*FORCED, "--allow-permission-answers"])
+    show(ctx, DIALOG, waiting_for="permission prompt")
+    _, error = await prepare(ctx, ["Down", "Enter"])
     assert not error
-    assert readback.startswith("Ready to press 1 in fpga on dev.")
+    # The dialog closed at the keyboard; the registry still says permission.
+    show(ctx, EMPTY_BOX, waiting_for="permission prompt")
     ctx.later()
-    assert await ctx.confirm("4172", risky_ok=True) == ("Pressed 1 in fpga on dev.", False)
-    assert keys_calls(ctx) == [f"switchboard-remote keys %1 {CLAUDE_PID} {SESSION_A} answer none 1"]
-    assert pressed(ctx) == [["send-keys", "-t", "%1", "1"]]
+    text, error = await ctx.confirm("4172", risky_ok=True)
+    assert error
+    assert text.startswith("Not pressed")
+    assert pressed(ctx) == []
+
+
+def test_the_dispatcher_refusal_of_an_unbound_answer_is_spoken() -> None:
+    item = Confirmation(
+        id="4172",
+        client="c",
+        client_name=None,
+        machine="dev",
+        session="fpga",
+        place="fpga on dev",
+        pane_id="%1",
+        pane_pid=CLAUDE_PID,
+        session_id=SESSION_A,
+        text="1",
+        risky=("permission",),
+        permission_answer=True,
+        dialog=None,
+        created_ms=0,
+        expires_ms=1,
+        kind=KEYS,
+        keys=("1",),
+    )
+    assert format_confirm_outcome(item, "not_sent:dialog_not_visible", "dialog_not_visible") == (
+        "Not pressed: the permission question is not visible on that screen. Check it at the keyboard."
+    )
 
 
 @pytest.mark.parametrize("key", ["Tab", "shift tab", "BTab", "backtab"])
@@ -399,6 +446,20 @@ def with_old_dispatcher(ctx: Ctx, *, version_ok: bool) -> RemoteTools:
     )
 
 
+async def test_the_version_probe_runs_beside_the_list_and_is_cached(make: Make) -> None:
+    """The `version` probe does not add a round trip before the capture (it runs alongside the list),
+    and its answer is reused for the next preparations on the machine."""
+    ctx = await make()
+    show(ctx, MENU)
+    for _ in range(3):
+        _, error = await prepare(ctx, ["Enter"])
+        assert not error
+    assert await ctx.tools.remote_resize("dev", "fpga", 120, 40, OWNER)
+    verbs = [c["argv"][-1].split()[1] for c in ctx.world.ssh_calls()]
+    assert verbs.count("version") == 1
+    assert verbs[:2] in (["list", "version"], ["version", "list"])
+
+
 async def test_an_older_dispatcher_is_named_when_preparing(make: Make) -> None:
     ctx = await make()
     show(ctx, MENU)
@@ -436,10 +497,19 @@ async def test_resize_reads_back_confirms_and_audits(make: Make) -> None:
     assert readback.text == (
         "Ready to resize the window of fpga on dev to 120 columns by 40 rows. It is now 80 by 24. "
         "The size stays fixed afterwards, and it also changes the other panes in that window and every "
-        "terminal attached to it. Say yes to resize it. (confirmation 4172, do not read this number aloud)"
+        "terminal attached to it. To undo it, run tmux set-option -w -u window-size in that window at the "
+        "keyboard, which goes back to automatic sizing. Say yes to resize it. "
+        "(confirmation 4172, do not read this number aloud)"
     )
     ctx.later()
-    assert await ctx.confirm("4172") == ("Resized the window of fpga on dev to 120 by 40.", False)
+    assert await ctx.confirm("4172") == (
+        "Resized the window of fpga on dev to 120 by 40. It stays that size until someone runs "
+        "tmux set-option -w -u window-size in that window.",
+        False,
+    )
+    assert [c["argv"][-1] for c in ctx.world.ssh_calls() if " resize " in c["argv"][-1]] == [
+        f"switchboard-remote resize %1 {CLAUDE_PID} {SESSION_A} 120 40"
+    ]
     resized = [c["argv"] for c in ctx.world.tmux_calls() if c["argv"][:1] == ["resize-window"]]
     assert resized == [["resize-window", "-t", "%1", "-x", "120", "-y", "40"]]
     (line,) = ctx.audit()
@@ -546,8 +616,12 @@ async def test_the_summariser_gets_the_question_options_and_footer(tmp_path: Pat
         assert answer.text == (
             "dev, fpga: Claude Code is waiting for your answer. A summary of the screen: "
             '"It asks how big the table should be; 1 is selected." '
-            f"{READBACK_MENU} {HINTS}"
+            'The menu\'s options: 1 "Small (10 entries)", selected; 2 "Medium (50 entries)"; '
+            '3 "Large (100 entries)"; 4 "Type something else".'
         )
+        # The question and the key hints are not spoken a second time after the summary.
+        assert answer.text.count(QUESTION) == 0
+        assert "key hints" not in answer.text
         (run,) = read_records(c.record)
         stdin = run["stdin"]
         for needle in (QUESTION, *OPTIONS, FOOTER.strip(), "❯ 1."):
@@ -684,7 +758,9 @@ async def test_status_of_a_menu_with_long_descriptions(tmp_path: Path) -> None:
     )
     try:
         answer = await c.tools.remote_status("dev", "fpga", None)
-        assert 'Options: 1 "A", selected; 2 "B".' in answer.text
+        assert (
+            'Options: 1 "A" (details: "detail 0 of option A detail 1 of option A detail 2 of optio…"), selected; 2 "B".'
+        ) in answer.text
         assert QUESTION in answer.text
     finally:
         await c.manager.shutdown("test finished")
@@ -696,5 +772,43 @@ async def test_no_cut_note_when_the_whole_menu_fits_a_short_alternate_pane(tmp_p
     try:
         answer = await c.tools.remote_status("dev", "fpga", None)
         assert answer.text == HEURISTIC
+    finally:
+        await c.manager.shutdown("test finished")
+
+
+async def test_status_heuristic_names_option_descriptions_in_short(tmp_path: Path) -> None:
+    lines = menu_lines()
+    lines.insert(6, "│      Fits on one screen" + " " * 32 + " │")
+    c = await build_status(tmp_path, menu_world(tmp_path, capture(lines, rows=30, alternate=False)), summary=False)
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert 'Options: 1 "Small (10 entries)" (details: "Fits on one screen"), selected; 2 "Medium' in answer.text
+        assert '4 "Type something else".' in answer.text
+    finally:
+        await c.manager.shutdown("test finished")
+
+
+async def test_status_drops_descriptions_before_options(tmp_path: Path) -> None:
+    """Descriptions too long for every option to fit: the options without them."""
+    options = tuple(f"Option number {i} with a long name" for i in range(1, 9))
+    lines = menu_lines(options=options)
+    for index in range(len(options), 0, -1):
+        lines.insert(5 + index, "│      " + "a fairly long description of this option".ljust(54) + " │")
+    c = await build_status(tmp_path, menu_world(tmp_path, capture(lines, rows=40, alternate=False)), summary=False)
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert "details" not in answer.text
+        assert '8 "Option number 8 with a long name"' in answer.text
+    finally:
+        await c.manager.shutdown("test finished")
+
+
+async def test_status_of_a_menu_with_twelve_options(tmp_path: Path) -> None:
+    options = tuple(f"Choice {i}" for i in range(1, 13))
+    text = capture(menu_lines(selected=11, options=options), rows=40, alternate=False)
+    c = await build_status(tmp_path, menu_world(tmp_path, text), summary=False)
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert '9 "Choice 9"; 10 "Choice 10"; 11 "Choice 11", selected; 12 "Choice 12".' in answer.text
     finally:
         await c.manager.shutdown("test finished")
