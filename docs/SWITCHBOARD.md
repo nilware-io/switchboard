@@ -1,13 +1,13 @@
 # Switchboard design
 
-Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher), M3 (`remote_send`, `remote_send_confirm`, audit), M4 (usage, `usage_report`, `voice-coding-mcp usage`) and M5 (Linux and WSL hub deploy, upstream session tools on Linux, the owner guide [SETUP-WSL.md](SETUP-WSL.md)) implemented, then the menu follow-up from the first voice test (whole menus in `remote_status`, `remote_send_keys`, `remote_resize`, see [Menus and keys](#menus-and-keys-after-the-first-voice-test)). What only the owner can verify on the real setup is listed in DESIGN.md "To verify with the real app". This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
+Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher), M3 (`remote_send`, `remote_send_confirm`, audit), M4 (usage, `usage_report`, `voice-coding-mcp usage`) and M5 (Linux and WSL hub deploy, upstream session tools on Linux, the owner guide [SETUP-WSL.md](SETUP-WSL.md)) implemented, then the menu follow-up from the first voice test (whole menus in `remote_status`, `remote_send_keys`, `remote_resize`, see [Menus and keys](#menus-and-keys-after-the-first-voice-test)). M6, outbound agents (machines connect to the hub instead of the hub connecting to them), is designed in [Outbound agents](#outbound-agents-machines-connect-to-the-hub) and not implemented yet. What only the owner can verify on the real setup is listed in DESIGN.md "To verify with the real app". This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
 
 ## Goal
 
 Talk, from Claude voice mode on the phone, to Claude Code sessions that already run inside tmux on the owner's machines:
 
 - the owner's own tmux sessions on the development machine (the WSL box the hub runs on), first class;
-- tmux sessions on other machines, reached over SSH.
+- tmux sessions on other machines, reached over SSH, or (M6, planned) connecting out to the hub themselves.
 
 The server can already run headless tasks and reach live sessions on the machine it runs on (Mac mode). Switchboard adds:
 
@@ -21,10 +21,12 @@ Non-goals: a web UI, multi-user access, starting new tmux sessions or Claude Cod
 ## Terms
 
 - **Hub**: the voice-coding-mcp server process, here running on Linux or WSL.
-- **Machine**: an entry in `remote.machines`, reached through a transport (`ssh` or `local`).
+- **Machine**: an entry in `remote.machines`, reached through a transport (`ssh`, `local`, or from M6 `agent`).
 - **Dev machine**: the machine the hub runs on, where the owner runs Claude Code inside tmux as their own Linux user. It is an ordinary machine entry, named `dev` in examples.
 - **Dispatcher**: `switchboard-remote`, a small stdlib-only Python 3 script installed on every machine. It is the only thing the hub runs there, and it accepts a fixed set of verbs with validated arguments.
 - **Pane**: a tmux pane, addressed internally only by its pane id (`%7`).
+- **Connector** (M6, planned): `switchboard-connect`, a stdlib-only script on a machine that opens an SSH connection out to the hub and runs the dispatcher in serve mode on it, see [Outbound agents](#outbound-agents-machines-connect-to-the-hub).
+- **Relay** (M6, planned): the forced command of the hub's `sbrelay` account; it joins one machine's SSH channel to the hub's Unix socket and names the machine by the key that authenticated.
 - **Registry**: Claude Code's live session files `<claudeHome>/sessions/<pid>.json` (see [The owner's sessions](DESIGN.md#the-owners-sessions)).
 
 ## Findings that shaped the design
@@ -47,7 +49,7 @@ phone, Claude app (voice) -> Anthropic -> Tailscale Funnel (HTTPS, <wsl-node>.<t
        -> ssh bot@example-host -> forced command switchboard-remote (that machine's tmux)       machine "buildbox"
 ```
 
-One hub, one public address, one OAuth pairing. Remote machines need no inbound exposure besides SSH from the hub.
+One hub, one public address, one OAuth pairing. Remote machines need no inbound exposure besides SSH from the hub. With the `agent` transport (M6, planned) they need none at all: they connect out to an SSH relay account on the hub, see [Outbound agents](#outbound-agents-machines-connect-to-the-hub).
 
 ## Config
 
@@ -126,7 +128,7 @@ New top-level sections. All keys are camelCase in the file, snake_case in Python
 | Key | Default | Meaning and validation |
 |---|---|---|
 | `name` | (required) | Spoken name. `^[a-z][a-z0-9-]{0,31}$`, unique, not `local`. Matched with the upstream fuzzy matcher |
-| `transport` | `ssh` | `ssh` or `local`. `local` runs the dispatcher as the hub's own user (no SSH), see [Local transport](#local-transport). At most one `local` machine; a startup warning says it is weaker isolation |
+| `transport` | `ssh` | `ssh`, `local` or (M6, planned) `agent`. `agent`: the machine connects out to the hub and the hub sends requests down that connection, see [Outbound agents](#outbound-agents-machines-connect-to-the-hub) for its keys. `local` runs the dispatcher as the hub's own user (no SSH), see [Local transport](#local-transport). At most one `local` machine; a startup warning says it is weaker isolation |
 | `host` | (required for `ssh`) | DNS name or IP literal: `^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$` or a bracket-free IPv6 literal `^[0-9A-Fa-f:]{2,39}$` (parsed with `ipaddress`); never starting with `-`, no spaces, no `@`, no `%` |
 | `user` | (required for `ssh`) | `^[a-z_][a-z0-9_-]{0,31}$` |
 | `port` | `22` | 1 to 65535 |
@@ -204,6 +206,9 @@ src/voice_coding_mcp/remote/
   watcher.py       notification watcher
   speech.py        spoken-result formatting for all remote tools
   tools.py         the remote tools' logic (deadlines, summary or task), called by mcp.py
+  agents.py        (M6, planned) relay socket server, live connections, AgentTransport, control socket
+  relay.py         (M6, planned) the relay forced command, stdlib only
+  connector.py     (M6, planned) byte-identical copy of deploy/remote/switchboard-connect
 src/voice_coding_mcp/usage/
   __init__.py
   config.py        the `usage` config section
@@ -216,6 +221,9 @@ src/voice_coding_mcp/usage/
   service.py       cache refresh (machines and the hub's own home), report building
   tool.py          `usage_report` (deadline, background task)
 deploy/remote/switchboard-remote     byte-identical copy of remote/dispatcher.py (a test checks it)
+deploy/remote/switchboard-connect    (M6, planned) the connector, byte-identical copy of remote/connector.py
+deploy/remote/switchboard-connect.service   (M6, planned) example systemd --user unit
+deploy/relay/                        (M6, planned) sshd drop-in and tmpfiles line for the relay account
 deploy/linux/sb-linux                on/off/status for Linux and WSL (Funnel), like deploy/mac/vcm-mac
 deploy/linux/switchboard.service     hardened system unit for the dedicated user
 deploy/linux/config.switchboard.example.json   example config for the dedicated user
@@ -290,6 +298,8 @@ Race guard: a permission dialog can open between the check and the keystrokes, a
 ## Transports
 
 `Transport.call(verb, args, *, timeout_seconds, stdin=None) -> TransportResult` (frozen dataclass: `ok`, `data` or `error`, `detail` (the dispatcher's own code with `refused_by_policy`), `elapsed_ms`). `stdin` (M3, only `send`) is written to the process and closed; a dispatcher that refuses without reading it (a broken pipe) is not an error. Never raises. Errors map to fixed codes the speech layer turns into words: `timeout`, `host_key` (host key unknown or changed), `auth` (permission denied), `refused` (connection refused or no route), `dispatcher_missing` (exit 127 or no JSON), `bad_response`, `refused_by_policy` (dispatcher said no), `other`. For `send`, a `timeout`, `bad_response` or `other` after the command string was handed to ssh means the outcome is unknown (the dispatcher may have typed the text): it is reported and audited as `unknown`, never as "not sent".
+
+The `agent` transport (M6, planned) implements the same protocol over a machine's own outbound connection and adds the codes `not_connected` and `disconnected`; see [Outbound agents](#outbound-agents-machines-connect-to-the-hub).
 
 ### SSH
 
@@ -644,6 +654,254 @@ Same-user mode: `transport: "local"`, no sshd, no keys.
 
 Deviation from upstream, recorded: upstream reaches only sessions whose cwd lies inside `projectRoots`. Machine `dev` reaches the owner's tmux sessions by tmux session name instead (`sessions` on both sides), whatever their cwd; `projectRoots` keeps applying to the hub's own tasks and to upstream's session tools. M1 records this in DESIGN.md's security model.
 
+## Outbound agents (machines connect to the hub)
+
+Status: designed (M6), not implemented. Until M6 lands, everything below is the plan; the sections above describe what runs.
+
+Today the hub opens an SSH connection to a machine for every dispatcher call. That needs an sshd and an `authorized_keys` line on every machine and a route from the hub to it, which a WSL box behind NAT, a laptop on changing networks or a LAN machine behind a home router does not have. With the `agent` transport the machine dials out to the hub over SSH and keeps that connection open; the hub sends its requests down it. The dispatcher, its verbs, its validation, its refusal codes and its policy flags stay exactly as they are. What changes is who opens the TCP connection and where the dispatcher process comes from: the machine starts it itself, as a child of a small connector, with the policy on its own command line.
+
+```
+machine "laptop" (behind NAT), Linux user USER, systemd --user unit switchboard-connect
+  switchboard-connect
+    ssh -T sbrelay@hub (dedicated key, pinned hub host key) -----------------------------+
+      stdin  <- stdout of: python3 -I switchboard-remote --serve --sessions ... (policy)  |
+      stdout -> stdin  of the same dispatcher                                             |
+                                                                                          v
+hub: sshd, account sbrelay, root-owned authorized_keys, one line per machine key:
+       restrict,command="<venv>/bin/python -I -m voice_coding_mcp.remote.relay --machine laptop"
+     relay process (user sbrelay)  --Unix socket-->  /run/switchboard-relay/hub.sock
+     hub (user vcm): AgentTransport, one live connection per machine, request ids, heartbeats
+```
+
+Requests go hub, relay, sshd, ssh, dispatcher; answers go back the same way. Nothing else on the machine reads or writes the stream. The hub never sends a command line, a policy or a path: only request frames that name a verb from the fixed set.
+
+### Serve mode (dispatcher 0.6.0)
+
+`python3 -I switchboard-remote --serve --sessions 'fpga,notes' [--allow-usage] [--allow-send] [--allow-permission-answers] [--send-to-any-pane] [--slash-commands <names>] [--claude-home <path>]`
+
+- `--serve` is one more flag of the existing option parser; every other option means what it means in forced mode, and the policy is read only from this real argv (the owner's unit file). The test-only `--tmux-socket-name` keeps its `SWITCHBOARD_REMOTE_TEST=1` rule.
+- A malformed policy does not stop the dispatcher: it connects, its hello says `"policy": "bad_policy"`, and it answers every request `bad_policy`, so a broken unit file shows up at once in `remote-check`, as a broken `authorized_keys` line does today.
+- `--serve` together with `--policy-from-hub` or with request tokens in argv is `bad_policy`. `--serve` with `SSH_ORIGINAL_COMMAND` or `SSH_CONNECTION` in the environment (someone put it into a forced command) writes one forced-mode `bad_policy` document and exits: serve mode runs on the machine as the connector's child, never under sshd. The connector builds the dispatcher's environment from an allow-list (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TMUX_TMPDIR`, `CLAUDE_CONFIG_DIR`, `XDG_RUNTIME_DIR`), so starting the connector from an SSH login does not trip this.
+
+Framing: newline-delimited JSON, one frame per line, written with `ensure_ascii` (so every frame is ASCII and starts with `{`), read as strict UTF-8. Size limits per frame: hub to machine 2 MiB (the largest request is a usage known-list of at most 1 MB as a JSON string), machine to hub 5 MiB (a 4 MB response document plus its envelope). A line longer than the limit loses the framing: the reader stops reading, answers `frame_too_large` and closes. A line that is complete but not a JSON object of the expected schema (missing or unknown keys, wrong types) is `bad_frame`: the dispatcher answers with an error frame and goes on (the framing is intact, and the hub is the side that wrote it); the hub closes the connection on any malformed frame from a machine (machine output is untrusted, no resynchronisation).
+
+Hub to machine:
+
+| Frame | Meaning |
+|---|---|
+| `{"t": "req", "id": 7, "verb": "capture", "args": ["%3", "60"]}`, optional `"input": "<string>"` | One dispatcher call. `input` is today's stdin as a string: the text of a `send`, the known-list of a `usage` |
+| `{"t": "ping", "id": 8}` | Heartbeat |
+| `{"t": "cancel", "id": 7}` | The hub gave up on request 7 (its deadline passed) |
+| `{"t": "welcome", "protocol": 1}` | Once, after the hub accepted the connection |
+| `{"t": "bye", "reason": "replaced"}` | The hub closes this connection; `reason` one of `replaced`, `unknown_machine`, `protocol`, `shutdown` |
+
+Machine to hub:
+
+| Frame | Meaning |
+|---|---|
+| `{"t": "hello", "protocol": 1, "version": "0.6.0", "verbs": [...], "allowSend": false, "allowUsage": true, "policy": "ok"}` | First frame, unprompted: the body of `version` plus the policy state. It names no machine, host or user; identity comes from the relay (below) |
+| `{"t": "res", "id": 7, "doc": {...}, "more": true}` | One response document, exactly the document forced mode writes to stdout (`"protocol": 1` included). `more` is present and `true` on every frame of a request but its last; only a successful `usage` has more than one |
+| `{"t": "pong", "id": 8}` | Answer to `ping` |
+| `{"t": "error", "id": 7, "error": "busy"}` | Frame-level refusal, `id` `null` when the frame had none: `bad_frame`, `frame_too_large`, `duplicate_id`, `busy` |
+
+Requests: `id` is an integer from 1 to 2^53 - 1, allocated increasing by the hub and unique among requests in flight (`duplicate_id` otherwise); `args` at most 16 strings. The dispatcher turns a request into the tokens `["switchboard-remote", verb, *args]` and runs the same `validate_request` and verb functions as for `SSH_ORIGINAL_COMMAND`, so every argument rule, cap and refusal code is the one in [The dispatcher](#the-dispatcher), by construction rather than by a second implementation. `input` is encoded to UTF-8 and handed to the verb as its stdin, with the same caps (8 KB for `send`, 1 MB for `usage`); `input` on a verb that takes no stdin is `bad_request`.
+
+Concurrency: up to 4 requests at once in worker threads (a fifth gets `busy` for its id; the hub never sends more, see below); `send`, `keys` and `resize` run one at a time under one lock, so two confirmed actions never interleave their checks and keystrokes. Frames are written whole under a write lock, so responses of different requests interleave only at frame boundaries. `cancel` stops a `usage` stream at the next record (its last frame is then `{"protocol": 1, "ok": false, "error": "cancelled"}`); other verbs finish (tmux calls are capped at 8 s) and the hub drops the late answer. A `cancel` of an unknown id is ignored.
+
+Liveness: `ping` is answered by the reader thread, not a worker, so a busy pool does not look dead. The dispatcher exits on end of stdin (exit 0), on `bye` (75 for `replaced`, 76 for `unknown_machine` and `protocol`, 0 for `shutdown`), and after 180 s without any frame from the hub (exit 0; the hub pings at least every 60 s). A `send` in progress when the connection drops completes on the machine; the hub reports its outcome as unknown, as for an ssh timeout today. Updating the dispatcher file takes effect at the next connection (`systemctl --user restart switchboard-connect`).
+
+### Connector: `deploy/remote/switchboard-connect`
+
+Stdlib-only Python 3.8+, one file, installed like the dispatcher (from the owner's own clone at a verified commit, read before installing, see [Trusted source](#trusted-source-for-owner-and-root-files)); a byte-identical copy lives in `src/voice_coding_mcp/remote/connector.py` and `voice-coding-mcp remote-connector` prints it. Python rather than POSIX sh: it has to cross-wire the pipes of two processes (sh has no portable coprocess), run a jittered capped backoff, and kill process groups cleanly.
+
+```
+python3 -I ~/.local/bin/switchboard-connect --host hub.example.org [--port 22] --user sbrelay
+    --identity ~/.ssh/switchboard_relay --known-hosts ~/.config/switchboard-connect/known_hosts
+    [--max-backoff 300] [--ssh /usr/bin/ssh]
+    -- /usr/bin/python3 -I /home/USER/.local/bin/switchboard-remote --serve --sessions 'fpga,notes' --allow-usage
+```
+
+- Validation: `--host` and `--user` with the charsets of `remote.machines[].host` and `user` (never starting with `-`); `--identity` and `--known-hosts` absolute, existing regular files owned by the user, the identity 0600 or stricter; the command after `--` starts with an absolute path and contains `--serve`, and is run from argv, never through a shell. Refuses to run as root. Holds an `flock` on `$XDG_RUNTIME_DIR/switchboard-connect.lock` (else `~/.cache/switchboard-connect.lock`), so a second instance for the same user (a manual run next to the unit) exits instead of replacing the first one's connection over and over.
+- ssh argv, environment built from scratch (`PATH`, `HOME`, `LANG`, `LC_ALL`; never `SSH_AUTH_SOCK`):
+
+  ```
+  <ssh> -F /dev/null -T -e none
+    -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none
+    -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile=<known-hosts> -o GlobalKnownHostsFile=/dev/null
+    -o HostKeyAlias=switchboard-hub -o HostKeyAlgorithms=ssh-ed25519
+    -o UpdateHostKeys=no -o CheckHostIP=no -o HashKnownHosts=no
+    -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+    -o RequestTTY=no -o LogLevel=ERROR
+    -i <identity> -p <port> -l <user> -- <host>
+  ```
+
+  No remote command: the forced command decides what runs. `-F /dev/null` keeps the owner's `~/.ssh/config` (`ProxyCommand`, `Match exec`, other identities) out. `HostKeyAlias` makes the pin independent of how the hub is addressed (DNS name, IP, tailnet name); `HostKeyAlgorithms=ssh-ed25519` pins the key type that was compared. `-e none` turns off the escape character (frames never start with `~` anyway).
+- Wiring: two pipes, ssh's stdout into the dispatcher's stdin and the dispatcher's stdout into ssh's stdin; both children in their own process group. ssh's stderr: the last 2 KB, mapped with the hub's ssh error mapping (`host_key`, `auth`, `refused`, `timeout`, `other`) and logged as that code plus the first line with control characters removed. The dispatcher's stderr goes to the journal. When one child exits, the other gets SIGTERM, SIGKILL after 2 s, and both are reaped. SIGTERM to the connector stops both and exits 0.
+- Backoff: the delay starts at 2 s and doubles per failed attempt up to `--max-backoff` (30 to 3600, default 300); the wait is uniform in [delay/2, delay], so machines that lost the hub together (a hub reboot) do not come back in lockstep. A connection that stayed up 60 s resets the delay. Exit 75 (replaced), 76 (refused by the hub), and ssh `auth` or `host_key` failures go straight to the maximum delay, logged once per change of reason and retried forever: a changed host key is fixed by the owner, never by the connector, which never writes the known-hosts file.
+
+User unit `deploy/remote/switchboard-connect.service` (example, the owner edits the policy flags):
+
+```
+[Unit]
+Description=Switchboard: outbound connection to the hub
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I %h/.local/bin/switchboard-connect --host hub.example.org --user sbrelay --identity %h/.ssh/switchboard_relay --known-hosts %h/.config/switchboard-connect/known_hosts -- /usr/bin/python3 -I %h/.local/bin/switchboard-remote --serve --sessions fpga,notes --allow-usage
+Restart=always
+RestartSec=30
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+```
+
+No `PrivateTmp`, `ProtectHome` or the like: the dispatcher has to reach the owner's tmux socket under `/tmp/tmux-<uid>` and `~/.claude`, like the forced command does today. No ordering on `network-online.target` (a system target a user manager cannot wait for); the backoff covers a machine that boots offline. `loginctl enable-linger USER` (once, as root) starts the user manager at boot and keeps it without a login session.
+
+### Relay: `voice_coding_mcp.remote.relay`
+
+The relay is the forced command of a dedicated hub account. It connects one SSH channel to the hub's socket and adds the one fact the hub needs: which machine key authenticated.
+
+Account: `sbrelay`, a system user with its own group `sbrelay`, no password, login shell `/bin/sh` (sshd runs forced commands through the login shell, so `nologin` would refuse them), home `/var/lib/sbrelay` owned by root, 0755, empty: nothing the account can write, no `~/.ssh`, no `rc`. Not a member of group `vcm` (which reads the hub's config); the hub user is not a member of `sbrelay`.
+
+sshd drop-in `/etc/ssh/sshd_config.d/switchboard-relay.conf` (`deploy/relay/sshd-switchboard-relay.conf`):
+
+```
+Match User sbrelay
+    AuthorizedKeysFile /etc/ssh/switchboard-relay/authorized_keys
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    DisableForwarding yes
+    PermitTTY no
+    PermitTunnel no
+    PermitUserRC no
+    MaxSessions 1
+    ClientAliveInterval 15
+    ClientAliveCountMax 3
+```
+
+`DisableForwarding` (OpenSSH 7.4 and later) turns off X11, agent, TCP and Unix socket forwarding together. A global `AllowUsers` or `AllowGroups` list needs `sbrelay` added. Not `ForceCommand`: it would override the per-key `command=` that carries the machine name.
+
+`/etc/ssh/switchboard-relay/authorized_keys`, root:root 0644 in a root-owned 0755 directory, one line per machine key:
+
+```
+restrict,command="/opt/voice-coding-mcp/.venv/bin/python -I -m voice_coding_mcp.remote.relay --machine laptop" ssh-ed25519 AAAA... switchboard-connect laptop
+```
+
+plus `from="<address>"` for a machine with a fixed egress address. `voice-coding-mcp agent-relay --machine laptop` is the same entry point as a CLI command, for manual tests; the forced command uses the module form with `-I`, so no `PYTHON*` variable and no user site-packages reach it, and it imports only the standard library (no third-party package is loaded on each connection).
+
+- Identity: the machine is the `--machine` argument of the forced command, so it is decided by which key authenticated, in a file only root can change. The relay never takes a name, or anything else, from the stream or from `SSH_ORIGINAL_COMMAND` (not read). `--machine` must match `^[a-z][a-z0-9-]{0,31}$`; `--socket <path>` (default `/run/switchboard-relay/hub.sock`) the path charset.
+- It connects to the socket (refusing a socket or directory owned by `sbrelay` itself, or writable by others), writes the preamble `{"t": "relay", "protocol": 1, "machine": "laptop", "peer": "<client address from SSH_CONNECTION>"}`, then copies bytes both ways until either side closes. Machine to hub it splits at newlines and closes both sides at the first frame over 5 MiB, so the hub never buffers more than that; it parses nothing. Hub to machine is copied as is.
+- Its stderr goes back to the machine through sshd, so it prints only fixed one-line messages (`switchboard relay: hub not running`, `switchboard relay: refused`). It keeps no log (the account can write nowhere); the hub logs every connection.
+
+Socket directory: `/etc/tmpfiles.d/switchboard-relay.conf` (`deploy/relay/tmpfiles-switchboard-relay.conf`): `d /run/switchboard-relay 2750 vcm sbrelay -`. The setgid bit gives the socket the hub creates the group `sbrelay` without the hub user being a member. The hub binds `hub.sock` under umask 0177 and then sets 0660 (connecting needs write permission on the socket; nobody outside the owner and group can even enter the directory). The hub unit gets `ReadWritePaths=/run/switchboard-relay`. At startup the hub checks that the directory is owned by its own uid, has the primary group of `remote.agents.relayUser` and mode exactly 2750, and removes a stale socket it owns; otherwise it does not listen, every agent machine reads as not connected, and `remote-check` and the log say why.
+
+Peer check: for every accepted connection the hub reads `SO_PEERCRED` and closes the connection before reading a byte unless the uid is that of `remote.agents.relayUser`. This backs up the file permissions (root can always connect; root on the hub is out of scope).
+
+Why a separate relay user, and not the relay as the hub user with an `authorized_keys` of its own: the hub user runs Claude Code tasks, so whatever it can write a prompt-injected task can write. An `authorized_keys` owned by or writable for the hub user would let a task add a key without `restrict` and `command=`, which is a persistent inbound shell on the hub. Even a root-owned key file for the hub user makes the account that holds OAuth state, the audit file and the config reachable over SSH, and puts every relay or sshd post-auth bug into it. `sbrelay` can do one thing, connect to one socket, where the hub treats it like an untrusted machine. The cost is one system user, one tmpfiles line and one sshd `Match` block. Also rejected: a socket in `stateDir` opened up with ACLs (fiddly under `ProtectSystem`, invisible in `ls -l`), an abstract socket (no permissions at all), TCP on loopback (any local user could connect; authenticating the relay would need a secret the relay account then holds).
+
+### Hub side
+
+`remote/agents.py`: one asyncio Unix server, started with the app when at least one `agent` machine is configured. Linux only (`SO_PEERCRED`); an `agent` machine on another platform is a config error. Per accepted connection:
+
+1. Peer uid check. At most `2 x <agent machines> + 4` connections at a time; beyond that a connection is closed at accept.
+2. Preamble within 5 s, strict schema. Its `machine` must be a configured `agent` machine, else `bye unknown_machine` and close (logged with the name). `peer` must parse as an IP address (`ipaddress`) or is dropped; it is shown, never trusted.
+3. Hello within 10 s, strict schema, protocol 1. Version, verbs, `allowSend`, `allowUsage` and `policy` are recorded. A disagreement with the hub's flags (both sides must agree, as today) is a warning in `remote-check` and `status`; the dispatcher enforces its own flags anyway.
+4. Accepted: it replaces the machine's live connection, if any (below), gets `welcome`, and the machine is connected from now on.
+
+One live connection per machine, and a newer one replaces the older. The usual reason for two connections is one dead and one alive: a laptop that suspended, a NAT that dropped its mapping, a WSL VM that restarted. The hub's end of the dead one lingers until a heartbeat or sshd's client-alive check notices (up to about 45 s); refusing the newcomer would lock the real machine out for that long, every time. Both connections were authenticated with the machine's own key, so the newcomer has no right the old one lacked: whoever holds the key can already be that machine. The old connection gets `bye replaced` and is closed. Requests in flight on it: `version`, `list`, `capture` and `usage` (read-only) are retried once on the new connection when the deadline allows; `send`, `keys` and `resize` that were already written are reported and audited as `unknown`, never retried. More than 3 replacements of one machine within 60 s log a warning and `status` shows them: the sign of two connectors sharing a key, or of a stolen key. A replaced dispatcher exits 75 and its connector waits the maximum backoff, so two connectors with one key settle at one swap every few minutes instead of a busy loop.
+
+Heartbeat: a `ping` every `remote.agents.heartbeatSeconds` (default 20); no frame within 10 s after a ping closes the connection, and the machine is not connected. Together with ssh's `ServerAliveInterval` on the machine and sshd's `ClientAliveInterval` on the hub, a dead path is noticed within about 30 to 45 s on all three.
+
+`AgentTransport` implements the existing `Transport.call(verb, args, *, timeout_seconds, stdin)`, so inventory, target resolution, `remote_status`, `pending_input`, `remote_send`, `remote_send_keys`, `remote_resize` with their two-step confirmations, `usage_report`, the watcher and audit are unchanged:
+
+- Not connected: at once `not_connected` (a new `TransportError`), no waiting. Spoken: "laptop is not connected right now." `pending_input` and `list_remote_sessions` name it the same way among the machines they could not check; the watcher counts it as an unreachable tick (with `notifyUnreachable`: "Machine laptop is not connected." after 3 ticks, "Machine laptop is connected again." when it is back).
+- Otherwise: a per-machine semaphore of 4 (waiting counts against the call's deadline), an id, the request frame, then the frames of that id: a single response through `protocol.parse_response` with the same 4 MB cap; a `usage` stream through the same strict line parser and 64 MB cap as over ssh. The timeout is `remote.agents.commandTimeoutSeconds` (usage 120 s, background only, as over ssh); on timeout the hub sends `cancel` and returns `timeout`. The connection closing during a call is `disconnected` (new code, spoken like a lost ssh connection). For `send`, `keys` and `resize`, a `timeout` or `disconnected` after the request frame was written is an unknown outcome, as for ssh.
+- `remote-check` and `status` run in another process than the hub, so the hub offers a control socket `<stateDir>/agents-control.sock` (0600, `SO_PEERCRED` uid must be the hub's own) with exactly two requests: `status` (per agent machine: connected or not, since when, dispatcher version, verbs and opt-ins, policy state, peer address, replacements in the last hour, last disconnect since the hub started) and `check <machine>` (`version` and `list` over the live connection, printed like `remote-check` does for ssh machines). It cannot send, type or capture, so it gives the hub user nothing it does not have already. `status` prints, for example, "laptop: connected since 14:02 (2 hours ago), dispatcher 0.6.0, from 203.0.113.5"; with the hub stopped it says the hub is not running.
+- `remote-check` also lints `remote.agents.authorizedKeysFile` when it can read it: every key line has `restrict` and exactly the relay `command=` with a `--machine` that is a configured `agent` machine, no line without `command=`, no key twice. It reports, it never edits.
+
+### Config
+
+A machine with `"transport": "agent"` has the keys `name`, `transport`, `sessions`, `allowUsage`, `allowSend`, `allowPermissionAnswers`, `sendToAnyPane`, with today's meaning and rules (the hub-side half of every opt-in). Rejected on it: `host`, `user`, `port`, `identityFile`, `knownHostsFile` (there is no connection for the hub to open), `dispatcher` (there is no explicit-path mode: serve mode always has a dispatcher-enforced policy), `claudeHome` (as for ssh, only the dispatcher's own `--claude-home` decides). The limit of 32 machines counts all transports.
+
+New section `remote.agents`, read only when an `agent` machine exists (a startup warning otherwise):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `remote.agents.socketPath` | `/run/switchboard-relay/hub.sock` | Where the hub listens for relays. Absolute, `^/[A-Za-z0-9._/-]{1,100}$` (a Unix socket path has at most 108 bytes) |
+| `remote.agents.relayUser` | `sbrelay` | The relay account, `^[a-z_][a-z0-9_-]{0,31}$`, resolved to a uid and primary group at startup; a missing user is a warning and no listener |
+| `remote.agents.heartbeatSeconds` | `20` | Ping interval, 5 to 60 |
+| `remote.agents.commandTimeoutSeconds` | `10` | Wall clock per dispatcher call except usage, 1 to 60 (as `remote.ssh.commandTimeoutSeconds`) |
+| `remote.agents.authorizedKeysFile` | `/etc/ssh/switchboard-relay/authorized_keys` | Read only by `remote-check` for its lint; absolute, same charset as `socketPath` |
+
+```json
+{"name": "laptop", "transport": "agent", "sessions": ["fpga", "notes"], "allowUsage": true}
+```
+
+### Setup outline
+
+The guide (a new part in [SETUP-WSL.md](SETUP-WSL.md), and for a server hub in [DEPLOY.md](DEPLOY.md)) follows these steps; `deploy/setup.sh` can do the hub part.
+
+Hub, once, as root:
+
+1. `useradd --system --user-group --shell /bin/sh --home-dir /var/lib/sbrelay sbrelay`, then `install -d -o root -g root -m 755 /var/lib/sbrelay /etc/ssh/switchboard-relay` and an empty `authorized_keys` (root:root 0644).
+2. The tmpfiles line, `systemd-tmpfiles --create /etc/tmpfiles.d/switchboard-relay.conf`; `ReadWritePaths=/run/switchboard-relay` in the hub unit.
+3. The sshd drop-in, `sshd -t`, then `sshd -T -C user=sbrelay,host=x,addr=192.0.2.1` must show `disableforwarding yes`, `permittty no` and the key file; reload sshd.
+4. Print the host key to pin: `cat /etc/ssh/ssh_host_ed25519_key.pub` and `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+
+Per machine, as the owner there:
+
+1. Install `switchboard-remote` and `switchboard-connect` from the trusted source into `~/.local/bin`.
+2. `ssh-keygen -t ed25519 -N '' -C 'switchboard-connect laptop' -f ~/.ssh/switchboard_relay` (no passphrase: it runs unattended; this key is used for nothing else).
+3. Pin the hub: write `switchboard-hub ssh-ed25519 AAAA...` (the hub's public host key) to `~/.config/switchboard-connect/known_hosts`, and compare `ssh-keygen -lf` of it with the fingerprint printed on the hub, read over a channel that is not the network path being protected (the hub's console, an existing SSH session whose key was checked).
+4. Root on the hub adds the `authorized_keys` line for `~/.ssh/switchboard_relay.pub` with `--machine laptop`; the hub config gets the machine with `"transport": "agent"`; restart the hub.
+5. Install the user unit, set the policy flags, `systemctl --user daemon-reload`, `systemctl --user enable --now switchboard-connect`, and once `sudo loginctl enable-linger USER`. On WSL: `[boot] systemd=true` in `/etc/wsl.conf`; the machine is reachable only while the WSL VM runs.
+6. Verify: `journalctl --user -u switchboard-connect` shows the connection without errors; on the hub `voice-coding-mcp status` lists `laptop` as connected and `voice-coding-mcp remote-check laptop` shows its sessions; then by voice, "what is my session on laptop doing".
+7. Off: `systemctl --user stop switchboard-connect`. The machine decides when it can be reached.
+
+Migration of a machine from `ssh` to `agent`:
+
+1. Set the machine up as above while its `ssh` entry still works.
+2. In the hub config change `transport` to `agent` and remove `host`, `user`, `port`, `identityFile`, `knownHostsFile` and `dispatcher`. Keep the `name` (the usage cache, `watch.json` keys and audit lines stay continuous) and the opt-ins; carry the forced command's policy flags over to the unit's `--serve` command line. Restart the hub and run `remote-check`.
+3. On the machine, remove the hub's key line from `~/.ssh/authorized_keys`; on the hub, delete that machine's private key and its `known_hosts` entry. If the machine's sshd served only the hub, turn it off. A rollback is the same steps backwards.
+
+### Security: what changes
+
+Better than the ssh transport:
+
+- No inbound sshd, no `authorized_keys` line and no open port on the machine; nothing on it listens. Works behind NAT and CGNAT and on changing networks.
+- The machine decides when it is reachable (stopping one user unit), and its policy lives in a file of its own, as with the forced command.
+- The hub holds no credential that opens a machine. Today a copy of the hub's private keys (a backup, a leaked disk image) reaches every dispatcher from wherever `from=` allows; now there is nothing to copy, and reaching a machine needs the live hub process (or root on the hub).
+- No explicit-path mode: an agent machine always has a dispatcher-enforced policy, where an explicit-path ssh machine gives a compromised hub a shell.
+- The machine name the hub acts on comes from a root-owned key file on the hub, never from what a machine says.
+
+The same as today:
+
+- A compromised hub user (a task with code execution, a hub bug) or hub root can call every verb the dispatcher allows on every connected machine, without any confirmation (confirmations live in the hub): with `--allow-send` it types anything the text rules permit into allow-listed Claude Code panes. The dispatcher's own flags are the limit, nothing else.
+- A compromised machine can lie about its own sessions and send crafted screen text, which stays data.
+- The session allow-list filters by name and is not a boundary against the machine user's own processes.
+
+New or different:
+
+- The hub gets an SSH login (`sbrelay`) reachable wherever its sshd listens. Pre-auth this is the sshd the hub already runs for administration; post-auth the account has no pty, no forwarding, no shell beyond the forced command and nothing it can write.
+- The machine now holds a credential: its relay key. Whoever steals it can pose as that machine from anywhere: replace the real connection (a denial of service the owner sees in `status`), receive the requests the hub sends to it, including the text of confirmed sends and keys and the usage known-list, and answer with fake screens. Mitigations: one key per machine, 0600 in the owner's home and used for nothing else, `from=` where the machine has a fixed address, replacements and peer addresses logged and shown, revocation by deleting one line on the hub.
+- A compromised `sbrelay` account (an sshd post-auth bug, a relay bug) can connect to the hub socket under any machine name: the same as holding every agent machine's key. It cannot reach a machine's dispatcher, which is attached only to that machine's own relay process.
+- A network attacker cannot pose as the hub to a machine: the hub's host key is pinned under a fixed alias, with no trust on first use and no host key updates. Even the real hub gets only the verbs the machine's policy allows.
+
+### Tests (M6)
+
+All hermetic, as in [Test strategy](#test-strategy): no network, no real ssh (the channel is pipes, socketpairs and a fake ssh), no real Claude Code or `~/.claude`, live tmux only on an isolated `tmux -L sb-test-<random>` server.
+
+- Serve mode (`tests/remote/test_dispatcher_serve.py`): framing (one frame per line, ASCII, interleaving under concurrency), both size limits, malformed frames (not JSON, not an object, unknown or missing keys, wrong types, duplicate and out-of-range ids, `input` on a verb without stdin), `busy`, `cancel` of a usage stream, ping during a busy pool, exit codes for end of input, `bye` and silence; policy identical to forced mode: the existing forced-mode request corpus (every verb, the injection corpus, every refusal code, opt-ins absent and present) run through both modes with byte-identical response documents; no frame can change the policy; `bad_policy` hello; refusal under `SSH_ORIGINAL_COMMAND`.
+- Relay (`test_relay.py`): the machine name only from `--machine` (a preamble or `SSH_ORIGINAL_COMMAND` naming another machine changes nothing), argument validation, oversize frames from the machine, socket and directory ownership refusals, fixed stderr lines; the stdlib-only import check as for the dispatcher.
+- Hub (`test_agents.py`): peer uid check (a socketpair with a mismatched expected uid), preamble and hello timeouts and schemas, unknown machine, replace semantics (old gets `bye replaced`, read verbs retried once, a written send is `unknown`), flapping warning, connection cap, socket mode 0660 and directory checks, heartbeat timeout, not connected, timeouts with `cancel`, disconnect mid-call, 4 concurrent requests and the fifth waiting, late answers dropped, the control socket's two requests and its peer check.
+- Every tool over the agent transport (`test_agent_tools.py`): `list_remote_sessions`, `remote_status` with capture, `pending_input`, `remote_send` and `remote_send_confirm`, `remote_send_keys`, `remote_resize` (two-step confirmation, audit lines), `usage_report`, the watcher's unreachable pushes, the spoken "laptop is not connected right now", `remote-check` and `status` output; the real dispatcher in serve mode behind an in-process relay over socketpairs, with the fake tmux.
+- Connector (`test_connector.py`): the ssh argv (every option above, as the fake ssh checks today's), the dispatcher's environment allow-list, argument validation, the instance lock, cross-wired pipes with a fake ssh that runs a relay double, reconnect after each failure mode, backoff growth, cap, jitter range and reset with an injected clock and random source, the long wait after exit 75 and 76 and after `auth` and `host_key`, clean shutdown of both children on SIGTERM.
+- Config: the allowed and rejected keys of `agent` machines, `remote.agents` validation, the platform rule; deploy files: the example unit, the sshd drop-in and the tmpfiles line parse and contain no personal details, and the `authorized_keys` lint on good and bad files.
+
 ## Threat model
 
 | Threat | Mitigation | Residual |
@@ -668,6 +926,12 @@ Deviation from upstream, recorded: upstream reaches only sessions whose cwd lies
 | Secrets in spoken answers, logs, pushes, transcripts | Redaction before the summariser and before speaking; pane text never logged (length only); summariser without session persistence; pushes carry names only unless `includeQuestion` (remote job pushes never carry their result, whatever `notify.includeResult` says); audit stores a keyed hash unless `logPrompts` | Regex redaction is best effort; redacted pane text still reaches Anthropic (summariser and the voice conversation) |
 | Resource exhaustion (huge panes, transcripts, slow hosts) | Caps on capture lines, response bytes, transcript size, per-call timeouts, parallel calls bounded by machine count, summariser in task slots | A very slow machine delays `pending_input` up to `commandTimeoutSeconds` |
 | Public exposure of the WSL hub | Funnel only while `sb-linux on`; loopback listen; upstream Host/Origin checks and rate limits | Scanners find the `ts.net` name (CT logs), as in Mac mode |
+| Agent transport (M6, planned): compromised hub against connected machines | The dispatcher's policy comes only from the machine's own unit file; request frames carry no policy and unknown keys are refused; serve mode runs the same validation and verbs as forced mode; no explicit-path mode | The same as for ssh machines: every allowed verb on every connected machine, without confirmations. Better than ssh: the hub holds no key that opens a machine, so a copy of the hub's files reaches nothing |
+| Agent transport: a machine (or anything) claims to be another machine | The name comes only from the per-key `command=` in a root-owned `authorized_keys` on the hub; the relay reads no name from the stream or `SSH_ORIGINAL_COMMAND`; the hub accepts relays only from the `sbrelay` uid (`SO_PEERCRED`) through a 2750 `vcm:sbrelay` directory; `remote-check` lints the key file | Root on the hub, or a compromised `sbrelay` account, can claim any machine |
+| Agent transport: stolen machine relay key | One key per machine, 0600, used for nothing else; optional `from=`; replacements and peer addresses logged and shown in `status`; revoked by deleting one line | The holder can pose as that machine: replace its connection, receive the requests meant for it (including confirmed send texts and keys) and answer with fake screens. Today that machine holds no credential at all |
+| Agent transport: the relay login on the hub | Dedicated system user, key-only, forced command with `restrict`, sshd `Match` block (`DisableForwarding`, `PermitTTY no`, `PermitUserRC no`, `MaxSessions 1`), root-owned home and key file, not in the hub's group; the relay parses nothing and caps frames | sshd's pre-auth surface, which the hub already exposes for administration; an sshd or relay post-auth bug gives the `sbrelay` account (the row above) |
+| Agent transport: MITM or a fake hub | Hub host key pinned under `HostKeyAlias=switchboard-hub`, `StrictHostKeyChecking=yes`, `HostKeyAlgorithms=ssh-ed25519`, `UpdateHostKeys=no`, no global known hosts, recorded from a fingerprint read on the hub's console; `-F /dev/null`, `IdentitiesOnly`, `IdentityAgent=none`, no `SSH_AUTH_SOCK` | First pinning is a manual, checked step. A fake hub holding the real key (the hub) gets only the allowed verbs |
+| Agent transport: resource exhaustion and stuck connections | Frame caps on both sides (2 MiB to the machine, 5 MiB to the hub, enforced also by the relay), the existing response caps, 4 requests in flight per machine, connection cap and handshake timeouts on the socket, heartbeats plus ssh and sshd keepalives, capped jittered backoff on the machine | A machine that floods frames is cut off and reconnects at most at its backoff rate |
 
 ## Test strategy
 
@@ -770,6 +1034,12 @@ The first real voice test (hub on a server, Claude Code in a tmux pane on anothe
 - Cause: not the capture. Checked with the real dispatcher and an isolated tmux 3.4 against a synthetic menu: `capture-pane -p -J -S -<lines>` returns the whole menu, question included, on the normal screen (also from scrollback in an 8-row pane) and on the alternate screen; only a pane that is both on the alternate screen and shorter than the menu loses its top lines. The answer came from the heuristic, which speaks one line, the last meaningful one, and did not know the footer's key hints, so the footer was that line. Which of the no-summary paths (summariser off, no slot, failed run, the pane's job holding its lock) answered on the owner's hub is not known; the hub now logs it.
 - Fixes: key hints under menus are status lines; the heuristic speaks a menu's question and every option ([remote_status](#remote_status)); the summariser prompt asks for the question, every choice and the selected one; `pending_input` captures 40 lines for waiting panes and quotes a menu's question; the capture reports `paneWidth`, `paneHeight` and `alternateOn` (no protocol change, extra fields) and a short alternate-screen pane gets a note; trailing empty lines are dropped. New tools `remote_send_keys` and `remote_resize` with dispatcher verbs `keys` and `resize` (dispatcher 0.5.0; an older dispatcher is named as too old), [above](#remote_send_keys-and-remote_resize).
 - Verified on the WSL box with `SB_LIVE_TMUX=1` (`tests/remote/test_live_menu.py`, tmux 3.4, isolated `tmux -L sb-test-<random>` servers, killed afterwards, `tests/fixtures/fake_menu.py` as the menu): the whole menu through capture, cleaning and the menu heuristic in tall and short panes on both screens; a confirmed `Down Down Enter` (through `remote_send_keys`, `remote_send_confirm`, the local transport and the dispatcher) moves the selection and chooses option 3; the same request on the changed screen is `menu_changed`; a confirmed `remote_resize` of an 8-row alternate-screen pane to 100 by 30 brings back the lines above the box. Not verified yet (owner, against a real Claude Code): see DESIGN.md "To verify with the real app".
+
+### M6: outbound agents (planned)
+
+- Dispatcher serve mode (0.6.0), connector and user unit, relay module and `agent-relay` CLI alias, `remote/agents.py` with `AgentTransport` and the control socket, `remote.agents` config, `status` and `remote-check` for agent machines with the `authorized_keys` lint, `remote-connector` CLI, deploy files for the relay account, `deploy/setup.sh` support.
+- Docs: the setup and migration parts of the guides, REFERENCE.md config keys, CLI commands and error codes, DESIGN.md security model (agent transport rows) and source layout.
+- Tests as in [Tests (M6)](#tests-m6).
 
 ## Open questions from the brief, with recommendations
 
