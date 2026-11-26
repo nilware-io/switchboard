@@ -39,3 +39,27 @@ def capture(lines: list[str], *, rows: int, alternate: bool, history: int = 40, 
     everything = [f"earlier output line {i}" for i in range(history)] + lines
     above, visible = everything[:-rows], everything[-rows:]
     return "\n".join(above[-requested:] + visible) + "\n"
+
+
+PLAIN_OPTIONS = ("Small", "Medium", "Large")
+
+
+def plain_menu_lines(selected: int = 1, *, options: tuple[str, ...] = PLAIN_OPTIONS) -> list[str]:
+    """A menu without numbers: the boxed question, options marked only by `❯` and the same footer."""
+    lines = [ASSISTANT, "", "╭" + "─" * (WIDTH - 2) + "╮", _boxed(QUESTION), _boxed("")]
+    for position, text in enumerate(options, start=1):
+        lines.append(_boxed(f"{'❯' if position == selected else ' '} {text}"))
+    lines.append("╰" + "─" * (WIDTH - 2) + "╯")
+    lines.append(FOOTER)
+    return lines
+
+
+def described_menu_lines(description_lines: int = 6) -> list[str]:
+    """A numbered menu whose option 1 has `description_lines` lines of description under it."""
+    lines = [ASSISTANT, "", "╭" + "─" * (WIDTH - 2) + "╮", _boxed(QUESTION), _boxed("")]
+    lines.append(_boxed("❯ 1. A"))
+    lines += [_boxed(f"     detail {i} of option A") for i in range(description_lines)]
+    lines.append(_boxed("  2. B"))
+    lines.append("╰" + "─" * (WIDTH - 2) + "╯")
+    lines.append(FOOTER)
+    return lines

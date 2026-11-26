@@ -3,10 +3,11 @@
 assistant line, a boxed question with four numbered options (the selected one marked `❯`) and the
 key hints "↑/↓ choose · ←/→ change size · enter confirm · esc not now".
 
-Usage: fake_menu.py normal|alt <record>. `alt` draws on the alternate screen (no scrollback, like a
-full-screen program); `normal` prints 40 earlier output lines first and draws each update below the
-last one. The terminal is in raw mode: Up and Down move the selection, Enter or a digit 1..4 chooses,
-and the chosen number is written to <record>. `<record>.ready` appears once the menu is drawn; a
+Usage: fake_menu.py normal|alt|plain <record>. `alt` draws on the alternate screen (no scrollback,
+like a full-screen program); `normal` prints 40 earlier output lines first and draws each update below
+the last one; `plain` is `alt` with three options without numbers (PLAIN_OPTIONS). The terminal is
+in raw mode: Up and Down move the selection, Enter (or, with numbers, a digit 1..4) chooses, and the
+chosen number is written to <record>. `<record>.ready` appears once the menu is drawn; a
 resize redraws it. Standard library only; it never runs anything it receives. Stops after 60 s.
 """
 
@@ -22,22 +23,28 @@ import tty
 
 QUESTION = "How big should the high score table be?"
 OPTIONS = ("Small (10 entries)", "Medium (50 entries)", "Large (100 entries)", "Type something else")
+PLAIN_OPTIONS = ("Small", "Medium", "Large")
 WIDTH = 62
 
 
-def menu(selected: int) -> list[str]:
+def menu(selected: int, numbered: bool = True) -> list[str]:
     def boxed(text: str) -> str:
         return "│ " + text.ljust(WIDTH - 4) + " │"
 
     lines = ["⏺ I can set the high score table up in a few ways.", "", "╭" + "─" * (WIDTH - 2) + "╮"]
     lines += [boxed(QUESTION), boxed("")]
-    lines += [boxed(f"{'❯' if n == selected else ' '} {n}. {text}") for n, text in enumerate(OPTIONS, start=1)]
+    if numbered:
+        lines += [boxed(f"{'❯' if n == selected else ' '} {n}. {text}") for n, text in enumerate(OPTIONS, start=1)]
+    else:
+        lines += [boxed(f"{'❯' if n == selected else ' '} {text}") for n, text in enumerate(PLAIN_OPTIONS, start=1)]
     lines += ["╰" + "─" * (WIDTH - 2) + "╯", "  ↑/↓ choose · ←/→ change size · enter confirm · esc not now"]
     return lines
 
 
 def main() -> int:
-    alternate = sys.argv[1] == "alt"
+    alternate = sys.argv[1] in ("alt", "plain")
+    numbered = sys.argv[1] != "plain"
+    count = len(OPTIONS if numbered else PLAIN_OPTIONS)
     record = sys.argv[2]
     fd = sys.stdin.fileno()
     out = sys.stdout.fileno()
@@ -47,7 +54,7 @@ def main() -> int:
     signal.signal(signal.SIGWINCH, lambda *_: redraw.__setitem__(0, True))
 
     def draw(selected: int) -> None:
-        text = "\r\n".join(menu(selected))
+        text = "\r\n".join(menu(selected, numbered))
         if alternate:
             os.write(out, ("\x1b[H\x1b[2J" + text).encode("utf-8"))
         else:
@@ -80,10 +87,10 @@ def main() -> int:
                 if pending.startswith((b"\x1b[A", b"\x1bOA")):
                     selected, pending = max(1, selected - 1), pending[3:]
                 elif pending.startswith((b"\x1b[B", b"\x1bOB")):
-                    selected, pending = min(len(OPTIONS), selected + 1), pending[3:]
+                    selected, pending = min(count, selected + 1), pending[3:]
                 elif pending[:1] == b"\r":
                     chosen, pending = selected, pending[1:]
-                elif pending[:1] in (b"1", b"2", b"3", b"4"):
+                elif numbered and pending[:1] in (b"1", b"2", b"3", b"4"):
                     selected = chosen = int(pending[:1])
                     pending = pending[1:]
                 elif pending[:1] == b"\x1b" and len(pending) < 3:

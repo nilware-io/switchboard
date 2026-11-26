@@ -842,7 +842,7 @@ def create_mcp_server(options: McpServerOptions) -> MCPServer:
             Field(
                 min_length=1,
                 max_length=MAX_KEYS,
-                description=f"The keys the owner named, in order, at most {MAX_KEYS}: up, down, left, right, enter, escape, tab, shift tab, a choice number 1 to 9, y or n. Nothing else is pressed.",
+                description=f"The keys the owner named, in order, at most {MAX_KEYS}: up, down, left, right, enter, escape, tab, shift tab, a choice number 1 to 9, y or n. A choice number, enter, escape, y or n only as the last key. Nothing else is pressed.",
             ),
         ],
         machine: Annotated[

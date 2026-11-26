@@ -44,7 +44,14 @@ OPTIONS = (
     (3, "Large (100 entries)"),
     (4, "Type something else"),
 )
-PANES = {"normal": ("normal", 40), "alt": ("alt", 40), "short": ("normal", 8), "shortalt": ("alt", 8)}
+PLAIN_OPTIONS = ((1, "Small"), (2, "Medium"), (3, "Large"))
+PANES = {
+    "normal": ("normal", 40),
+    "alt": ("alt", 40),
+    "short": ("normal", 8),
+    "shortalt": ("alt", 8),
+    "plain": ("plain", 24),
+}
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("SB_LIVE_TMUX") != "1" or shutil.which("tmux") is None,
@@ -120,11 +127,12 @@ def test_the_whole_menu_is_captured_on_every_screen(server: Server) -> None:
     for session, (mode, rows) in PANES.items():
         captured = d.handle([*policy(server), "capture", server.panes[session], "120"], dispatcher_env())
         assert captured["ok"] is True, captured
-        assert captured["alternateOn"] is (mode == "alt"), session
+        assert captured["alternateOn"] is (mode in ("alt", "plain")), session
         assert captured["paneHeight"] == rows
         menu = screen_menu(clean_screen(str(captured["text"])))
         assert menu is not None, session
-        assert menu.options == OPTIONS, session
+        assert menu.numbered is (mode != "plain"), session
+        assert menu.options == (OPTIONS if mode != "plain" else PLAIN_OPTIONS), session
         assert menu.selected == 1
         assert menu.question == QUESTION, session
 

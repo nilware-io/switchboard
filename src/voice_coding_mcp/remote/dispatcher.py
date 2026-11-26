@@ -89,11 +89,18 @@ KEYS_MENU = "menu"
 heard (`none`: no menu was on it). The other mode is SEND_ANSWER, bound to `dialog_hash`."""
 NO_MENU = "none"
 KEY_NAMES = ("Up", "Down", "Left", "Right", "Enter", "Escape", "Tab", "BTab", *"123456789", "y", "n")
-MODE_KEYS = ("Tab", "BTab")
-"""Keys that switch modes at a Claude Code input (Shift+Tab cycles its permission mode up to accept
-edits or bypass permissions): `keys` presses them only into a bound menu or permission dialog."""
 """The only keys `keys` presses: tmux key names (and single characters tmux types as they are), never
 free text, modifiers (`C-c`, `M-x`) or tmux commands."""
+MODE_KEYS = ("Tab", "BTab")
+"""Keys that switch modes at a Claude Code input (Shift+Tab cycles its permission mode up to accept
+edits or bypass permissions): `keys` presses them only into a bound menu or permission dialog, and
+never after a FINAL_KEYS key (`keys_problem`)."""
+FINAL_KEYS = ("Enter", "Escape", *"123456789", "y", "n")
+"""Keys that end a selection (choose, dismiss or answer): only the last key of a `keys` request, so
+nothing lands on the screen that follows the menu, which nobody checked."""
+HISTORY_KEYS = ("Up", "Down")
+"""At an input without a menu these recall earlier prompts or shell commands: never followed by Enter
+there, which would submit text nobody heard."""
 MAX_KEYS = 10
 RESIZE_COLUMNS = (80, 300)
 RESIZE_ROWS = (24, 120)
@@ -319,15 +326,25 @@ def shows_vim_normal(screen: str) -> bool:
 
 
 _MENU_OPTION_RE = re.compile(r"(?:([❯>›▶])\s*)?([1-9])[.)]\s+(\S.*)")
+_MARKED_LINE_RE = re.compile(r"[❯>›▶]\s*(\S.*)")
 MENU_FOOTER_RE = re.compile(
     r"↑\s*/?\s*↓|←\s*/?\s*→|\benter\s+(?:to\s+)?(?:confirm|select|submit|choose)\b"
     r"|\besc\s+(?:to\s+)?(?:cancel|not now|go back|exit|close)\b|\btab\s+to\s+[a-z]",
     re.I,
 )
 """The key hints under an interactive menu ("↑/↓ choose · enter confirm · esc not now")."""
+_PICKER_MOVE_RE = re.compile(r"↑\s*/?\s*↓")
+_PICKER_PICK_RE = re.compile(
+    r"\benter\s+(?:to\s+)?(?:confirm|select|submit|choose)\b|\besc\s+(?:to\s+)?(?:cancel|not now|go back|exit|close)\b",
+    re.I,
+)
 _ASSISTANT_MARK_RE = re.compile(r"[⏺●]\s*")
 MENU_GAP_LINES = 4
 """Non-option lines (an option's description) allowed between two options, or under the last one."""
+MENU_GAP_LINES_PICKER = 12
+"""The same under a picker footer (`_picker_footer`), which no prose with a numbered list has."""
+MENU_PLAIN_OPTIONS = 12
+"""At most this many lines in a menu without numbers."""
 MENU_QUESTION_LINES = 3
 
 
@@ -335,7 +352,17 @@ def _menu_lines(screen: str) -> list[str]:
     return [line.strip().strip(_BOX_EDGES).strip() for line in screen.split("\n")]
 
 
-def _find_menu(lines: list[str]) -> dict[str, object] | None:
+def _picker_footer(footer: list[str]) -> bool:
+    """Key hints that only an interactive picker shows: up/down to move and enter or esc to choose
+    or dismiss ("↑/↓ choose · enter confirm · esc not now"). Claude Code's input status line has
+    neither."""
+    text = " ".join(footer)
+    return _PICKER_MOVE_RE.search(text) is not None and _PICKER_PICK_RE.search(text) is not None
+
+
+def _menu_footer(lines: list[str]) -> tuple[list[str], int]:
+    """(the key hint lines at the bottom, the index of the last line above them that is neither
+    empty, a border nor a key hint)."""
     index = len(lines) - 1
     footer: list[str] = []
     while index >= 0 and (
@@ -344,7 +371,13 @@ def _find_menu(lines: list[str]) -> dict[str, object] | None:
         if lines[index] and not _BORDER_RE.fullmatch(lines[index]):
             footer.insert(0, lines[index])
         index -= 1
-    last = index
+    return footer, index
+
+
+def _numbered_options(lines: list[str], last: int, max_gap: int) -> tuple[list[tuple[int, str, bool]], int] | None:
+    """(options `1.`..`n.` top down as (number, text, marked), the index of option 1) ending at
+    `last`, or None."""
+    index = last
     options: list[tuple[int, str, bool]] = []
     gap = 0
     while index >= 0:
@@ -364,37 +397,83 @@ def _find_menu(lines: list[str]) -> dict[str, object] | None:
             if line.startswith(_INPUT_PROMPTS) or _ASSISTANT_MARK_RE.match(line):
                 return None
             gap += 1
-            if gap > MENU_GAP_LINES:
+            if gap > max_gap:
                 return None
         index -= 1
     if not options or options[-1][0] != 1:
         return None
+    options.reverse()
+    return options, index
+
+
+def _plain_options(lines: list[str], last: int) -> tuple[list[tuple[int, str, bool]], int, list[str]] | None:
+    """A menu without numbers above a picker footer: the block of lines ending at `last` (up to an
+    empty line or a border, at most MENU_PLAIN_OPTIONS) with exactly one selection-marked line. An
+    unmarked first line ending in `?` or `:` is the question. Returns (options numbered by position
+    top down as (number, text, marked), the index of the first line, question lines), or None."""
+    index = last
+    block: list[str] = []
+    while index >= 0 and lines[index] and not _BORDER_RE.fullmatch(lines[index]):
+        if _ASSISTANT_MARK_RE.match(lines[index]) or len(block) >= MENU_PLAIN_OPTIONS + MENU_QUESTION_LINES:
+            return None
+        block.insert(0, lines[index])
+        index -= 1
+    first = index + 1
+    question: list[str] = []
+    while len(block) > 1 and not _MARKED_LINE_RE.fullmatch(block[0]) and block[0].endswith(("?", ":")):
+        question.append(block.pop(0))
+        if len(question) >= MENU_QUESTION_LINES:
+            break
+    marked = [_MARKED_LINE_RE.fullmatch(line) for line in block]
+    if len(block) < 2 or len(block) > MENU_PLAIN_OPTIONS or sum(m is not None for m in marked) != 1:
+        return None
+    options = [
+        (position, (mark.group(1) if mark is not None else line).strip(), mark is not None)
+        for position, line, mark in ((index + 1, block[index], marked[index]) for index in range(len(block)))
+    ]
+    return options, first, question
+
+
+def _find_menu(lines: list[str]) -> dict[str, object] | None:
+    footer, last = _menu_footer(lines)
+    picker = _picker_footer(footer)
+    numbered = _numbered_options(lines, last, MENU_GAP_LINES_PICKER if picker else MENU_GAP_LINES)
+    question: list[str] = []
+    if numbered is not None:
+        options, first = numbered
+    else:
+        plain = _plain_options(lines, last) if picker else None
+        if plain is None:
+            return None
+        options, first, question = plain
     marked = [number for number, _, mark in options if mark]
     if not marked and not footer:
         return None
-    first = index
-    question: list[str] = []
-    probe = index - 1
-    while probe >= 0 and (not lines[probe] or _BORDER_RE.fullmatch(lines[probe])):
-        probe -= 1
-    while (
-        probe >= 0 and lines[probe] and not _BORDER_RE.fullmatch(lines[probe]) and len(question) < MENU_QUESTION_LINES
-    ):
-        line = lines[probe]
-        if MENU_FOOTER_RE.search(line) or line.startswith(_INPUT_PROMPTS):
-            break
-        assistant = _ASSISTANT_MARK_RE.match(line)
-        question.insert(0, line[assistant.end() :] if assistant else line)
-        first = probe
-        if assistant:
-            break
-        probe -= 1
-    options.reverse()
+    if not question:
+        probe = first - 1
+        while probe >= 0 and (not lines[probe] or _BORDER_RE.fullmatch(lines[probe])):
+            probe -= 1
+        while (
+            probe >= 0
+            and lines[probe]
+            and not _BORDER_RE.fullmatch(lines[probe])
+            and len(question) < MENU_QUESTION_LINES
+        ):
+            line = lines[probe]
+            if MENU_FOOTER_RE.search(line) or line.startswith(_INPUT_PROMPTS):
+                break
+            assistant = _ASSISTANT_MARK_RE.match(line)
+            question.insert(0, line[assistant.end() :] if assistant else line)
+            first = probe
+            if assistant:
+                break
+            probe -= 1
     return {
         "question": " ".join(" ".join(question).split()) or None,
         "options": [(number, " ".join(text.split())) for number, text, _ in options],
         "selected": marked[0] if marked else None,
         "footer": " ".join(" ".join(footer).split()) or None,
+        "numbered": numbered is not None,
         "first": first,
         "last": last,
     }
@@ -402,14 +481,43 @@ def _find_menu(lines: list[str]) -> dict[str, object] | None:
 
 def find_menu(screen: str) -> dict[str, object] | None:
     """An interactive menu at the bottom of the screen (Claude Code's questions with choices, its
-    permission dialogs, other numbered pickers), or None. A run of consecutive numbered options
+    permission dialogs, other pickers), or None. Either a run of consecutive numbered options
     `1.`..`9.` (an optional `❯ > › ▶` marks the selected one; up to MENU_GAP_LINES description lines
-    between options) with only borders, empty lines and key hints (MENU_FOOTER_RE) below it, and
-    either a selection marker or key hints. Prose with a numbered list above an input box is no
-    menu. Returns `question` (up to MENU_QUESTION_LINES lines directly above the options, stopping
-    at an assistant line), `options` [(number, text)], `selected` (a number or None), `footer` and
-    the line range `first`..`last`. The hub runs this same function for what it reads back."""
+    between options, MENU_GAP_LINES_PICKER under a picker footer) with only borders, empty lines and
+    key hints (MENU_FOOTER_RE) below it, and either a selection marker or key hints; or, under a
+    picker footer (up/down plus enter or esc hints), a block of up to MENU_PLAIN_OPTIONS lines
+    without numbers, exactly one of them selection-marked (`numbered` False; the options are then
+    numbered by position and a digit key does not choose them). Prose with a numbered list above an
+    input box is no menu. Returns `question` (up to MENU_QUESTION_LINES lines directly above the
+    options, stopping at an assistant line), `options` [(number, text)], `selected` (a number or
+    None), `footer`, `numbered` and the line range `first`..`last`. The hub runs this same function
+    for what it reads back."""
     return _find_menu(_menu_lines(screen))
+
+
+def shows_picker(screen: str) -> bool:
+    """The bottom of the screen has a picker footer (`_picker_footer`): a menu is open, whether or
+    not `find_menu` can read it. `keys` without a bound menu is refused then (`menu_unreadable`):
+    the selection mark of an unread menu is no input draft, and Enter would choose an option nobody
+    heard."""
+    return _picker_footer(_menu_footer(_menu_lines(screen))[0])
+
+
+def keys_problem(keys: list[str], menu_bound: bool) -> str | None:
+    """Why a `keys` request may not be pressed as it is, or None; the hub runs the same function
+    before it reads back. A FINAL_KEYS key (a choice, Enter, Escape, y, n) may only be the last key
+    (`key_order`): what follows it would land on whatever screen the choice opens, which nobody
+    checked. Without a bound menu or permission dialog (`menu_bound` False), no MODE_KEYS
+    (`mode_keys`) and no HISTORY_KEYS before Enter (`history_submit`: that recalls and submits an
+    earlier prompt or shell command nobody heard)."""
+    if any(key in FINAL_KEYS for key in keys[:-1]):
+        return "key_order"
+    if not menu_bound:
+        if any(key in MODE_KEYS for key in keys):
+            return "mode_keys"
+        if keys and keys[-1] == "Enter" and any(key in HISTORY_KEYS for key in keys):
+            return "history_submit"
+    return None
 
 
 def menu_hash(screen: str) -> str | None:
@@ -1011,13 +1119,17 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
     `menu` mode no permission dialog may show (`permission_prompt`) and the menu must be the one read
     back (`menu_changed`, `none` when there was none; then also no draft and no vim normal mode); in
     `answer` mode the permission dialog must be the one read back (`dialog_changed`), and only with
-    --allow-permission-answers. MODE_KEYS go only into a bound menu or a dialog (`mode_keys`)."""
+    --allow-permission-answers. Without a bound menu, a screen with a picker footer is refused
+    (`menu_unreadable`). `keys_problem` limits the order of the keys (`key_order`, `mode_keys`,
+    `history_submit`), and every check runs before the one `send-keys`, so a key that ends the
+    selection is the last one pressed."""
     if not policy.allow_send:
         raise RefusedError("not_allowed")
     pane_id, pane_pid, session_id, mode, bound = args[:5]
     keys = args[5:]
-    if mode == KEYS_MENU and bound == NO_MENU and any(key in MODE_KEYS for key in keys):
-        raise RefusedError("mode_keys")
+    problem = keys_problem(keys, menu_bound=mode == SEND_ANSWER or bound != NO_MENU)
+    if problem is not None:
+        raise RefusedError(problem)
     pane, entry, screen = _send_state(policy, env, pane_id)
     if pane is None:
         raise RefusedError("gone")
@@ -1037,6 +1149,8 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
         current = menu_hash(screen)
         if (current or NO_MENU) != bound:
             raise RefusedError("menu_changed")
+        if current is None and shows_picker(screen):
+            raise RefusedError("menu_unreadable")
         if current is None and entry is not None:
             if shows_draft(screen):
                 raise RefusedError("draft_present")

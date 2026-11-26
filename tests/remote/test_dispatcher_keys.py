@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from tests.remote.helpers import DISPATCHER, SESSION_A, SESSION_B, RemoteWorld, pane
-from tests.remote.menu_fixtures import capture, menu_lines
+from tests.remote.menu_fixtures import capture, described_menu_lines, menu_lines, plain_menu_lines
 from voice_coding_mcp.remote import dispatcher as d
 
 SESSIONS = ["--sessions", "fpga,notes,work-*"]
@@ -194,9 +194,9 @@ def test_pane_pid_and_session_are_rechecked(world: RemoteWorld) -> None:
 
 
 def test_a_shell_pane_only_with_send_to_any_pane(world: RemoteWorld) -> None:
-    out = call(world, f"keys %2 {SHELL_PID} none menu none y Enter", [*FORCED, "--send-to-any-pane"])
+    out = call(world, f"keys %2 {SHELL_PID} none menu none Left y", [*FORCED, "--send-to-any-pane"])
     assert out["ok"] is True
-    assert pressed(world) == [["send-keys", "-t", "%2", "y", "Enter"]]
+    assert pressed(world) == [["send-keys", "-t", "%2", "Left", "y"]]
 
 
 def test_a_changed_menu_is_refused(world: RemoteWorld) -> None:
@@ -337,3 +337,106 @@ def test_the_script_answers_keys_like_handle(world: RemoteWorld) -> None:
         [sys.executable, "-I", DISPATCHER, *FORCED], env=env, capture_output=True, timeout=30, check=True
     )
     assert json.loads(done.stdout) == {"protocol": 1, "ok": True, "sent": True, "keys": 2}
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        "1 BTab BTab BTab",
+        "1 Tab",
+        "Enter BTab",
+        "Escape Up Enter",
+        "y Enter",
+        "n Down",
+        "2 Enter",
+        "Down Enter Enter",
+    ],
+)
+def test_nothing_follows_a_key_that_ends_the_selection(world: RemoteWorld, names: str) -> None:
+    """A choice, Enter, Escape, y or n only as the last key: what follows would land on the screen the
+    choice opens (Claude Code's input, where Shift+Tab cycles the permission mode), which nobody
+    checked. In menu and answer mode, whatever the opt-ins."""
+    assert keys(world, *names.split())["error"] == "key_order"
+    forced = [*FORCED, "--allow-permission-answers", "--send-to-any-pane"]
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})
+    assert keys(world, *names.split(), bound=f"answer {DIALOG_HASH}", forced=forced)["error"] == "key_order"
+    assert pressed(world) == []
+
+
+@pytest.mark.parametrize("names", ["Up Enter", "Down Enter", "Up Up Enter", "Left Up Enter", "Down Right Enter"])
+def test_no_history_recall_and_submit_without_a_menu(world: RemoteWorld, names: str) -> None:
+    """Up or Down at an input recalls an earlier prompt (or shell command); Enter would submit text
+    that was never read back or risk-checked."""
+    world.set_panes(
+        [
+            pane("fpga", "%1", CLAUDE_PID, command="claude"),
+            pane("fpga", "%2", SHELL_PID, window_index=1, window_name="shell", command="bash"),
+        ],
+        {"%1": EMPTY_BOX, "%2": "$ make\nok\n$ "},
+    )
+    world.register("2001", os.getpid(), sessionId=SESSION_A, status="idle", tmux="0:@0.%1")
+    assert keys(world, *names.split(), bound="menu none")["error"] == "history_submit"
+    forced = [*FORCED, "--send-to-any-pane"]
+    request = f"keys %2 {SHELL_PID} none menu none {names}"
+    assert call(world, request, forced)["error"] == "history_submit"
+    assert pressed(world) == []
+    # One navigation key, or Enter alone, still goes.
+    assert keys(world, "Up", bound="menu none")["ok"] is True
+    assert keys(world, "Enter", bound="menu none")["ok"] is True
+    # Inside the menu the owner heard, Up and Enter are menu navigation.
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": MENU})
+    assert keys(world, "Down", "Up", "Enter")["ok"] is True
+
+
+def test_keys_problem_rules() -> None:
+    assert d.keys_problem(["Down", "Down", "Enter"], menu_bound=True) is None
+    assert d.keys_problem(["Left", "Right", "3"], menu_bound=True) is None
+    assert d.keys_problem(["BTab", "Tab", "Escape"], menu_bound=True) is None
+    assert d.keys_problem(["3", "BTab"], menu_bound=True) == "key_order"
+    assert d.keys_problem(["Escape", "Enter"], menu_bound=True) == "key_order"
+    assert d.keys_problem(["y"], menu_bound=False) is None
+    assert d.keys_problem(["Left", "Enter"], menu_bound=False) is None
+    assert d.keys_problem(["Up", "Enter"], menu_bound=False) == "history_submit"
+    assert d.keys_problem(["Up", "Tab"], menu_bound=False) == "mode_keys"
+    assert d.keys_problem(["1", "2", "Enter"], menu_bound=False) == "key_order"
+    assert set(d.FINAL_KEYS) | set(d.MODE_KEYS) | set(d.HISTORY_KEYS) <= set(d.KEY_NAMES)
+
+
+def test_a_menu_without_numbers_is_bound_and_pressed(world: RemoteWorld) -> None:
+    screen = capture(plain_menu_lines(), rows=30, alternate=True)
+    menu = d.find_menu(screen)
+    assert menu is not None
+    assert menu["numbered"] is False
+    assert menu["options"] == [(1, "Small"), (2, "Medium"), (3, "Large")]
+    assert menu["selected"] == 1
+    assert menu["question"] == "How big should the high score table be?"
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+    assert d.shows_draft(screen) is True, "the selection mark looks like a draft line"
+    assert keys(world, "Escape", bound="menu none")["error"] == "menu_changed"
+    assert keys(world, "Down", "Enter", bound=f"menu {d.menu_hash(screen)}")["ok"] is True
+    assert pressed(world) == [["send-keys", "-t", "%1", "Down", "Enter"]]
+
+
+def test_an_unreadable_menu_is_refused_without_a_bound_menu(world: RemoteWorld) -> None:
+    """A picker footer the menu detection cannot read (here: two selection marks): its selection mark
+    is no draft and Enter would choose something nobody heard."""
+    lines = plain_menu_lines()
+    lines[6] = lines[6].replace("  Medium", "❯ Medium")
+    screen = capture(lines, rows=30, alternate=True)
+    assert d.find_menu(screen) is None
+    assert d.shows_picker(screen) is True
+    world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": screen})
+    assert keys(world, "Escape", bound="menu none")["error"] == "menu_unreadable"
+    assert pressed(world) == []
+    assert d.shows_picker(EMPTY_BOX) is False
+    assert d.shows_picker("> draft\n  ⏵⏵ accept edits on (shift+tab to cycle)\n") is False
+
+
+def test_a_numbered_menu_with_long_descriptions_is_found_under_a_picker_footer() -> None:
+    screen = capture(described_menu_lines(6), rows=30, alternate=True)
+    menu = d.find_menu(screen)
+    assert menu is not None
+    assert (menu["numbered"], menu["options"], menu["selected"]) == (True, [(1, "A"), (2, "B")], 1)
+    # Without the picker footer the old limit holds: prose with a numbered list is no menu.
+    prose = "\n".join(["1. A", *(f"text {i}" for i in range(6)), "2. B", "esc to cancel"])
+    assert d.find_menu(prose) is None

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..text import clip
-from .dispatcher import find_menu
+from .dispatcher import MENU_FOOTER_RE, find_menu, shows_picker
 
 MENU_OPTION_MAX = 80
 
@@ -24,6 +24,9 @@ class ScreenMenu:
     """(number, text), each text clipped to MENU_OPTION_MAX."""
     selected: int | None
     footer: str | None
+    numbered: bool = True
+    """False for a menu without numbers: its options are numbered by position, and a digit key does
+    not choose them."""
 
 
 QUESTION_MAX_CHARS = 200
@@ -44,4 +47,32 @@ def screen_menu(screen: str) -> ScreenMenu | None:
         options=tuple((int(number), clip(str(text), MENU_OPTION_MAX)) for number, text in options),
         selected=selected if isinstance(selected, int) else None,
         footer=footer if isinstance(footer, str) else None,
+        numbered=found["numbered"] is not False,
     )
+
+
+FOOTER_BLOCK_LINES = 8
+FOOTER_BLOCK_MAX_CHARS = 400
+
+
+def footer_block(screen: str) -> str | None:
+    """For a screen whose bottom is a picker footer (`dispatcher.shows_picker`: up/down plus enter or
+    esc hints) but no menu `screen_menu` can read: the last FOOTER_BLOCK_LINES non-empty, non-border
+    lines above the hints (the question and options), joined with " / " and clipped. None without
+    such a footer."""
+    if not shows_picker(screen):
+        return None
+    lines = [line.strip().strip("│┃║|").strip() for line in screen.split("\n")]
+    index = len(lines) - 1
+    while index >= 0 and (not lines[index] or _border(lines[index]) or MENU_FOOTER_RE.search(lines[index])):
+        index -= 1
+    block: list[str] = []
+    while index >= 0 and len(block) < FOOTER_BLOCK_LINES:
+        if lines[index] and not _border(lines[index]):
+            block.insert(0, " ".join(lines[index].split()))
+        index -= 1
+    return clip(" / ".join(block), FOOTER_BLOCK_MAX_CHARS) if block else None
+
+
+def _border(line: str) -> bool:
+    return all(ch in "─━│┃╭╮╰╯┌┐└┘├┤┬┴┼═║╔╗╚╝-_ " for ch in line)

@@ -32,7 +32,6 @@ from .dispatcher import (
     KEY_NAMES,
     KEYS_MENU,
     MAX_KEYS,
-    MODE_KEYS,
     NO_DIALOG,
     NO_MENU,
     RESIZE_COLUMNS,
@@ -40,9 +39,11 @@ from .dispatcher import (
     SEND_ANSWER,
     SEND_CHECK_LINES,
     SEND_MESSAGE,
+    keys_problem,
+    shows_picker,
 )
 from .inventory import Inventory, resolve_machine
-from .menu import screen_menu
+from .menu import footer_block, screen_menu
 from .pending import (
     PendingChecker,
     PendingCheckerOptions,
@@ -108,6 +109,10 @@ VERSION_CACHE_MS = 5 * 60 * 1000
 prepared again."""
 _SPOKEN_KEYS = key_words(
     [name for name in KEY_NAMES if not name.isdigit() and name not in ("y", "n")] + ["the numbers 1 to 9", "y", "n"]
+)
+KEYS_ORDER_REFUSAL = (
+    "I press a number, enter, escape, y or n only as the last key: anything after it would land on "
+    "the next screen, which I have not read. Ask for the rest once I have read that screen."
 )
 KEYS_REFUSAL = {
     "empty": f"Which keys should I press? I can press {_SPOKEN_KEYS}.",
@@ -300,9 +305,16 @@ class RemoteTools:
             },
         )
         note = ""
-        if captured.alternate_on and captured.pane_height is not None and captured.pane_height < RESIZE_ROWS[0]:
+        rows = captured.pane_height
+        if (
+            captured.alternate_on
+            and rows is not None
+            and rows < RESIZE_ROWS[0]
+            and (screen_menu(screen) is None or len(screen.lstrip("\n").split("\n")) >= rows)
+        ):
             # The alternate screen has no scrollback: a menu taller than the pane is cut at its top.
-            note = cut_note(captured.pane_height, found.item.allow_send)
+            # Not said when the whole menu was found below a free top row.
+            note = cut_note(rows, found.item.allow_send)
         answer = await self._describe(name, pane, label, screen, deadline)
         return ToolAnswer(answer.text + note, answer.is_error) if note else answer
 
@@ -314,8 +326,9 @@ class RemoteTools:
         self._logger.info("remote_status answer", fields)
 
     async def _describe(self, machine: str, pane: PaneInfo, label: str, screen: str, deadline: _Deadline) -> ToolAnswer:
-        line = last_meaningful_line(screen)
         menu = screen_menu(screen)
+        # A menu that cannot be read still has its question and options above the key hints.
+        line = (footer_block(screen) if menu is None else None) or last_meaningful_line(screen)
 
         def heuristic(reason: str) -> str:
             self._log_answer(machine, pane, "heuristic", reason)
@@ -330,7 +343,7 @@ class RemoteTools:
         if cached is not None:
             self.echo.observe(cached)
             self._log_answer(machine, pane, "cached")
-            return ToolAnswer(format_status(label, pane, summary=cached, line=line))
+            return ToolAnswer(format_status(label, pane, summary=cached, line=line, menu=menu))
         lock_key = f"remote:{key}"
         lease = self._manager.claim_slot(lock_key)
         if lease is None:
@@ -349,7 +362,7 @@ class RemoteTools:
                 return ToolAnswer(heuristic("failed"))
             self.echo.observe(summary)
             self._log_answer(machine, pane, "summary")
-            return ToolAnswer(format_status(label, pane, summary=summary, line=line))
+            return ToolAnswer(format_status(label, pane, summary=summary, line=line, menu=menu))
 
         async def finish(abort: asyncio.Event) -> str:
             try:
@@ -361,7 +374,7 @@ class RemoteTools:
                 return heuristic("failed")
             self.echo.observe(summary)
             self._log_answer(machine, pane, "summary", "task")
-            return format_status(label, pane, summary=summary, line=line)
+            return format_status(label, pane, summary=summary, line=line, menu=menu)
 
         started = self._manager.start_job(
             label=f"status of {clean_name(pane.session)} on {machine}", machine=machine, lock_key=lock_key, job=finish
@@ -557,6 +570,8 @@ class RemoteTools:
         parsed = parse_keys(keys)
         if isinstance(parsed, str):
             return refuse(KEYS_REFUSAL[parsed], f"keys_{parsed}")
+        if keys_problem(parsed, menu_bound=True) == "key_order":
+            return refuse(KEYS_ORDER_REFUSAL, "key_order")
         view = await self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left())
         if not view.ok:
             return refuse(f"{name} is not reachable: {unreachable_reason(view.error, view.detail)}.", "unreachable")
@@ -605,14 +620,32 @@ class RemoteTools:
             )
             if question is None and claude is not None and claude.status == "waiting":
                 question = waiting_for_text(claude.waiting_for)
-            if bound is None and any(key in MODE_KEYS for key in parsed):
+            if bound is None and shows_picker(captured.text):
+                # A menu is open but cannot be read: its selection mark is no draft, and Enter would
+                # choose an option nobody heard. The dispatcher refuses the same (`menu_unreadable`).
+                return refuse(
+                    f"{place} shows a menu I cannot read, so I will not press keys in it. "
+                    "Ask me what its screen says, or answer it at the keyboard.",
+                    "menu_unreadable",
+                )
+            problem = keys_problem(parsed, menu_bound=bound is not None)
+            if problem == "mode_keys":
                 # Tab and Shift+Tab at a Claude Code input switch modes (Shift+Tab cycles the
                 # permission mode up to accept edits or bypass), a broader grant than answering one
                 # dialog: only into a menu the owner heard or a permission dialog.
                 return refuse(
-                    f"I see no menu on the screen of {place}, and there tab and shift tab can switch "
-                    "Claude Code's modes, so I will not press them.",
+                    f"There is no menu on the screen of {place}; tab and shift tab there would change "
+                    "Claude Code's mode, so I will not press them.",
                     "mode_keys",
+                )
+            if problem == "history_submit":
+                # Up or Down at an input recalls an earlier prompt or shell command; Enter would
+                # submit text that was never read back or risk-checked.
+                return refuse(
+                    f"There is no menu on the screen of {place}; up or down and then enter would send "
+                    "an earlier prompt or command again without me reading it to you, so I will not "
+                    "press them. Tell me the message instead.",
+                    "history_submit",
                 )
         # Also for a permission dialog: find_menu reads its options, so the owner hears which one.
         chosen = chosen_option(menu, parsed)

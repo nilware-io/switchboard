@@ -152,8 +152,9 @@ def key_words(keys: Sequence[str]) -> str:
 
 def chosen_option(menu: ScreenMenu | None, keys: Sequence[str]) -> tuple[int, str] | None:
     """The option the keys should choose in `menu`: moving the selection with Up and Down, then
-    Enter, or a choice number. None when it cannot be told (no selection mark, a move past the first
-    or last option, which may wrap around, or any other key first)."""
+    Enter, or a choice number (only in a numbered menu). None when it cannot be told (no selection
+    mark, a move past the first or last option, which may wrap around, or any other key first).
+    Keys after a choosing one are refused before this (`dispatcher.keys_problem`, `key_order`)."""
     if menu is None:
         return None
     options = dict(menu.options)
@@ -161,7 +162,7 @@ def chosen_option(menu: ScreenMenu | None, keys: Sequence[str]) -> tuple[int, st
     for key in keys:
         if key.isdigit():
             number = int(key)
-            return (number, options[number]) if number in options else None
+            return (number, options[number]) if menu.numbered and number in options else None
         if key == "Up" and selected is not None and selected - 1 in options:
             selected -= 1
         elif key == "Down" and selected is not None and selected + 1 in options:

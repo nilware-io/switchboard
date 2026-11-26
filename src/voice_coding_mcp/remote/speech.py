@@ -124,25 +124,27 @@ def status_fact(pane: PaneInfo) -> str:
 MENU_WORDS_MAX = 400
 
 
-def menu_words(menu: ScreenMenu, limit: int = MENU_WORDS_MAX) -> str:
-    """'A menu on the screen asks: "<question>". Options: 1 "Small", selected; 2 "Medium".', the
-    options cut (with "and N more") so the whole stays within about `limit` characters. Screen text,
-    so quoted and redacted."""
+def menu_words(menu: ScreenMenu, limit: int = MENU_WORDS_MAX, *, hints: bool = True) -> str:
+    """'A menu on the screen asks: "<question>". Options: 1 "Small", selected; 2 "Medium".' (a menu
+    without numbers: '"Small", selected; "Medium"'), the options cut (with "and N more") so the
+    whole stays within about `limit` characters, then the unusual key hints unless `hints` is off.
+    Screen text, so quoted and redacted."""
     head = (
         f"A menu on the screen asks: {quote(redact(menu.question))}." if menu.question else "The screen shows a menu."
     )
     parts: list[str] = []
     used = len(head) + len(" Options: ")
     for index, (number, text) in enumerate(menu.options):
-        item = f"{number} {quote(redact(text))}" + (", selected" if number == menu.selected else "")
+        item = (f"{number} " if menu.numbered else "") + quote(redact(text))
+        item += ", selected" if number == menu.selected else ""
         rest = len(menu.options) - index
         if parts and used + len(item) + 2 > limit:
             parts.append(f"and {rest} more")
             break
         parts.append(item)
         used += len(item) + 2
-    hints = footer_words(menu.footer)
-    tail = f" Its key hints also say: {quote(hints)}." if hints else ""
+    hints_said = footer_words(menu.footer) if hints else None
+    tail = f" Its key hints also say: {quote(hints_said)}." if hints_said else ""
     return f"{head} Options: {'; '.join(parts)}.{tail}"
 
 
@@ -176,7 +178,9 @@ def format_status(
 ) -> str:
     fact = status_fact(pane)
     if summary:
-        return f"{label}: {fact} A summary of the screen: {quote(summary)}"
+        # The menu's own words too, so its options reach the owner whatever the summary says.
+        more = f" {menu_words(menu)}" if menu is not None else ""
+        return f"{label}: {fact} A summary of the screen: {quote(summary)}{more}"
     if menu is not None:
         return f"{label}: {fact} {menu_words(menu)}"
     if line:
@@ -354,13 +358,16 @@ def format_keys_readback(
         asked = f" It asks for permission: {quote(question)}." if question else " It shows a permission question."
         parts.append(f"Ready to press {keys} in {item.place}.{asked}")
     elif menu is not None:
-        parts.append(f"Ready to press {keys} in {item.place}. {menu_words(menu)}")
+        # The footer's unusual hints matter only for keys beyond moving, choosing and confirming.
+        plain = all(key in ("Up", "Down", "Enter") or key.isdigit() for key in item.keys)
+        parts.append(f"Ready to press {keys} in {item.place}. {menu_words(menu, hints=not plain)}")
     elif question:
         parts.append(f"Ready to press {keys} in {item.place}, which asks: {quote(question)}.")
     else:
         parts.append(f"Ready to press {keys} in {item.place}. I see no menu on its screen.")
     if chosen is not None:
-        parts.append(f"That should choose {chosen[0]}, {quote(redact(chosen[1]))}.")
+        number = f"{chosen[0]}, " if menu is None or menu.numbered else ""
+        parts.append(f"That should choose {number}{quote(redact(chosen[1]))}.")
     if item.risky:
         parts.append(f"Careful, {risk_words(item.risky)}. To press them anyway, say {yes_phrase(item.risky)}.")
     else:
@@ -377,6 +384,10 @@ def format_resize_readback(
     columns, rows = item.size
     now = f" It is now {current[0]} by {current[1]}." if current is not None else ""
     parts.append(f"Ready to resize the window of {item.place} to {columns} columns by {rows} rows.{now}")
+    parts.append(
+        "The size stays fixed afterwards, and it also changes the other panes in that window "
+        "and every terminal attached to it."
+    )
     parts.append("Say yes to resize it.")
     parts.append(f"(confirmation {item.id}, do not read this number aloud)")
     return " ".join(parts)
@@ -402,7 +413,10 @@ _NOT_SENT: dict[str, str] = {
 
 _NOT_DONE_KEYS: dict[str, str] = {
     "menu_changed": "Not pressed: the menu on that screen changed since I read it to you. Ask me to read it again.",
-    "mode_keys": "Not pressed: there is no menu on that screen, and there tab and shift tab can switch Claude Code's modes.",
+    "mode_keys": "Not pressed: there is no menu on that screen; tab and shift tab there would change Claude Code's mode.",
+    "key_order": "Not pressed: switchboard-remote on {machine} presses a number, enter, escape, y or n only as the last key.",
+    "history_submit": "Not pressed: there is no menu on that screen; up or down and then enter would send an earlier prompt or command again.",
+    "menu_unreadable": "Not pressed: that screen now shows a menu I cannot read. Ask me what it says.",
     "bad_request": "Not pressed: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
 }
 _NOT_DONE_RESIZE: dict[str, str] = {

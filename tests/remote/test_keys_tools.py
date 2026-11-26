@@ -14,7 +14,15 @@ import pytest
 
 from tests.helpers import read_records
 from tests.remote.helpers import SESSION_A, RemoteWorld, pane
-from tests.remote.menu_fixtures import FOOTER, OPTIONS, QUESTION, capture, menu_lines
+from tests.remote.menu_fixtures import (
+    FOOTER,
+    OPTIONS,
+    QUESTION,
+    capture,
+    described_menu_lines,
+    menu_lines,
+    plain_menu_lines,
+)
 from tests.remote.test_send_tools import (
     CLAUDE_PID,
     DIALOG,
@@ -52,9 +60,10 @@ async def make(tmp_path: Path) -> AsyncIterator[Make]:
 
 READBACK_MENU = (
     'A menu on the screen asks: "How big should the high score table be?". Options: 1 "Small (10 entries)", '
-    'selected; 2 "Medium (50 entries)"; 3 "Large (100 entries)"; 4 "Type something else". '
-    'Its key hints also say: "left/right change size".'
+    'selected; 2 "Medium (50 entries)"; 3 "Large (100 entries)"; 4 "Type something else".'
 )
+"""The menu as read back for keys that only move, choose and confirm (no footer hints then)."""
+HINTS = 'Its key hints also say: "left/right change size".'
 
 
 def show(ctx: Ctx, text: str, *, status: str = "waiting", waiting_for: str = "user answer") -> None:
@@ -262,7 +271,7 @@ async def test_tab_and_shift_tab_without_a_menu_are_refused(make: Make, key: str
     show(ctx, EMPTY_BOX, status="idle")
     text, error = await prepare(ctx, ["Down", key])
     assert (text, error) == (
-        "I see no menu on the screen of fpga on dev, and there tab and shift tab can switch Claude Code's modes, "
+        "There is no menu on the screen of fpga on dev; tab and shift tab there would change Claude Code's mode, "
         "so I will not press them.",
         True,
     )
@@ -303,7 +312,7 @@ async def test_a_risky_option_needs_risky_ok(make: Make) -> None:
     assert await ctx.confirm("4172") == (NEEDS_RISKY_OK, True)
     assert pressed(ctx) == []
     # When the option is not known, every option counts as the question's.
-    await prepare(ctx, ["Escape", "Enter"])
+    await prepare(ctx, ["Left", "Enter"])
     assert ctx.tools.confirmations.check("5283", OWNER.fingerprint) in ("early",)
     ctx.later()
     item = ctx.tools.confirmations.check("5283", OWNER.fingerprint)
@@ -400,7 +409,8 @@ async def test_resize_reads_back_confirms_and_audits(make: Make) -> None:
     readback = await ctx.tools.remote_resize("dev", "fpga", 120, 40, OWNER)
     assert readback.text == (
         "Ready to resize the window of fpga on dev to 120 columns by 40 rows. It is now 80 by 24. "
-        "Say yes to resize it. (confirmation 4172, do not read this number aloud)"
+        "The size stays fixed afterwards, and it also changes the other panes in that window and every "
+        "terminal attached to it. Say yes to resize it. (confirmation 4172, do not read this number aloud)"
     )
     ctx.later()
     assert await ctx.confirm("4172") == ("Resized the window of fpga on dev to 120 by 40.", False)
@@ -454,7 +464,7 @@ def menu_world(tmp_path: Path, text: str, *, height: int = 40, alternate: bool =
     return world
 
 
-HEURISTIC = f"dev, fpga: Claude Code is waiting for your answer. {READBACK_MENU}"
+HEURISTIC = f"dev, fpga: Claude Code is waiting for your answer. {READBACK_MENU} {HINTS}"
 
 
 @pytest.mark.parametrize(
@@ -509,7 +519,8 @@ async def test_the_summariser_gets_the_question_options_and_footer(tmp_path: Pat
         answer = await c.tools.remote_status("dev", "fpga", None)
         assert answer.text == (
             "dev, fpga: Claude Code is waiting for your answer. A summary of the screen: "
-            '"It asks how big the table should be; 1 is selected."'
+            '"It asks how big the table should be; 1 is selected." '
+            f"{READBACK_MENU} {HINTS}"
         )
         (run,) = read_records(c.record)
         stdin = run["stdin"]
@@ -538,5 +549,126 @@ async def test_pending_input_quotes_the_question_of_a_tall_menu(tmp_path: Path) 
     try:
         answer = await c.tools.pending_input("dev")
         assert answer.text == f'1 session needs you.\nOn dev, fpga asks: "{QUESTION}".'
+    finally:
+        await c.manager.shutdown("test finished")
+
+
+@pytest.mark.parametrize(
+    "names", [["1", "BTab", "BTab", "BTab"], ["Enter", "Tab"], ["Escape", "Up", "Enter"], ["y", "Enter"]]
+)
+async def test_nothing_follows_a_key_that_ends_the_selection(make: Make, names: list[str]) -> None:
+    """With only allowSend and an ordinary menu, one confirmation must not pick an option and then
+    cycle Claude Code's permission mode (or type into the screen that follows)."""
+    ctx = await make()
+    show(ctx, MENU)
+    text, error = await prepare(ctx, names)
+    assert (text, error) == (
+        "I press a number, enter, escape, y or n only as the last key: anything after it would land on the next "
+        "screen, which I have not read. Ask for the rest once I have read that screen.",
+        True,
+    )
+    assert len(ctx.tools.confirmations) == 0
+    assert keys_calls(ctx) == []
+
+
+@pytest.mark.parametrize("names", [["Up", "Enter"], ["down", "down", "enter"]])
+async def test_no_history_recall_and_submit_without_a_menu(make: Make, names: list[str]) -> None:
+    ctx = await make(dev={"sendToAnyPane": True})
+    show(ctx, EMPTY_BOX, status="idle")
+    text, error = await prepare(ctx, names)
+    assert error
+    assert text.startswith(
+        "There is no menu on the screen of fpga on dev; up or down and then enter would send an earlier prompt"
+    )
+    assert len(ctx.tools.confirmations) == 0
+    text, error = await prepare(ctx, names, target="fpga:1")
+    assert error, "a shell pane reruns its last command"
+    assert "earlier prompt or command" in text
+
+
+async def test_a_menu_without_numbers_is_read_back_and_pressed(make: Make) -> None:
+    ctx = await make()
+    screen = capture(plain_menu_lines(), rows=30, alternate=True)
+    show(ctx, screen)
+    readback, error = await prepare(ctx, ["Down", "Enter"])
+    assert not error
+    assert readback == (
+        'Ready to press down and enter in fpga on dev. A menu on the screen asks: "How big should the high score '
+        'table be?". Options: "Small", selected; "Medium"; "Large". That should choose "Medium". '
+        "Say yes to press them. (confirmation 4172, do not read this number aloud)"
+    )
+    ctx.later()
+    assert await ctx.confirm("4172") == ("Pressed down and enter in fpga on dev.", False)
+    assert keys_calls(ctx) == [
+        f"switchboard-remote keys %1 {CLAUDE_PID} {SESSION_A} menu {d.menu_hash(screen)} Down Enter"
+    ]
+    # A digit does not choose an option without a number.
+    readback, _ = await prepare(ctx, ["2"])
+    assert "That should choose" not in readback
+
+
+async def test_an_unreadable_menu_is_refused_up_front(make: Make) -> None:
+    ctx = await make()
+    lines = plain_menu_lines()
+    lines[6] = lines[6].replace("  Medium", "❯ Medium")
+    show(ctx, capture(lines, rows=30, alternate=True))
+    text, error = await prepare(ctx, ["Escape"])
+    assert (text, error) == (
+        "fpga on dev shows a menu I cannot read, so I will not press keys in it. "
+        "Ask me what its screen says, or answer it at the keyboard.",
+        True,
+    )
+    assert len(ctx.tools.confirmations) == 0
+
+
+async def test_status_of_a_menu_without_numbers_names_question_and_options(tmp_path: Path) -> None:
+    for rows, alternate in ((40, False), (40, True), (12, True)):
+        text = capture(plain_menu_lines(selected=3), rows=rows, alternate=alternate)
+        world = menu_world(tmp_path / f"{rows}{alternate}", text, height=rows, alternate=alternate)
+        c = await build_status(tmp_path / f"{rows}{alternate}", world, summary=False)
+        try:
+            answer = await c.tools.remote_status("dev", "fpga", 120)
+            assert answer.text == (
+                'dev, fpga: Claude Code is waiting for your answer. A menu on the screen asks: "How big should the '
+                'high score table be?". Options: "Small"; "Medium"; "Large", selected. '
+                'Its key hints also say: "left/right change size".'
+            ), (rows, alternate)
+        finally:
+            await c.manager.shutdown("test finished")
+
+
+async def test_status_of_an_unreadable_menu_speaks_the_block_above_the_footer(tmp_path: Path) -> None:
+    lines = plain_menu_lines()
+    lines[6] = lines[6].replace("  Medium", "❯ Medium")
+    c = await build_status(tmp_path, menu_world(tmp_path, capture(lines, rows=30, alternate=True)), summary=False)
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert answer.text == (
+            "dev, fpga: Claude Code is waiting for your answer. The screen says: "
+            '"⏺ I can set the high score table up in a few ways. / How big should the high score table be? / '
+            '❯ Small / ❯ Medium / Large"'
+        )
+    finally:
+        await c.manager.shutdown("test finished")
+
+
+async def test_status_of_a_menu_with_long_descriptions(tmp_path: Path) -> None:
+    c = await build_status(
+        tmp_path, menu_world(tmp_path, capture(described_menu_lines(6), rows=30, alternate=False)), summary=False
+    )
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert 'Options: 1 "A", selected; 2 "B".' in answer.text
+        assert QUESTION in answer.text
+    finally:
+        await c.manager.shutdown("test finished")
+
+
+async def test_no_cut_note_when_the_whole_menu_fits_a_short_alternate_pane(tmp_path: Path) -> None:
+    text = capture(menu_lines(), rows=12, alternate=True)
+    c = await build_status(tmp_path, menu_world(tmp_path, text, height=12, alternate=True), summary=False)
+    try:
+        answer = await c.tools.remote_status("dev", "fpga", None)
+        assert answer.text == HEURISTIC
     finally:
         await c.manager.shutdown("test finished")
