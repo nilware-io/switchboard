@@ -26,6 +26,7 @@ from mcp.types import (
 
 from ..clock import ago, now_ms
 from ..text import plural
+from .links import LINK_TTL_WORDS, Link
 from .protocol import ATTACHMENT_CAPS, AttachmentInfo
 from .speech import quote
 
@@ -39,6 +40,12 @@ MAX_CONCURRENT_FETCHES = 1
 """Attachment fetches in flight on the hub at once (a 250 MB video needs about twice its size while
 it is reassembled and checked, and the check runs in a worker thread)."""
 BUSY_WORDS = "I am already fetching an attachment. Try again in a moment."
+EMBED_MAX_BYTES = 16 * 1024 * 1024
+"""The largest video returned inside the tool result (about 22 MB of base64, the size the
+contract had before the 250 MB cap); a larger one gets a one-time link (`links.py`)."""
+LINK_FETCH_SECONDS = 600
+"""How long a large video's fetch may run on after its tool call has answered (250 MB at about
+0.5 MB/s); it holds the hub's one fetch slot meanwhile."""
 SPOKEN_ATTACHMENTS = 5
 KIND_WORDS = {"image": "an image", "audio": "audio", "video": "a video"}
 KIND_NOUNS = {"image": "image", "audio": "audio file", "video": "video"}
@@ -71,9 +78,10 @@ class Media:
 
 
 def size_words(size: int) -> str:
-    if size < 1024 * 1024:
-        return f"{max(1, round(size / 1024))} KB"
-    return f"{size / (1024 * 1024):.1f} MB"
+    """Decimal units, as people say them: the 250 MB video cap is spoken as 250.0 MB."""
+    if size < 1_000_000:
+        return f"{max(1, round(size / 1000))} KB"
+    return f"{size / 1_000_000:.1f} MB"
 
 
 def media_content(answer_text: str, media: Media) -> CallToolResult:
@@ -196,6 +204,23 @@ def format_sent(media: Media, mtime: int | None, now: int) -> str:
     if media.kind != "image":
         text += " Tags inside audio and video files may not all be removed."
     return text
+
+
+def format_link(link: Link, url: str, mtime: int | None, now: int) -> str:
+    when = f", from {ago(now - mtime)}" if mtime is not None else ""
+    return (
+        f"Video {quote(link.name)} from {link.machine}, {size_words(len(link.data))}{when}. It is too large to "
+        f"play inside this answer, so I put a link in the chat, valid for {LINK_TTL_WORDS}. The file name comes "
+        "from the machine. Tags inside audio and video files may not all be removed. "
+        f"Link (do not read it aloud): {url}"
+    )
+
+
+def format_still_coming(machine: str, entry: AttachmentInfo) -> str:
+    return (
+        f"The video {quote(entry.name)} from {machine} is {size_words(entry.size)}, so it takes a while to arrive "
+        "and be checked. Ask me for it again in a moment and I will put a link in the chat."
+    )
 
 
 def refusal_words(code: str | None, machine: str, name: str | None) -> str | None:

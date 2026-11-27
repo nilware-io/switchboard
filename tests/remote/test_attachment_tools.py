@@ -21,7 +21,7 @@ from mcp.types import AudioContent, BlobResourceContents, EmbeddedResource, Imag
 from tests.helpers import FakeClock, claude_config
 from tests.remote.agent_helpers import MachineLink, agent_machine, agents_section, socket_dir, wait_until
 from tests.remote.helpers import RemoteWorld, machine
-from tests.remote.media_fixtures import GPS, SVG, exif_segment, jpeg, mp3, mp4, png
+from tests.remote.media_fixtures import GPS, SVG, exif_segment, jpeg, mp3, mp4, png, write_sparse_mkv
 from voice_coding_mcp.config import Config, parse_config
 from voice_coding_mcp.log import silent_logger
 from voice_coding_mcp.mcp import McpServerOptions, create_mcp_server
@@ -454,7 +454,56 @@ async def test_a_large_video_over_the_agent_transport(tmp_path: Path) -> None:
             assert not answer.is_error, answer.text
             assert answer.media is not None
             assert answer.media.data == d.media_check("clip.mp4", video)[2]
-            assert answer.text.startswith('Video "clip.mp4" from laptop, 6.0 MB')
+            assert answer.text.startswith('Video "clip.mp4" from laptop, 6.3 MB')
+        finally:
+            await tools.stop()
+            link.stop()
+            await manager.shutdown("test over")
+
+
+async def test_a_250_mb_video_over_the_agent_transport_gets_a_link(tmp_path: Path) -> None:
+    """The largest video there may be, through the real relay and serve-mode dispatcher: about 5 s
+    on a desktop machine (the answer may first say it is still coming, then the next call has the
+    link). Slow by this suite's standards, but it is the only test of 250 chunks end to end."""
+    with socket_dir() as directory:
+        world = RemoteWorld.create(tmp_path)
+        cap = d.ATTACHMENT_CAPS["video"]
+        box = Path(world.home) / d.OUTBOX_DIR
+        box.mkdir(parents=True)
+        write_sparse_mkv(str(box / "take.mkv"), cap)
+        config = make_config(
+            tmp_path,
+            [agent_machine("laptop", allowAttachments=True, allowUsage=False)],
+            agents=agents_section(directory),
+        )
+        manager = await make_manager(config)
+        tools = RemoteTools(
+            RemoteToolsOptions(
+                config=config,
+                manager=manager,
+                logger=silent_logger,
+                base_env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)},
+                now=FakeClock(T0),
+            )
+        )
+        await tools.start()
+        link = MachineLink(world, str(directory / "hub.sock"), "laptop", FORCED)
+        try:
+            await wait_until(lambda: tools.agents is not None and tools.agents.live("laptop") is not None)
+            answer = await tools.remote_attachment("laptop", "take.mkv", None, OWNER)
+            for _ in range(10):
+                if "still" not in answer.text and "a while to arrive" not in answer.text:
+                    break
+                answer = await tools.remote_attachment("laptop", "take.mkv", None, OWNER)
+            assert not answer.is_error, answer.text
+            assert "Link (do not read it aloud): https://vcm.example.com/attachments/" in answer.text
+            token = answer.text.rsplit("/", 1)[1]
+            held = tools.links.get(token)
+            assert held is not None
+            assert len(held.data) == cap
+            assert b"OBS Studio" not in held.data[:4096]
+            rows, _ = read_audit(config.state_dir)
+            assert [r["outcome"] for r in rows if r["event"] == "remote_attachment"] == ["link"]
         finally:
             await tools.stop()
             link.stop()

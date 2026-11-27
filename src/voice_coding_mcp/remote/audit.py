@@ -143,6 +143,43 @@ class AuditLog:
         self._append(line)
         return line
 
+    def record_link(
+        self,
+        *,
+        link: str,
+        machine: str,
+        name: str,
+        kind: str,
+        size: int,
+        outcome: str,
+        expires: int | None = None,
+        requests: int | None = None,
+        ranges: int | None = None,
+        served: int | None = None,
+    ) -> dict[str, Any]:
+        """Appends an `attachment_link` line: outcome `created` (with `expiresAt`), or how the link
+        ended (`expired`, `evicted`, `served_limit`, `closed`) with the requests, range requests
+        and bytes it served. The token only as its fingerprint, the file name as an HMAC."""
+        key = load_key(self.state_dir)
+        line: dict[str, Any] = {
+            "time": to_iso(self.now()),
+            "event": "attachment_link",
+            "link": link,
+            "machine": machine,
+            "nameHmac": text_hmac(key, name),
+            "kind": kind,
+            "bytes": size,
+            "outcome": outcome,
+        }
+        if expires is not None:
+            line["expiresAt"] = to_iso(expires)
+        if requests is not None:
+            line["requests"] = requests
+            line["ranges"] = ranges
+            line["bytesServed"] = served
+        self._append(line)
+        return line
+
     def _append(self, line: dict[str, Any]) -> None:
         data = (json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
