@@ -7,6 +7,7 @@ relay) to a Discord MockTransport."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 from collections.abc import Sequence
@@ -24,9 +25,9 @@ from voice_coding_mcp.config import parse_config
 from voice_coding_mcp.log import silent_logger
 from voice_coding_mcp.remote import dispatcher as d
 from voice_coding_mcp.remote import hook as h
-from voice_coding_mcp.remote.config import DiscordConfig, EventsConfig, MachineConfig, RemoteConfig
+from voice_coding_mcp.remote.config import DiscordConfig, EventsConfig, MachineConfig, RemoteConfig, WatchConfig
 from voice_coding_mcp.remote.discord import DiscordNotifier
-from voice_coding_mcp.remote.events import EventPoller, EventPollerOptions, check_event
+from voice_coding_mcp.remote.events import HOOKS_COVER_MS, EventPoller, EventPollerOptions, check_event
 from voice_coding_mcp.remote.incidents import (
     IncidentLog,
     IncidentTracker,
@@ -34,9 +35,12 @@ from voice_coding_mcp.remote.incidents import (
     TrackerOptions,
     event_entry,
 )
+from voice_coding_mcp.remote.inventory import MachineView
+from voice_coding_mcp.remote.pending import PendingEntry, PendingKind, PendingReport, TrackedSession
 from voice_coding_mcp.remote.protocol import EventsResponse, SessionEvent, parse_response
 from voice_coding_mcp.remote.tools import RemoteTools, RemoteToolsOptions
 from voice_coding_mcp.remote.transport import TransportResult, dispatcher_error
+from voice_coding_mcp.remote.watcher import Watcher, WatcherOptions
 from voice_coding_mcp.tasks.manager import TaskManager, TaskManagerOptions
 
 T0 = 1_795_000_000_000
@@ -401,6 +405,98 @@ async def test_an_old_dispatcher_or_no_opt_in_is_asked_again_later(tmp_path: Pat
     hub.poller.tick()
     await asyncio.sleep(0.05)
     assert len(hub.fake.calls) == 2
+    await hub.discord.aclose()
+
+
+async def test_the_watcher_stands_down_for_waits_the_hooks_report(tmp_path: Path, world: RemoteWorld) -> None:
+    """Once a machine's hooks deliver events, the watcher's own "needs a decision" pushes for that
+    machine stand down (the hook's event says it already); other machines, and the same machine
+    after HOOKS_COVER_MS without events, push as before."""
+    hub = Hub(tmp_path, world)
+    sent: list[str] = []
+    reports: list[PendingReport] = []
+
+    async def check() -> PendingReport:
+        return reports.pop(0)
+
+    async def send(text: str) -> None:
+        sent.append(text)
+
+    watcher = Watcher(
+        WatcherOptions(
+            watch=WatchConfig(interval_seconds=60),
+            check=check,
+            send=send,
+            state_dir=hub.state,
+            logger=silent_logger,
+            now=hub.clock,
+            hooks_cover=hub.poller.covers,
+        )
+    )
+
+    def waits(*machines: str, kind: PendingKind = "permission") -> PendingReport:
+        sessions = [
+            TrackedSession(
+                key=f"{m}|%1|{SESSION}", machine=m, place=f"fpga on {m}", status="waiting", status_updated_at=None
+            )
+            for m in machines
+        ]
+        entries = [
+            PendingEntry(
+                key=f"{s.key}|{kind}",
+                session=s,
+                label=f"On {s.machine}, fpga",
+                kind=kind,
+                question=None,
+                source="registry",
+                permission_answers=False,
+            )
+            for s in sessions
+        ]
+        views = [MachineView(machine=MachineConfig(name=m, transport="local", sessions=["fpga"])) for m in machines]
+        return PendingReport(
+            entries=tuple(entries), sessions=tuple(sessions), views=tuple(views), partial=(), unknown=frozenset()
+        )
+
+    async def tick(report: PendingReport) -> list[str]:
+        reports.append(report)
+        return await watcher.tick()
+
+    # No events taken yet: the watcher pushes as before.
+    assert not hub.poller.covers("laptop", "permission")
+    assert await tick(waits("laptop")) == ["fpga on laptop needs a decision."]
+    assert await tick(waits()) == []
+    spool(world, note())
+    await hub.poller.poll("laptop")
+    assert hub.poller.covers("laptop", "permission")
+    assert hub.poller.covers("laptop", "question")
+    assert not hub.poller.covers("dev", "permission")
+    # Covered: no push for laptop, dev still pushes; a question stands down too.
+    assert await tick(waits("laptop", "dev")) == ["fpga on dev needs a decision."]
+    assert await tick(waits("laptop", kind="question")) == []
+    assert await tick(waits()) == []
+    # The cover survives a restart of the hub (events.json).
+    restarted = hub.new_poller()
+    restarted.load()
+    assert restarted.covers("laptop", "permission")
+    # Without events for HOOKS_COVER_MS the watcher pushes again.
+    hub.clock.t += HOOKS_COVER_MS
+    assert not hub.poller.covers("laptop", "permission")
+    assert await tick(waits("laptop")) == ["fpga on laptop needs a decision."]
+    await hub.discord.aclose()
+
+
+async def test_without_discord_the_watcher_keeps_pushing(tmp_path: Path, world: RemoteWorld) -> None:
+    hub = Hub(tmp_path, world)
+    spool(world, note())
+    await hub.poller.poll("laptop")
+    assert hub.poller.covers("laptop", "permission")
+    only_finished = DiscordNotifier(URL, DiscordConfig(kinds=["finished"]), silent_logger)
+    for discord in (None, only_finished):
+        poller = EventPoller(dataclasses.replace(hub.poller._opts, discord=discord))
+        poller.load()
+        assert not poller.covers("laptop", "permission")
+    await only_finished.aclose()
     await hub.discord.aclose()
 
 

@@ -60,6 +60,11 @@ WHAT = {
     "owner_note": "a session sent a note",
 }
 UNSUPPORTED = ("bad_request", "not_allowed", "events_unsafe")
+HOOKS_COVER_MS = 6 * HOUR_MS
+"""A machine whose hooks delivered an event this recently counts as covered by its hooks: the
+watcher's own "needs a decision" pushes for it stand down (`EventPoller.covers`)."""
+COVERED_KINDS = {"permission": "approval_needed", "question": "question"}
+"""The watcher's wait kinds and the session event kind that reports the same wait."""
 """Refusals that mean the machine does not hand out events (an older dispatcher, no
 `--allow-events`, a spool directory others can write): asked again after UNSUPPORTED_RETRY_MS."""
 
@@ -161,6 +166,8 @@ class EventPoller:
         self._last_poll: dict[str, int] = {}
         self._unsupported: dict[str, int] = {}
         self._busy: set[str] = set()
+        self._hooked: dict[str, int] = {}
+        """Machine name: when the hub last took events from its hooks (ms)."""
         self._loop: asyncio.Task[None] | None = None
         self._polls: set[asyncio.Task[None]] = set()
         self.delivered = 0
@@ -185,17 +192,39 @@ class EventPoller:
             for name, ids in acks.items():
                 if name in self._machines and isinstance(ids, list):
                     self._acks[name] = [i for i in ids if isinstance(i, str) and EVENT_ID_RE.fullmatch(i)][:16]
+        hooked = data.get("hooked")
+        if isinstance(hooked, dict):
+            for name, at in hooked.items():
+                if name in self._machines and isinstance(at, int) and not isinstance(at, bool):
+                    self._hooked[name] = at
 
     def _save(self) -> None:
         with contextlib.suppress(OSError):
             ensure_dir(self._opts.state_dir)
-            write_json_atomic(self._path, {"version": 1, "seen": list(self._seen), "acks": self._acks})
+            write_json_atomic(
+                self._path, {"version": 1, "seen": list(self._seen), "acks": self._acks, "hooked": self._hooked}
+            )
 
     def _remember(self, key: str) -> None:
         if len(self._seen) == self._seen.maxlen:
             self._seen_set.discard(self._seen[0])
         self._seen.append(key)
         self._seen_set.add(key)
+
+    def covers(self, machine: str, kind: str) -> bool:
+        """True when the machine's session hooks report this kind of wait (`permission` or
+        `question`) to the owner: events are on, the machine handed out events in the last
+        HOOKS_COVER_MS, and Discord is on and takes that event kind. The watcher then does not
+        push the same wait again; without Discord the events only reach the incident log, so the
+        watcher keeps pushing."""
+        event_kind = COVERED_KINDS.get(kind)
+        discord = self._opts.discord
+        if not self._opts.events.enabled or event_kind is None or discord is None or not discord.wants(event_kind):
+            return False
+        if machine in self._unsupported:
+            return False
+        at = self._hooked.get(machine)
+        return at is not None and 0 <= self._now() - at < HOOKS_COVER_MS
 
     # --- loop -------------------------------------------------------------------------------
 
@@ -276,6 +305,8 @@ class EventPoller:
                 return
             taken = [event.id for event in data.events]
             changed = bool(acks) or bool(taken)
+            if taken:
+                self._hooked[name] = self._now()
             self._acks[name] = taken
             for event in data.events:
                 key = f"{name}|{event.id}"

@@ -378,6 +378,7 @@ def create_app(options: CreateAppOptions) -> Starlette:
                 send=watch_send,
                 state_dir=config.state_dir,
                 logger=options.logger.child({"component": "watch"}),
+                hooks_cover=remote_tools.events.covers,
             )
         )
         if config.watch.interval_seconds > 0 and watch_send is not None
