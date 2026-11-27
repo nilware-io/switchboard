@@ -79,7 +79,7 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 1. Your own copy of the repository at a commit you checked, exactly as in [SETUP-WSL.md](SETUP-WSL.md#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root) (`git clone`, `git checkout --detach <commit>`, `git rev-parse HEAD`, `git status --porcelain`). Two files from it run as you: the dispatcher and the connector. Never copy them from the hub.
 
-2. Read both, then install them. The dispatcher is one Python file of about 3400 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 450 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
+2. Read both, then install them. The dispatcher is one Python file of about 4100 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 450 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
 
    ```sh
    cd ~/src/switchboard

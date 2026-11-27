@@ -79,6 +79,7 @@ This fork (nilware-io/switchboard) adds tools to talk to Claude Code sessions th
 - `remote_send` and `remote_send_confirm`: type an instruction into a session after a read-back and your yes in a later turn; off by default, opt-in per machine in two places.
 - `remote_send_keys` and `remote_resize`: answer a menu on a session's screen with keys (arrows, enter, escape, a choice number) or make a window bigger, with the same read-back and confirm; same opt-ins as `remote_send`.
 - `usage_report` and `voice-coding-mcp usage`: active hours, billable amount and token cost per project or session.
+- `timesheet_summary` and `voice-coding-mcp timesheet`: a draft timesheet per client and project (owner hours, agent hours, commits, pull requests) that you adjust and approve before exporting it; nothing is sent anywhere.
 
 How it is built:
 

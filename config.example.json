@@ -78,5 +78,22 @@
     "overlap": "union",
     "maxTranscriptMegabytes": 512,
     "prices": {}
+  },
+  "timesheet": {
+    "timeZone": "Europe/Zurich",
+    "clients": { "acme": { "name": "Acme AG" } },
+    "projects": {
+      "web": { "client": "acme", "aliases": ["web-*"], "repos": ["acme/web"], "paths": [] }
+    },
+    "authorEmails": ["owner@example.com"],
+    "githubLogins": ["owner-login"],
+    "roundingMinutes": 0,
+    "roundingMode": "nearest",
+    "ownerOverlap": "split",
+    "recordVoice": true,
+    "voiceApproval": true,
+    "ghBin": "gh",
+    "gitBin": "git",
+    "commandTimeoutSeconds": 20
   }
 }

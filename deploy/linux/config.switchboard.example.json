@@ -51,5 +51,12 @@
     "send": { "confirmSeconds": 120, "maxChars": 2000, "maxPending": 1, "minConfirmSeconds": 4, "slashCommands": [] }
   },
   "watch": { "intervalSeconds": 0, "longTurnMinutes": 10, "notifyUnreachable": false, "includeQuestion": false },
-  "usage": { "idleGapMinutes": 15, "hourlyRate": 40, "currency": "EUR", "overlap": "union" }
+  "usage": { "idleGapMinutes": 15, "hourlyRate": 40, "currency": "EUR", "overlap": "union" },
+  "timesheet": {
+    "timeZone": "Europe/Zurich",
+    "clients": { "acme": { "name": "Acme AG" } },
+    "projects": { "web": { "client": "acme", "aliases": ["web-*"], "repos": ["acme/web"] } },
+    "authorEmails": ["owner@example.com"],
+    "githubLogins": ["owner-login"]
+  }
 }

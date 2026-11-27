@@ -75,7 +75,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from typing import BinaryIO
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 PROTOCOL = 1
 VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize", "attachments", "attachment", "health")
 PROGRAM = "switchboard-remote"
@@ -90,6 +90,11 @@ SLASH_COMMAND_RE = re.compile(r"[a-z][a-z0-9:-]{0,31}")
 PATH_RE = re.compile(r"/[A-Za-z0-9._/-]{1,255}")
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 REGISTRY_FILE_RE = re.compile(r"[0-9]+\.json")
+AGENT_FILE_RE = re.compile(r"agent-([A-Za-z0-9]{1,40})\.jsonl")
+"""A subagent or workflow agent transcript under `<session id>/subagents/` (0.10.0)."""
+USAGE_FILE_ID_RE = re.compile(UUID_RE.pattern + r"(?::[a-z0-9]{1,40})?")
+"""A transcript id of `usage`: the session id, or `<session id>:<agent id>` for an agent (0.10.0)."""
+ENTRYPOINT_RE = re.compile(r"[A-Za-z0-9._-]{1,32}")
 TMUX_SOCKET_RE = re.compile(r"sb-test-[A-Za-z0-9]{1,32}")
 SEND_NO_SESSION = "none"
 """The `sessionId` argument of a send to a pane that runs no Claude Code (`-` would read as an option)."""
@@ -1554,6 +1559,17 @@ def is_owner_prompt(entry: dict[str, object]) -> bool:
     return prompt
 
 
+def is_other_origin(entry: dict[str, object]) -> bool:
+    """A prompt line that the owner did not type (0.10.0): a task notification or another `origin`
+    that is not `human`, or a compact summary. Still a `u` record (as before), marked `"o": "n"`."""
+    if entry.get("isCompactSummary") is True or entry.get("isVisibleInTranscriptOnly") is True:
+        return True
+    origin = entry.get("origin")
+    if isinstance(origin, dict):
+        return origin.get("kind") != "human"
+    return origin is not None
+
+
 def usage_record(entry: dict[str, object]) -> dict[str, object] | None:
     """The compact usage record of one transcript line, or None. No text, tool input or path."""
     moment = parse_timestamp(entry.get("timestamp"))
@@ -1561,7 +1577,9 @@ def usage_record(entry: dict[str, object]) -> dict[str, object] | None:
         return None
     kind = entry.get("type")
     if kind == "user":
-        return {"t": moment, "k": "u"} if is_owner_prompt(entry) else None
+        if not is_owner_prompt(entry):
+            return None
+        return {"t": moment, "k": "u", "o": "n"} if is_other_origin(entry) else {"t": moment, "k": "u"}
     if kind != "assistant":
         return None
     message = entry.get("message")
@@ -1578,7 +1596,7 @@ def usage_record(entry: dict[str, object]) -> dict[str, object] | None:
         write_5m, write_1h = _tokens(usage.get("cache_creation_input_tokens")), 0
     model = message.get("model")
     model_name = clean_text(model, NAME_MAX) if isinstance(model, str) else ""
-    return {
+    record: dict[str, object] = {
         "t": moment,
         "k": "a",
         "m": model_name or None,
@@ -1590,14 +1608,50 @@ def usage_record(entry: dict[str, object]) -> dict[str, object] | None:
         "cw1": write_1h,
         "cr": _tokens(usage.get("cache_read_input_tokens")),
     }
+    if entry.get("isSidechain") is True:
+        record["sc"] = 1
+    return record
 
 
-def parse_transcript(handle: BinaryIO, limit: int) -> tuple[str, list[dict[str, object]]]:
-    """(project, records) of a transcript opened in binary mode, reading at most `limit` bytes.
-    Lines over MAX_USAGE_LINE_BYTES are skipped; only lines that may carry usage or a prompt are
-    parsed. The project is the basename of the session's latest `cwd`."""
+MAX_GIT_ROOT_DEPTH = 40
+
+
+def work_project(cwd: str, roots: dict[str, str]) -> str:
+    """The project a working directory belongs to (0.10.0): the basename of the nearest directory at
+    or above `cwd` that holds a `.git` entry (a repository or a worktree), else of `cwd` itself. Only
+    `lstat` calls; `roots` caches the answers of one `usage` call."""
+    cwd = cwd.rstrip("/") or "/"
+    found = roots.get(cwd)
+    if found is not None:
+        return found
+    name = clean_text(os.path.basename(cwd), NAME_MAX)
+    path = cwd
+    for _ in range(MAX_GIT_ROOT_DEPTH):
+        if path in ("", "/"):
+            break
+        if os.path.lexists(os.path.join(path, ".git")):
+            name = clean_text(os.path.basename(path), NAME_MAX)
+            break
+        path = os.path.dirname(path)
+    roots[cwd] = name
+    return name
+
+
+def parse_transcript_details(
+    handle: BinaryIO, limit: int, *, agent: bool = False, roots: dict[str, str] | None = None
+) -> tuple[str, list[dict[str, object]], str | None, str]:
+    """(project, records, entrypoint, work project) of a transcript opened in binary mode, reading at
+    most `limit` bytes. Lines over MAX_USAGE_LINE_BYTES are skipped; only lines that may carry usage
+    or a prompt are parsed. The project is the basename of the session's latest `cwd` (for an agent
+    transcript, of its own lines; a session ignores the sidechain lines in it). Since 0.10.0 the
+    entrypoint is that of the first line that names one, the work project is `work_project` of the
+    same latest `cwd`, and a record gets `"p"` with the work project of its own line's `cwd` when that
+    differs from the transcript's work project."""
+    roots = {} if roots is None else roots
     project = ""
-    records: list[dict[str, object]] = []
+    latest_cwd = ""
+    entrypoint: str | None = None
+    records: list[tuple[dict[str, object], str]] = []
     left = limit
     skipping = False
     while left > 0:
@@ -1618,11 +1672,32 @@ def parse_transcript(handle: BinaryIO, limit: int) -> tuple[str, list[dict[str, 
         if not isinstance(entry, dict):
             continue
         cwd = entry.get("cwd")
-        if isinstance(cwd, str) and cwd.strip("/") and entry.get("isSidechain") is not True:
-            project = clean_text(os.path.basename(cwd.rstrip("/")), NAME_MAX)
+        line_project = ""
+        if isinstance(cwd, str) and cwd.strip("/"):
+            absolute = cwd.startswith("/")
+            line_project = work_project(cwd, roots) if absolute else ""
+            if agent or entry.get("isSidechain") is not True:
+                project = clean_text(os.path.basename(cwd.rstrip("/")), NAME_MAX)
+                latest_cwd = cwd if absolute else ""
+        if entrypoint is None:
+            found = entry.get("entrypoint")
+            if isinstance(found, str) and ENTRYPOINT_RE.fullmatch(found):
+                entrypoint = found
         record = usage_record(entry)
         if record is not None:
-            records.append(record)
+            records.append((record, line_project))
+    main = work_project(latest_cwd, roots) if latest_cwd else ""
+    out = []
+    for record, line_project in records:
+        if line_project and line_project != main:
+            record["p"] = line_project
+        out.append(record)
+    return project, out, entrypoint, main
+
+
+def parse_transcript(handle: BinaryIO, limit: int) -> tuple[str, list[dict[str, object]]]:
+    """(project, records) of a session transcript, see `parse_transcript_details`."""
+    project, records, _entrypoint, _main = parse_transcript_details(handle, limit)
     return project, records
 
 
@@ -1652,15 +1727,38 @@ def read_usage_known(stdin: object) -> dict[str, tuple[int, int]]:
         if not isinstance(item, dict):
             raise RefusedError("bad_request")
         file_id, size, mtime = item.get("id"), _number(item.get("size")), _number(item.get("mtime"))
-        if not isinstance(file_id, str) or not UUID_RE.fullmatch(file_id) or size is None or mtime is None:
+        if not isinstance(file_id, str) or not USAGE_FILE_ID_RE.fullmatch(file_id) or size is None or mtime is None:
             raise RefusedError("bad_request")
         known[file_id] = (size, mtime)
     return known
 
 
+def _agent_files(directory: str, session_id: str, seen: set[str], out: list[tuple[str, str, int, int]]) -> None:
+    """The agent transcripts `agent-<id>.jsonl` directly inside `directory`, as `<session id>:<id>`."""
+    try:
+        files = sorted(os.scandir(directory), key=lambda item: item.name)
+    except OSError:
+        return
+    for item in files:
+        found = AGENT_FILE_RE.fullmatch(item.name)
+        if found is None:
+            continue
+        file_id = f"{session_id}:{found.group(1).lower()}"
+        try:
+            if file_id in seen or not item.is_file(follow_symlinks=False):
+                continue
+            info = item.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        seen.add(file_id)
+        out.append((file_id, item.path, info.st_size, info.st_mtime_ns // 1_000_000))
+
+
 def transcript_files(home: str) -> list[tuple[str, str, int, int]]:
-    """(session id, path, size, mtime ms) of `<home>/projects/*/<uuid>.jsonl`: top level of each
-    project directory only, no symlinks, the first file of an id wins."""
+    """(transcript id, path, size, mtime ms) of `<home>/projects/*/<uuid>.jsonl`: top level of each
+    project directory only, no symlinks, the first file of an id wins. Since 0.10.0 also the agent
+    transcripts of each session, `<uuid>/subagents/agent-<id>.jsonl` and
+    `<uuid>/subagents/workflows/<run>/agent-<id>.jsonl`, with the id `<uuid>:<id>`."""
     out: list[tuple[str, str, int, int]] = []
     seen: set[str] = set()
     try:
@@ -1674,8 +1772,16 @@ def transcript_files(home: str) -> list[tuple[str, str, int, int]]:
             files = sorted(os.scandir(directory.path), key=lambda item: item.name)
         except OSError:
             continue
+        sessions: list[tuple[str, str]] = []
         for item in files:
             name = item.name
+            if UUID_RE.fullmatch(name):
+                try:
+                    if item.is_dir(follow_symlinks=False):
+                        sessions.append((name.lower(), item.path))
+                except OSError:
+                    pass
+                continue
             if not name.endswith(".jsonl") or not UUID_RE.fullmatch(name[:-6]):
                 continue
             file_id = name[:-6].lower()
@@ -1687,6 +1793,24 @@ def transcript_files(home: str) -> list[tuple[str, str, int, int]]:
                 continue
             seen.add(file_id)
             out.append((file_id, item.path, info.st_size, info.st_mtime_ns // 1_000_000))
+        for session_id, path in sessions:
+            subagents = os.path.join(path, "subagents")
+            if os.path.islink(subagents):
+                continue
+            _agent_files(subagents, session_id, seen, out)
+            workflows = os.path.join(subagents, "workflows")
+            if os.path.islink(workflows):
+                continue
+            try:
+                runs = sorted(os.scandir(workflows), key=lambda item: item.name)
+            except OSError:
+                continue
+            for run in runs:
+                try:
+                    if run.is_dir(follow_symlinks=False):
+                        _agent_files(run.path, session_id, seen, out)
+                except OSError:
+                    continue
     return out
 
 
@@ -1694,10 +1818,12 @@ def usage_documents(
     home: str, since_ms: int, max_bytes: int, known: dict[str, tuple[int, int]]
 ) -> Iterator[dict[str, object]]:
     """The usage lines for transcripts modified since `since_ms` whose (size, mtime) differs from
-    `known`: per file a header `{"file", "size", "mtime", "project", "records"}` and its records, or
-    `{"file", "size", "mtime", "skipped": true}` when it is larger than `max_bytes`; then
-    `{"done": true, "gone": [known ids that no longer exist]}`."""
+    `known`: per file a header `{"file", "size", "mtime", "project", "records"}` (since 0.10.0 also
+    `"ep"`, the entrypoint, when known, and `"wp"`, the work project, when it differs from
+    `project`) and its records, or `{"file", "size", "mtime", "skipped": true}` when it is larger than
+    `max_bytes`; then `{"done": true, "gone": [known ids that no longer exist]}`."""
     present: set[str] = set()
+    roots: dict[str, str] = {}
     for file_id, path, size, mtime in transcript_files(home):
         present.add(file_id)
         if mtime < since_ms or known.get(file_id) == (size, mtime):
@@ -1708,10 +1834,23 @@ def usage_documents(
         try:
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(fd, "rb") as handle:
-                project, records = parse_transcript(handle, size)
+                project, records, entrypoint, main = parse_transcript_details(
+                    handle, size, agent=":" in file_id, roots=roots
+                )
         except OSError:
             continue
-        yield {"file": file_id, "size": size, "mtime": mtime, "project": project, "records": len(records)}
+        header: dict[str, object] = {
+            "file": file_id,
+            "size": size,
+            "mtime": mtime,
+            "project": project,
+            "records": len(records),
+        }
+        if entrypoint is not None:
+            header["ep"] = entrypoint
+        if main and main != project:
+            header["wp"] = main
+        yield header
         yield from records
     yield {"done": True, "gone": sorted(set(known) - present)}
 
