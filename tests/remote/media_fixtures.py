@@ -86,11 +86,18 @@ def riff(form: bytes, *chunks: bytes) -> bytes:
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
-def webp(*extra: bytes, flags: int = 0) -> bytes:
-    """A VP8X WebP with a VP8L image chunk; `extra` chunks after it."""
+WEBP_IMAGE = riff_chunk(b"VP8L", b"\x2f\x00\x00\x00\x00\x07\x10\x11\x88\x88\xfe\x07\x00")
+
+
+def webp(*extra: bytes) -> bytes:
+    """A simple lossless WebP (one VP8L chunk); `extra` chunks after it."""
+    return riff(b"WEBP", WEBP_IMAGE, *extra)
+
+
+def webp_extended(*extra: bytes, flags: int = 0) -> bytes:
+    """An extended (VP8X) WebP with a VP8L image chunk: refused by the media check."""
     vp8x = riff_chunk(b"VP8X", bytes([flags, 0, 0, 0]) + b"\x00\x00\x00\x00\x00\x00")
-    image = riff_chunk(b"VP8L", b"\x2f\x00\x00\x00\x00\x07\x10\x11\x88\x88\xfe\x07\x00")
-    return riff(b"WEBP", vp8x, image, *extra)
+    return riff(b"WEBP", vp8x, WEBP_IMAGE, *extra)
 
 
 # --- audio -----------------------------------------------------------------------------------

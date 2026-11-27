@@ -44,6 +44,7 @@ from tests.remote.media_fixtures import (
     wav,
     webm,
     webp,
+    webp_extended,
     zip_of_secret,
     zip_secret,
 )
@@ -164,10 +165,8 @@ def test_exif_gps_and_text_are_stripped_from_images() -> None:
     assert clean == png()
     _, _, clean = d.media_check("anim.gif", gif(gif_comment(GPS)))
     assert clean == gif()
-    with_exif = webp(riff_chunk(b"EXIF", b"MM\x00\x2a" + GPS), riff_chunk(b"XMP ", GPS), flags=0x0C)
-    _, _, clean = d.media_check("pic.webp", with_exif)
-    assert GPS not in clean
-    assert clean == webp(flags=0)
+    with_exif = webp_extended(riff_chunk(b"EXIF", b"MM\x00\x2a" + GPS), riff_chunk(b"XMP ", GPS), flags=0x0C)
+    assert refused("pic.webp", with_exif) == "not_media"
 
 
 def test_tags_are_stripped_from_mp3_wav_flac_and_mp4() -> None:
@@ -639,3 +638,19 @@ def test_webm_needs_a_video_track() -> None:
     )
     assert audio_only != webm()
     assert refused("x.webm", audio_only) == "not_media"
+
+
+def test_only_simple_webp_is_accepted() -> None:
+    """The extended format's extra chunks (red team, round 3: ZIP data in a last ANIM or ALPH
+    chunk, bytes after a VP8X header, EXIF inside an ANMF frame) cannot carry anything, because
+    the extended format is refused as a whole."""
+    zip_bytes = b"PK\x03\x04" + bytes(26) + b".env"
+    assert refused("pic.webp", webp_extended()) == "not_media"
+    assert refused("pic.webp", webp_extended(riff_chunk(b"ANIM", zip_bytes), flags=0x02)) == "not_media"
+    assert refused("pic.webp", webp_extended(riff_chunk(b"ALPH", zip_bytes), flags=0x10)) == "not_media"
+    anmf = riff_chunk(b"ANMF", bytes(16) + riff_chunk(b"EXIF", b"MM\x00\x2a" + GPS))
+    assert refused("pic.webp", webp_extended(anmf, flags=0x02)) == "not_media"
+    assert refused("pic.webp", webp(riff_chunk(b"VP8L", b"\x2f\x00\x00\x00\x00"))) == "not_media"
+    assert refused("pic.webp", webp(riff_chunk(b"ICCP", zip_bytes))) == "not_media"
+    _, _, clean = d.media_check("pic.webp", webp())
+    assert clean == webp()

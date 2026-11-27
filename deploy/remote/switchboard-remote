@@ -1722,8 +1722,7 @@ GIF_KEEP_APPS = (b"\x0bNETSCAPE2.0", b"\x0bANIMEXTS1.0")
 """Application extensions kept (looping), only as exactly one 3-byte sub-block (id 1 and the loop
 count); others (XMP), longer ones, comments and plain text are dropped. A Graphic Control Extension
 is kept only as exactly one 4-byte sub-block."""
-WEBP_CHUNKS = (b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP", b"EXIF", b"XMP ")
-WEBP_STRIP = (b"EXIF", b"XMP ")
+WEBP_CHUNKS = (b"VP8 ", b"VP8L")
 WAV_KEEP = (b"fmt ", b"fact", b"data")
 """WAV chunks kept (an allowlist), each exactly once; LIST (INFO tags), id3, bext, cue points,
 sampler data and any other chunk are dropped."""
@@ -2309,38 +2308,30 @@ def _rebuild_riff(data: bytes, form: bytes, kept: list[bytes]) -> bytes:
 
 
 def _webp_size(kind: bytes, payload: bytes) -> None:
-    """Both sides of the canvas (VP8X) or of a single image (VP8L, VP8) within MAX_IMAGE_SIDE."""
-    if kind == b"VP8X":
-        _side(_le(payload, 4, 3) + 1)
-        _side(_le(payload, 7, 3) + 1)
-    elif kind == b"VP8L":
-        _need(_be(payload, 0, 1) == 0x2F)
+    """Both sides of a simple WebP image (VP8L, VP8) within MAX_IMAGE_SIDE."""
+    if kind == b"VP8L":
+        _need(len(payload) >= 5 and _be(payload, 0, 1) == 0x2F)
         bits = _le(payload, 1, 4)
         _side((bits & 0x3FFF) + 1)
         _side(((bits >> 14) & 0x3FFF) + 1)
     else:
-        _need(payload[3:6] == b"\x9d\x01\x2a")
+        _need(len(payload) >= 10 and payload[3:6] == b"\x9d\x01\x2a")
         _side(_le(payload, 6, 2) & 0x3FFF)
         _side(_le(payload, 8, 2) & 0x3FFF)
 
 
 def _webp(data: bytes, budget: _Budget) -> bytes:
+    """Simple WebP only: exactly one chunk, `VP8 ` (lossy) or `VP8L` (lossless), covering the
+    file, with a zero padding byte. The extended format (`VP8X`, with `ALPH`, `ANIM`, `ANMF`,
+    `ICCP`, `EXIF`, `XMP `) is refused: its extra chunks are places to carry other bytes, and a
+    simple WebP has nowhere to keep metadata, so nothing needs stripping."""
     chunks = _riff(data, b"WEBP", budget)
-    _need(bool(chunks) and chunks[0][0] in (b"VP8 ", b"VP8L", b"VP8X"))
-    first, start, end = chunks[0]
-    _webp_size(first, data[start + 8 : end])
-    kept = []
-    for kind, start, end in chunks:
-        _need(kind in WEBP_CHUNKS)
-        if kind in WEBP_STRIP:
-            continue
-        chunk = data[start:end]
-        if kind == b"VP8X":
-            _need(end - start >= 18)
-            # Clear the EXIF and XMP flags of the dropped chunks.
-            chunk = chunk[:8] + bytes([chunk[8] & ~0x0C & 0xFF]) + chunk[9:]
-        kept.append(chunk)
-    return _rebuild_riff(data, b"WEBP", kept)
+    _need(len(chunks) == 1 and chunks[0][0] in WEBP_CHUNKS)
+    kind, start, end = chunks[0]
+    length = _le(data, start + 4, 4)
+    _need(length & 1 == 0 or data[end - 1] == 0)
+    _webp_size(kind, data[start + 8 : start + 8 + length])
+    return data
 
 
 def _wav_fmt_ok(payload: bytes) -> None:
