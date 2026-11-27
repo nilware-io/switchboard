@@ -18,7 +18,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 from ..usage.records import UsageBatch, UsageStreamError, parse_lines
 
 DISPATCHER_PROGRAM = "switchboard-remote"
-VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage", "keys", "resize", "health")
+VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage", "keys", "resize", "health", "events")
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -169,6 +169,38 @@ class HealthResponse(_Response):
     uptime_seconds: float | None = Field(default=None, alias="uptimeSeconds", ge=0, le=1e12)
 
 
+EVENT_KINDS = ("approval_needed", "question", "finished", "failed", "pr_opened", "owner_note")
+EVENT_LEVELS = ("info", "warning", "urgent")
+EVENT_ID_PATTERN = r"^[0-9]{13}-[0-9]{10}-[0-9a-f]{8}$"
+MAX_EVENTS = 16
+
+
+class SessionEvent(_Response):
+    """One event of a machine's `switchboard-hook` spool (`events`, dispatcher 0.11.0). Everything in
+    it was written by the machine's sessions: untrusted, checked again by `remote/events.py`. A
+    `machine` field, should one appear, is ignored: the machine is the link the answer came on."""
+
+    id: Annotated[str, Field(pattern=EVENT_ID_PATTERN)]
+    kind: str = Field(max_length=32)
+    time: int = Field(ge=0, le=10**13)
+    session_id: str | None = Field(default=None, alias="sessionId", max_length=64)
+    session_name: Name | None = Field(default=None, alias="sessionName")
+    project: Name | None = None
+    pane: str | None = Field(default=None, max_length=8)
+    tmux_session: Name | None = Field(default=None, alias="tmuxSession")
+    message: Annotated[str | None, _capped(500)] = None
+    url: str | None = Field(default=None, max_length=300)
+    level: str | None = Field(default=None, max_length=16)
+
+
+class EventsResponse(_Response):
+    events: Annotated[list[SessionEvent], Field(max_length=MAX_EVENTS)] = Field(default_factory=list)
+    more: bool = False
+    pending: int = Field(default=0, ge=0, le=10**6)
+    full: bool = False
+    bad: int = Field(default=0, ge=0, le=10**6)
+
+
 class UsageResponse(BaseModel):
     """The parsed JSON lines of `usage` (built with `model_construct`, already checked)."""
 
@@ -188,6 +220,7 @@ RESPONSE_MODELS: dict[str, type[_Response]] = {
     "keys": KeysResponse,
     "resize": ResizeResponse,
     "health": HealthResponse,
+    "events": EventsResponse,
 }
 
 

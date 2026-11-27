@@ -23,8 +23,9 @@ Invocation, one of:
   the hub. It reads request frames (newline-delimited JSON) and answers each with the documents the
   forced command would write; the policy comes only from this real argv (refused under sshd).
 
-Policy options: --sessions <globs> (comma separated, required), --allow-usage, --allow-send,
---allow-permission-answers, --send-to-any-pane, --slash-commands <names>, --claude-home <path>.
+Policy options: --sessions <globs> (comma separated, required), --allow-usage, --allow-events,
+--allow-send, --allow-permission-answers, --send-to-any-pane, --slash-commands <names>,
+--claude-home <path>.
 Test only (refused unless SWITCHBOARD_REMOTE_TEST=1 is in the environment): --tmux-socket-name.
 
 Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none> message`
@@ -37,7 +38,9 @@ from KEY_NAMES, only with --allow-send; bound to the menu or permission dialog t
 --allow-send),
 `usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
 only with --allow-usage), `health` (free space and the read-only flag of the file systems that matter,
-load, memory and uptime; read-only, no opt-in, 0.9.0). Every response is one JSON document on stdout,
+load, memory and uptime; read-only, no opt-in, 0.9.0), `events [<eventId>...]` (only with
+--allow-events, 0.11.0: deletes the named events of the switchboard-hook spool, which the hub has
+taken, and answers the next ones, oldest first). Every response is one JSON document on stdout,
 `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`, except a
 successful `usage`, which is JSON lines (a header document, then file headers and token records
 without any text, then `{"done": true, ...}`); the exit code is 0 also for refusals. Nothing from the request ever reaches a shell: tmux runs from argv with
@@ -47,6 +50,7 @@ a fixed environment, and the text of a send reaches tmux only on the stdin of `l
 from __future__ import annotations
 
 import calendar
+import contextlib
 import datetime
 import fnmatch
 import hashlib
@@ -58,6 +62,7 @@ import re
 import secrets
 import select
 import shlex
+import stat
 import subprocess
 import sys
 import threading
@@ -66,9 +71,9 @@ import unicodedata
 from collections.abc import Iterator
 from typing import BinaryIO
 
-VERSION = "0.9.0"
+VERSION = "0.11.0"
 PROTOCOL = 1
-VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize", "health")
+VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize", "health", "events")
 PROGRAM = "switchboard-remote"
 
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}")
@@ -161,7 +166,7 @@ LIST_FIELDS = (
 LIST_FORMAT = "\t".join("#{" + name + "}" for name in LIST_FIELDS)
 
 SERVE_OPTION = "--serve"
-FLAG_OPTIONS = ("--allow-usage", "--allow-send", "--allow-permission-answers", "--send-to-any-pane")
+FLAG_OPTIONS = ("--allow-usage", "--allow-send", "--allow-permission-answers", "--send-to-any-pane", "--allow-events")
 VALUE_OPTIONS = ("--sessions", "--slash-commands", "--claude-home", "--tmux-socket-name")
 
 _INVISIBLE = frozenset(
@@ -183,6 +188,7 @@ class Policy:
     def __init__(self) -> None:
         self.sessions: list[str] = []
         self.allow_usage = False
+        self.allow_events = False
         self.allow_send = False
         self.allow_permission_answers = False
         self.send_to_any_pane = False
@@ -700,6 +706,7 @@ def policy_from_options(options: dict[str, object]) -> Policy:
         raise RefusedError("bad_policy")
     policy.sessions = _split_list(sessions, GLOB_RE, "--sessions")
     policy.allow_usage = options.get("--allow-usage") is True
+    policy.allow_events = options.get("--allow-events") is True
     policy.allow_send = options.get("--allow-send") is True
     policy.allow_permission_answers = options.get("--allow-permission-answers") is True
     policy.send_to_any_pane = options.get("--send-to-any-pane") is True
@@ -733,6 +740,7 @@ def policy_from_file(path: str) -> Policy:
     known = {
         "sessions": "--sessions",
         "allowUsage": "--allow-usage",
+        "allowEvents": "--allow-events",
         "allowSend": "--allow-send",
         "allowPermissionAnswers": "--allow-permission-answers",
         "sendToAnyPane": "--send-to-any-pane",
@@ -843,6 +851,8 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
             or not RESIZE_ROWS[0] <= int(args[4]) <= RESIZE_ROWS[1]
         ):
             raise RefusedError("bad_request")
+    if verb == "events" and (len(args) > MAX_EVENTS or not all(EVENT_ID_RE.fullmatch(arg) for arg in args)):
+        raise RefusedError("bad_request")
     if verb == "usage":
         if len(args) != 2 or not NUMBER_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
             raise RefusedError("bad_request")
@@ -1457,6 +1467,137 @@ def verb_health(
     }
 
 
+# --- events ------------------------------------------------------------------------------------
+#
+# `switchboard-hook` (the Claude Code hooks and the notify_owner MCP server on this machine) writes
+# one small JSON file per event into the spool; `events` hands them to the hub, oldest first, and
+# deletes the ones the hub names as taken. Same user as the hook, but every file is checked again:
+# any process of this user can write there.
+
+EVENTS_PARTS = (".local", "state", "switchboard-hook", "events")
+EVENT_FILE_RE = re.compile(r"([0-9]{13}-[0-9]{10}-[0-9a-f]{8})\.json")
+EVENT_ID_RE = re.compile(r"[0-9]{13}-[0-9]{10}-[0-9a-f]{8}")
+MAX_EVENTS = 16
+"""Events per answer, and ids per request (the argument limit of serve mode)."""
+MAX_EVENT_BYTES = 4096
+EVENT_SPOOL_FULL = 200
+"""switchboard-hook's MAX_SPOOL_FILES: at this count it writes no more."""
+EVENT_KINDS = ("approval_needed", "question", "finished", "failed", "pr_opened", "owner_note")
+EVENT_LEVELS = ("info", "warning", "urgent")
+EVENT_KEYS = ("v", "kind", "time", "sessionId", "sessionName", "project", "pane", "message", "url", "level")
+EVENT_TEXT_LIMITS = {"sessionName": NAME_MAX, "project": NAME_MAX, "message": 500, "url": 300}
+EVENT_URL_RE = re.compile(
+    r"https://github\.com/[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}(?:/[A-Za-z0-9._~%/#=?&+-]{0,200})?"
+)
+_EVENTS_LOCK = threading.Lock()
+
+
+def events_dir(env: dict[str, str]) -> str:
+    return os.path.join(home_dir(env), *EVENTS_PARTS)
+
+
+def _read_event(path: str) -> dict[str, object] | None:
+    """One spool file as an event, or None when it is not one (it is then deleted)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_EVENT_BYTES:
+            return None
+        raw = os.read(fd, MAX_EVENT_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or set(data) != set(EVENT_KEYS) or data["v"] != 1:
+        return None
+    if data["kind"] not in EVENT_KINDS or data["level"] not in (None, *EVENT_LEVELS):
+        return None
+    moment = data["time"]
+    if type(moment) is not int or not 0 < moment < 10**13:
+        return None
+    session_id, pane, url = data["sessionId"], data["pane"], data["url"]
+    if session_id is not None and not (isinstance(session_id, str) and UUID_RE.fullmatch(session_id)):
+        return None
+    if pane is not None and not (isinstance(pane, str) and PANE_ID_RE.fullmatch(pane)):
+        return None
+    if url is not None and not (isinstance(url, str) and len(url) <= 300 and EVENT_URL_RE.fullmatch(url)):
+        return None
+    event: dict[str, object] = {"kind": data["kind"], "time": moment, "sessionId": session_id, "pane": pane}
+    for key, limit in EVENT_TEXT_LIMITS.items():
+        value = data[key]
+        if value is not None and not isinstance(value, str):
+            return None
+        event[key] = clean_text(value, limit) or None
+    event["level"] = data["level"]
+    return event
+
+
+def verb_events(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str, object]:
+    """Deletes the events named in `args` (the hub has taken them), then answers up to MAX_EVENTS of
+    the rest, oldest first, each with its `id` and, for a pane in an allowed tmux session, that
+    session's name. Files that are not valid events are deleted and counted as `bad`."""
+    if not policy.allow_events:
+        raise RefusedError("not_allowed")
+    directory = events_dir(env)
+    with _EVENTS_LOCK:
+        try:
+            info = os.lstat(directory)
+        except OSError:
+            info = None
+        if info is not None and (
+            not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            # A symlink, or a directory someone else could have written: not this user's hooks.
+            raise RefusedError("events_unsafe")
+        for event_id in args:
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(directory, event_id + ".json"))
+        try:
+            names = sorted(os.listdir(directory)) if info is not None else []
+        except OSError:
+            names = []
+        found = [m.group(1) for m in (EVENT_FILE_RE.fullmatch(n) for n in names) if m is not None]
+        events: list[dict[str, object]] = []
+        bad = 0
+        for event_id in found:
+            if len(events) >= MAX_EVENTS:
+                break
+            path = os.path.join(directory, event_id + ".json")
+            event = _read_event(path)
+            if event is None:
+                bad += 1
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+                continue
+            event["id"] = event_id
+            events.append(event)
+    sessions: dict[str, str] = {}
+    if any(event["pane"] is not None for event in events):
+        try:
+            sessions = {pane["pane_id"]: pane["session_name"] for pane in list_panes(policy, env)}
+        except RefusedError:
+            sessions = {}
+    for event in events:
+        name = sessions.get(str(event["pane"]))
+        event["tmuxSession"] = clean_text(name, NAME_MAX) if name is not None and policy.allows(name) else None
+    pending = len(found) - bad
+    return {
+        "events": events,
+        "more": pending > len(events),
+        "pending": pending,
+        "full": len(found) >= EVENT_SPOOL_FULL,
+        "bad": bad,
+    }
+
+
 # --- usage -------------------------------------------------------------------------------------
 
 _TIMESTAMP_RE = re.compile(
@@ -1734,6 +1875,8 @@ def run_request(
             body = verb_resize(policy, env, args)
         elif verb == "health":
             body = verb_health(policy, env)
+        elif verb == "events":
+            body = verb_events(policy, env, args)
         elif verb == "usage":
             lines = verb_usage(policy, env, args, stdin)
             body = {"stream": "usage"}

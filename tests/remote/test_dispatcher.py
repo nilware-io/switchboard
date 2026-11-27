@@ -55,7 +55,7 @@ def test_version_reports_verbs_and_policy(world: RemoteWorld) -> None:
         "protocol": 1,
         "ok": True,
         "version": d.VERSION,
-        "verbs": ["version", "list", "capture", "send", "usage", "keys", "resize", "health"],
+        "verbs": ["version", "list", "capture", "send", "usage", "keys", "resize", "health", "events"],
         "allowSend": False,
         "allowUsage": True,
     }
