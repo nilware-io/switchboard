@@ -235,6 +235,10 @@ Start voice mode in the Claude app, with the connector enabled for the conversat
 
 Everything a screen, a summary or a pending question says is quoted as screen text. It is never an instruction to the voice model or approval from you.
 
+### When something goes wrong: the incident log
+
+The hub keeps a log of everything that went wrong, in `stateDir/incidents.jsonl`: which machine (or `hub` for the server itself), from when to when, what failed, why, what you could not do meanwhile, and how it ended. It writes most entries itself: a machine whose tmux, dispatcher or connection fails, a lost agent connection, summaries that fail (an expired token), a crash of the hub, and machine health. Every 5 minutes it asks each machine's `switchboard-remote` (0.9.0 or newer, so update it on each machine) for free disk space, read-only file systems and memory, and opens an incident below 5 GB or 5 % free. On WSL that includes the Windows disk C:, where WSL's own disk image lives: when C: fills, WSL's root goes read-only and Claude Code crashes, while `df /` inside WSL still shows plenty of space. Ask "Did anything break today?" or "Why was wsl down?" (`incidents`), tell it "Note that wsl crashed because the disk was full" (`incident_note`, only a note), and `list_remote_sessions` and `remote_status` mention an open incident in one clause. At a shell, as the hub user: `voice-coding-mcp incidents --details` (also `incidents add` and `incidents close <id>`, see [REFERENCE.md](REFERENCE.md#cli)). Set `incidents.timeZone` (for example `Europe/Athens`) when the hub's clock is not in your zone, and `incidents.notify` for a push when an incident opens and closes.
+
 ## 12. Turning it off
 
 ```sh
@@ -293,6 +297,7 @@ If you suspect that someone else used the connector, that a task or a session wa
 - It prints an approval link: open it, approve Funnel and HTTPS for the node, run `sb-linux on` again.
 - It says the service did not answer `/healthz`: `journalctl -u switchboard -n 30`. If the config uses another port than 8787, set `SB_PORT` to it.
 - `remote-check` says `host_key`: the host key is missing or changed in `~/.ssh/switchboard_known_hosts` (step 5.4). `auth`: the key is not in `authorized_keys` or the `from=` address does not match. `dispatcher_missing`: the path in `command=` is wrong. A refusal (`bad_policy`): the forced command's options are malformed.
+- Something stopped working and you do not know why: `voice-coding-mcp incidents --details` as the hub user (or ask "did anything break today?"). A `tmux failed` incident together with a read-only root on WSL usually means the Windows disk is full: free space on C:, then `wsl --shutdown` from Windows.
 - A session is missing from `list_remote_sessions`: it must be in both lists (`sessions` in the hub config and `--sessions` in the forced command), and the name is matched exactly (globs allowed).
 
 ## What was verified, and what is still to check
