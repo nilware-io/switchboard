@@ -34,7 +34,7 @@ from ..clock import now_ms
 from ..log import Logger
 from .config import MACHINE_NAME_RE, MachineConfig, RemoteConfig
 from .protocol import ARG_RE, ResponseError, parse_response, request_tokens, response_cap
-from .transport import TransportError, TransportResult
+from .transport import TransportError, TransportResult, dispatcher_error
 
 PROTOCOL = 1
 MAX_MACHINE_FRAME_BYTES = 5 * 1024 * 1024
@@ -765,7 +765,7 @@ class AgentTransport:
         except ResponseError:
             return failed("bad_response")
         if isinstance(parsed, str):
-            return failed("refused_by_policy", parsed)
+            return failed(dispatcher_error(parsed), parsed)
         return TransportResult(ok=True, data=parsed, elapsed_ms=round((time.monotonic() - started) * 1000))
 
 

@@ -31,6 +31,7 @@ UNREACHABLE: dict[str, str] = {
     "dispatcher_missing": "switchboard-remote is not installed there",
     "bad_response": "it answered something unexpected",
     "refused_by_policy": "switchboard-remote refused the request",
+    "remote_failed": "something failed on the machine",
     "other": "something went wrong",
     "not_connected": "it is not connected right now",
     "disconnected": "the connection was lost",
@@ -38,6 +39,9 @@ UNREACHABLE: dict[str, str] = {
 
 
 def unreachable_reason(error: TransportError | None, detail: str | None = None) -> str:
+    if error == "remote_failed" and detail == "tmux_failed":
+        # The machine answered: tmux there failed (stopped, or its disk went read-only).
+        return "tmux failed there"
     if error == "refused_by_policy" and detail in ("no_policy", "bad_policy"):
         return "switchboard-remote there has no valid policy"
     if error == "refused_by_policy" and detail == "busy":
@@ -51,6 +55,8 @@ def unreachable_sentence(name: str, error: TransportError | None, detail: str | 
     not connected right now." """
     if error == "not_connected":
         return f"{name} is not connected right now."
+    if error == "remote_failed":
+        return f"{name} answered, but {unreachable_reason(error, detail)}."
     return f"{name} is not reachable: {unreachable_reason(error, detail)}."
 
 
@@ -102,6 +108,8 @@ def machine_line(view: MachineView) -> str:
     if not view.ok:
         if view.error == "not_connected":
             return f"{name}: not connected right now."
+        if view.error == "remote_failed":
+            return f"{name}: answered, but {unreachable_reason(view.error, view.detail)}."
         return f"{name}: not reachable, {unreachable_reason(view.error, view.detail)}."
     sessions = view.sessions()
     cut = " It has more panes than I can list, so some are missing." if view.truncated else ""

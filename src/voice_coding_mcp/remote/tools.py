@@ -950,7 +950,7 @@ class RemoteTools:
             return "sent", None
         if result.ok:
             return "unknown", None
-        if result.error == "refused_by_policy":
+        if result.error in ("refused_by_policy", "remote_failed"):
             if result.detail == "pasted_no_enter":
                 return "pasted_no_enter", None
             return f"not_sent:{result.detail or 'other'}", result.detail
