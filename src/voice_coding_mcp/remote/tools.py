@@ -29,7 +29,7 @@ from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from .agents import AgentHub
 from .audit import AuditLog
 from .check import check_machine
-from .config import MachineConfig, command_timeout_seconds
+from .config import MachineConfig, command_timeout_seconds, known_names, known_terms
 from .dispatcher import (
     KEY_NAMES,
     KEYS_MENU,
@@ -63,6 +63,7 @@ from .send import (
     KEYS,
     PERMISSION_ANSWER_RE,
     RESIZE,
+    TEXT,
     Confirmation,
     ConfirmationStore,
     RiskClassifier,
@@ -192,7 +193,7 @@ class RemoteTools:
         self.transports: dict[str, Transport] = dict(transports)
         """One per machine; `usage_report` calls the same ones."""
         self._now = options.now or now_ms
-        self.echo = ScreenEcho(self._now)
+        self.echo = ScreenEcho(self._now, known_terms(config.remote), known_names(config.remote))
         self.inventory = Inventory(config.remote, transports, self._logger, now=options.now, observe=self.echo.observe)
         send = config.remote.send
         self.confirmations = ConfirmationStore(
@@ -873,6 +874,9 @@ class RemoteTools:
             return ToolAnswer(NEEDS_RISKY_OK, True)
         self.confirmations.consume(key)
         outcome, detail = await self._send(item, deadline)
+        if outcome == "sent" and item.kind == TEXT:
+            # The owner heard this text read back and said yes: its new words are the owner's.
+            self.echo.owner_said(item.text)
         self.audit.record(item, outcome=outcome, risky_ok=risky_ok)
         self._logger.info(
             "tool call",

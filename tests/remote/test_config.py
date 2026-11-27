@@ -12,7 +12,7 @@ import pytest
 from tests.helpers import config_data
 from tests.remote.helpers import machine
 from voice_coding_mcp.config import ConfigError, config_warnings, parse_config
-from voice_coding_mcp.remote.config import known_hosts_path, remote_warnings
+from voice_coding_mcp.remote.config import known_hosts_path, known_names, known_terms, remote_warnings
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -165,12 +165,29 @@ def test_a_state_dir_ssh_cannot_quote_needs_an_explicit_known_hosts_file(tmp_pat
         ({"send": {"slashCommands": ["compact", "compact"]}}, "remote.send.slashCommands"),
         ({"send": {"riskyPatterns": ["(unclosed"]}}, "remote.send.riskyPatterns"),
         ({"send": {"riskyPatterns": [""]}}, "remote.send.riskyPatterns"),
+        ({"send": {"knownTerms": ["ab"]}}, "remote.send.knownTerms"),
+        ({"send": {"knownTerms": ["x" * 65]}}, "remote.send.knownTerms"),
+        ({"send": {"knownTerms": ["-dash"]}}, "remote.send.knownTerms"),
+        ({"send": {"knownTerms": ["two  spaces"]}}, "remote.send.knownTerms"),
+        ({"send": {"knownTerms": ["bad\u202eterm"]}}, "remote.send.knownTerms"),
+        ({"send": {"knownTerms": ["fpga", "fpga"]}}, "remote.send.knownTerms"),
+        ({"send": {"knownTerms": [f"term{i}" for i in range(201)]}}, "remote.send.knownTerms"),
+        ({"send": {"knownTerms": "GreenArrays"}}, "remote.send.knownTerms"),
         ({"send": {"clientApproval": "yes"}}, "remote.send.clientApproval"),
         ({"send": {"unknown": 1}}, "remote.send.unknown"),
     ],
 )
 def test_other_remote_keys(tmp_path: Path, section: dict[str, Any], message: str) -> None:
     assert message in error(tmp_path, section)
+
+
+def test_known_terms_come_from_the_hub_config_only(tmp_path: Path) -> None:
+    terms = ["GreenArrays", "polly2-rtl", "voice coding", "O'Brien", "sh4"]
+    config = parse(tmp_path, {"machines": [machine("dev")], "send": {"knownTerms": terms}})
+    assert config.remote.send.known_terms == terms
+    assert known_terms(config.remote) == terms
+    assert known_names(config.remote) == ["dev", "fpga", "notes"], "globs such as work-* are left out"
+    assert parse(tmp_path, {}).remote.send.known_terms == []
 
 
 def test_warnings(tmp_path: Path) -> None:
