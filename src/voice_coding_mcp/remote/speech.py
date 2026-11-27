@@ -510,6 +510,7 @@ _NOT_SENT: dict[str, str] = {
     "no_policy": "Not sent: switchboard-remote on {machine} has no valid policy.",
     "tmux_failed": "Not sent: tmux failed on {machine}.",
     "slow": "Not sent: {machine} answered too slowly. Try again in a moment.",
+    "locked": "Not sent: another send to {machine} was still running. Try again in a moment.",
 }
 
 
@@ -531,7 +532,8 @@ _NOT_DONE_CLEAR: dict[str, str] = {
     "exit_armed": "Not cleared: that screen asks to press Ctrl-C again to exit, so I pressed nothing. Try again in a few seconds.",
     "vim_normal": "Not cleared: that input is in vim normal mode. Clear it at the keyboard.",
     "not_claude": "Not cleared: that pane no longer runs Claude Code.",
-    "bad_request": "Not cleared: switchboard-remote on {machine} refused the request. If it is older than 0.8.0, update it there.",
+    "no_input_box": "Not cleared: I cannot see the input box on that screen any more, so I pressed nothing. Clear it at the keyboard.",
+    "bad_request": "Not cleared: switchboard-remote on {machine} refused the request. If it is older than 0.11.0, update it there.",
 }
 _NOT_DONE_RESIZE: dict[str, str] = {
     "not_claude": "Not resized: switchboard-remote on {machine} does not allow resizing panes without Claude Code.",

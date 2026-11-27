@@ -614,6 +614,20 @@ class ConfirmationStore:
         """Single use: removed before the send starts, whatever its outcome."""
         self._items.pop(confirmation_id, None)
 
+    def drop_pane(self, machine: str, pane_id: str, kind: str) -> list[Confirmation]:
+        """Removes every pending confirmation of `kind` for that pane (of any client), oldest first."""
+        gone = sorted(
+            (
+                item
+                for item in self._items.values()
+                if (item.machine, item.pane_id, item.kind) == (machine, pane_id, kind)
+            ),
+            key=lambda item: item.created_ms,
+        )
+        for item in gone:
+            del self._items[item.id]
+        return gone
+
     def __len__(self) -> int:
         self._expire()
         return len(self._items)

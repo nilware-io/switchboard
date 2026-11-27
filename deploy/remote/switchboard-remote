@@ -48,7 +48,10 @@ a fixed environment, and the text of a send reaches tmux only on the stdin of `l
 from __future__ import annotations
 
 import calendar
+import contextlib
 import datetime
+import errno
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -66,9 +69,10 @@ import time
 import traceback
 import unicodedata
 from collections.abc import Iterator
+from stat import S_ISREG
 from typing import BinaryIO
 
-VERSION = "0.9.0"
+VERSION = "0.11.0"
 PROTOCOL = 1
 VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize", "health", "clear")
 PROGRAM = "switchboard-remote"
@@ -127,7 +131,15 @@ Ctrl+C just pressed at the keyboard shows its exit hint within this time, and a 
 (typing, a dialog opening, Claude Code starting to work) is not cleared."""
 CLEAR_SETTLE_SECONDS = 2.0
 """After the key `clear` waits this long before it checks the result and returns, past Claude
-Code's exit window, so no later request can land as a second Ctrl+C inside it."""
+Code's exit window, still holding the mutation lock (`mutation_lock`), so no later request can land
+as a second Ctrl+C inside it."""
+MUTATION_LOCK_FILE = "switchboard-remote.lock"
+"""The lock file `send`, `keys`, `resize` and `clear` hold (exclusive `flock`) for their whole run,
+in tmux's own socket directory (`$TMUX_TMPDIR/tmux-<uid>`, default /tmp): every process that talks
+to the same tmux server, forced command, local transport or serve mode, takes the same lock."""
+MUTATION_LOCK_SECONDS = 6.0
+"""Longest wait for the mutation lock; then the request is refused with `locked`."""
+MUTATING_VERBS = ("send", "keys", "resize", "clear")
 TEST_CLEAR_NO_WAIT = "SWITCHBOARD_REMOTE_TEST_CLEAR_NO_WAIT"
 """Test only (with SWITCHBOARD_REMOTE_TEST=1): `clear` skips both waits."""
 
@@ -362,9 +374,12 @@ def shows_vim_normal(screen: str) -> bool:
 
 SUGGESTION_MAX = 300
 """At most this many characters of a prompt suggestion are reported (`capture`'s `suggestion`)."""
+SUGGESTION_ROWS = 8
+"""Rows under the input line searched for the box's bottom border when a suggestion wraps."""
 _ESCAPE_RE = re.compile(
     r"\x1b\[([0-?]*)[ -/]*([@-~])"  # CSI, group 1 the parameters, group 2 the final byte
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC (a hyperlink), to BEL or ST
+    r"|\x1b[P^_X][^\x1b]*(?:\x1b\\)?"  # DCS, PM, APC or SOS with its payload, to ST
     r"|\x1b[ -/]*[0-~]"  # any other escape sequence
     r"|\x1b"  # a lone escape at the end
 )
@@ -418,7 +433,19 @@ def _dim_input(cells: list[tuple[str, bool]]) -> tuple[int, int, str] | None:
         start += 1
     if start >= len(cells) or cells[start][0] not in _INPUT_PROMPTS:
         return None
-    start += 1
+    return _dim_span(cells, start + 1)
+
+
+def _dim_row(cells: list[tuple[str, bool]]) -> tuple[int, int, str] | None:
+    """(start, end, text) of a box row under the input line when all of its text is dim (the
+    continuation of a prompt suggestion that wraps), else None."""
+    start = 0
+    while start < len(cells) and (cells[start][0].isspace() or cells[start][0] in _BOX_EDGES):
+        start += 1
+    return _dim_span(cells, start)
+
+
+def _dim_span(cells: list[tuple[str, bool]], start: int) -> tuple[int, int, str] | None:
     end = len(cells)
     while end > start and (cells[end - 1][0].isspace() or cells[end - 1][0] in _BOX_EDGES):
         end -= 1
@@ -440,23 +467,43 @@ def split_suggestion(raw: str) -> tuple[str, str | None]:
     prompt (up to a closing box edge) is dim and is not the empty box's hint (`Try "..."`, also dim,
     which stays), that text is the suggestion: it is cut from the plain screen, so `shows_draft`,
     `draft_hash` and the menu checks see an empty input, and returned on its own, cleaned and
-    clipped to SUGGESTION_MAX characters. Older input boxes in the scrollback (a dim input line right
+    clipped to SUGGESTION_MAX characters. A suggestion that wraps continues on wholly dim rows up to
+    the box's bottom border; those rows are cut and joined to it. Older input boxes in the scrollback (a dim input line right
     under a border line) lose their suggestion too, without reporting it. A line with any non-dim
     character is typed text and is left whole. The plain screen is otherwise the capture without its
     escape sequences, as a capture without -e gives it."""
     lines = _styled_lines(raw)
     plain = ["".join(char for char, _ in cells) for cells in lines]
+    stripped = [line.strip().strip(_BOX_EDGES).strip() for line in plain]
+
+    def blank(index: int, start: int, end: int) -> None:
+        kept = plain[index][:start] + " " * (end - start) + plain[index][end:]
+        plain[index] = kept.rstrip() if end == len(lines[index]) else kept
 
     def cut(index: int) -> str | None:
         found = _dim_input(lines[index])
         if found is None:
             return None
+        # A long suggestion wraps onto further rows of the box: wholly dim rows up to the box's
+        # bottom border. Without a bottom border (within SUGGESTION_ROWS rows) only the prompt line
+        # is cut; a row with any non-dim text before the border makes it typed text, left whole.
+        window = range(index + 1, min(index + 1 + SUGGESTION_ROWS, len(lines)))
+        bottom = next((below for below in window if _BORDER_RE.fullmatch(stripped[below])), None)
+        rows: list[tuple[int, int, int, str]] = []
+        for below in range(index + 1, bottom if bottom is not None else index + 1):
+            if not stripped[below]:
+                continue
+            row = _dim_row(lines[below])
+            if row is None:
+                return None
+            rows.append((below, *row))
         start, end, text = found
-        kept = plain[index][:start] + " " * (end - start) + plain[index][end:]
-        plain[index] = kept.rstrip() if end == len(lines[index]) else kept
+        blank(index, start, end)
+        for below, row_start, row_end, row_text in rows:
+            blank(below, row_start, row_end)
+            text += " " + row_text
         return text
 
-    stripped = [line.strip().strip(_BOX_EDGES).strip() for line in plain]
     tail = [index for index, line in enumerate(stripped) if line][-CHECK_TAIL:]
     current = next((index for index in reversed(tail) if stripped[index].startswith(_INPUT_PROMPTS)), None)
     above: str | None = None
@@ -793,6 +840,7 @@ INPUT_BOX_BELOW = 10
 """Non-empty lines (status line, hints, an open slash list) allowed under the input box's bottom
 border."""
 _EXIT_ARMED_RE = re.compile(r"\bagain to exit\b", re.I)
+_WORKING_RE = re.compile(r"\besc to interrupt\b", re.I)
 
 
 def input_box(screen: str) -> tuple[list[str], bool] | None:
@@ -868,6 +916,25 @@ def shows_empty_input(screen: str) -> bool:
     is not empty."""
     box = input_box(screen)
     return box is not None and not box[0] and not box[1] and not shows_draft(screen)
+
+
+def clear_target(screen: str) -> str | None:
+    """Why `clear` must not press Ctrl+C on this screen, or None. Only positive evidence counts: a
+    recognised input box (`no_input_box` otherwise; the `shows_draft` fallback of `input_draft` may
+    read a shell command line or an old prompt as a draft) that holds a draft (`nothing_to_clear`).
+    Hub and dispatcher both run it."""
+    box = input_box(screen)
+    if box is None:
+        return "no_input_box"
+    if not box[0] and not box[1]:
+        return "nothing_to_clear"
+    return None
+
+
+def shows_working(screen: str) -> bool:
+    """Claude Code's working indicator ("esc to interrupt") in the screen tail: a turn is running even
+    if the registry still says idle, and Ctrl+C would interrupt it."""
+    return any(_WORKING_RE.search(line) for line in _screen_tail(screen))
 
 
 def shows_exit_armed(screen: str) -> bool:
@@ -1079,7 +1146,8 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
     if verb == "clear":
         if len(args) != 4 or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
             raise RefusedError("bad_request")
-        if args[2] != SEND_NO_SESSION and not UUID_RE.fullmatch(args[2]):
+        # Only a Claude Code pane is ever cleared, so a session id is required (no `none`).
+        if not UUID_RE.fullmatch(args[2]):
             raise RefusedError("bad_request")
         if not DIALOG_HASH_RE.fullmatch(args[3]):
             raise RefusedError("bad_request")
@@ -1717,11 +1785,12 @@ def verb_health(
 
 def _clear_check(policy: Policy, env: dict[str, str], args: list[str]) -> str:
     """The screen of the pane `clear` would press its key in, after every check; raises the refusal.
-    Claude Code panes only (a shell's Ctrl+C interrupts its program; `none` is `not_claude`, also
-    with --send-to-any-pane), idle (`not_idle`: Ctrl+C interrupts a working session and cancels a
-    question), no permission dialog (`permission_prompt`), no menu or picker footer (`menu_present`),
-    no vim normal mode, no exit hint (`exit_armed`), a draft (`nothing_to_clear`) and the one the
-    owner heard (`draft_changed`)."""
+    Claude Code panes only (a shell's Ctrl+C interrupts its program; also with --send-to-any-pane),
+    idle in the registry and on the screen (`not_idle`: Ctrl+C interrupts a working session and
+    cancels a question), no permission dialog (`permission_prompt`), no menu or picker footer
+    (`menu_present`), no vim normal mode, no exit hint (`exit_armed`), a recognised input box
+    (`no_input_box`) with a draft (`nothing_to_clear`) and the one the owner heard
+    (`draft_changed`)."""
     pane_id, pane_pid, session_id, draft = args
     pane, entry, screen, _ = _send_state(policy, env, pane_id)
     if pane is None:
@@ -1734,12 +1803,15 @@ def _clear_check(policy: Policy, env: dict[str, str], args: list[str]) -> str:
         raise RefusedError("permission_prompt")
     if bound_menu_hash(screen, claude_pane=True) is not None or shows_picker(screen):
         raise RefusedError("menu_present")
-    if entry.get("status") != "idle":
+    if entry.get("status") != "idle" or shows_working(screen):
         raise RefusedError("not_idle")
     if shows_vim_normal(screen):
         raise RefusedError("vim_normal")
     if shows_exit_armed(screen):
         raise RefusedError("exit_armed")
+    problem = clear_target(screen)
+    if problem is not None:
+        raise RefusedError(problem)
     current = draft_hash(screen)
     if current is None:
         raise RefusedError("nothing_to_clear")
@@ -1772,8 +1844,8 @@ def verb_clear(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str
     if code != 0:
         raise RefusedError("tmux_failed")
     if wait:
-        # Serve mode runs mutating verbs one at a time (`send_lock`), so nothing else is typed into
-        # any pane before Claude Code's exit window has closed.
+        # The caller holds the mutation lock (`mutation_lock`) through this wait, so no other
+        # request of any transport types into any pane before Claude Code's exit window has closed.
         _pause(CLEAR_SETTLE_SECONDS)
     # The prompt suggestion that Claude Code shows again in the emptied box is cut off here.
     code, screen, _, _ = capture_screen(policy, env, pane_id, SEND_CHECK_LINES)
@@ -2042,6 +2114,48 @@ def respond(argv: list[str], env: dict[str, str], stdin: object = None) -> Itera
     yield from run_request(policy, tokens, env, stdin)
 
 
+@contextlib.contextmanager
+def mutation_lock(env: dict[str, str], seconds: float = MUTATION_LOCK_SECONDS) -> Iterator[None]:
+    """Holds the exclusive `flock` on MUTATION_LOCK_FILE in tmux's socket directory, so mutating
+    verbs run one at a time across processes: the forced command and the local transport start one
+    process per request, serve mode has threads (`Server.send_lock`). Without that directory there
+    is no tmux server and nothing to type into, so nothing is locked. Refuses `locked` when the
+    lock stays taken for `seconds`, or when the directory or the file is not this user's own."""
+    directory = os.path.join(env.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}")
+    try:
+        info = os.lstat(directory)
+    except FileNotFoundError:
+        yield
+        return
+    except OSError:
+        raise RefusedError("locked") from None
+    if not os.path.isdir(directory) or os.path.islink(directory) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise RefusedError("locked")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(os.path.join(directory, MUTATION_LOCK_FILE), flags, 0o600)
+    except OSError:
+        raise RefusedError("locked") from None
+    try:
+        held = os.fstat(fd)
+        if held.st_uid != os.getuid() or not S_ISREG(held.st_mode):
+            raise RefusedError("locked")
+        give_up = time.monotonic() + seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    raise RefusedError("locked") from None
+            if time.monotonic() >= give_up:
+                raise RefusedError("locked")
+            time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
 def refusal(code: str) -> dict[str, object]:
     return {"protocol": PROTOCOL, "ok": False, "error": code}
 
@@ -2058,16 +2172,18 @@ def run_request(
             body = verb_version(policy)
         elif verb == "list":
             body = verb_list(policy, env)
-        elif verb == "send":
-            body = verb_send(policy, env, args, stdin)
-        elif verb == "keys":
-            body = verb_keys(policy, env, args)
-        elif verb == "resize":
-            body = verb_resize(policy, env, args)
+        elif verb in MUTATING_VERBS:
+            with mutation_lock(env):
+                if verb == "send":
+                    body = verb_send(policy, env, args, stdin)
+                elif verb == "keys":
+                    body = verb_keys(policy, env, args)
+                elif verb == "resize":
+                    body = verb_resize(policy, env, args)
+                else:
+                    body = verb_clear(policy, env, args)
         elif verb == "health":
             body = verb_health(policy, env)
-        elif verb == "clear":
-            body = verb_clear(policy, env, args)
         elif verb == "usage":
             lines = verb_usage(policy, env, args, stdin)
             body = {"stream": "usage"}
@@ -2109,7 +2225,6 @@ SERVE_SILENCE_SECONDS = 180.0
 EXIT_REPLACED = 75
 EXIT_REFUSED = 76
 BYE_EXIT = {"replaced": EXIT_REPLACED, "unknown_machine": EXIT_REFUSED, "protocol": EXIT_REFUSED, "shutdown": 0}
-MUTATING_VERBS = ("send", "keys", "resize", "clear")
 STDIN_VERBS = ("send", "usage")
 FRAME_ERRORS = ("bad_frame", "frame_too_large", "duplicate_id", "busy", "crashed")
 _HUB_FRAMES = {
@@ -2240,7 +2355,8 @@ class Server:
         self.out_fd = out_fd
         self.write_lock = threading.Lock()
         self.send_lock = threading.Lock()
-        """`send`, `keys` and `resize` run one at a time: their checks and keystrokes never interleave."""
+        """`send`, `keys`, `resize` and `clear` run one at a time: their checks and keystrokes never
+        interleave (`mutation_lock` serialises them with other processes too)."""
         self.state_lock = threading.Lock()
         self.inflight: dict[int, threading.Event] = {}
         self.workers: list[threading.Thread] = []

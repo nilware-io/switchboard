@@ -46,6 +46,7 @@ from .dispatcher import (
     SEND_MESSAGE,
     accepts_suggestion,
     bound_menu_hash,
+    clear_target,
     dialog_bound,
     draft_hash,
     input_draft,
@@ -54,6 +55,7 @@ from .dispatcher import (
     shows_exit_armed,
     shows_picker,
     shows_vim_normal,
+    shows_working,
 )
 from .health import HealthPoller, HealthPollerOptions
 from .incidents import (
@@ -261,6 +263,9 @@ class RemoteTools:
         self.transports: dict[str, Transport] = dict(transports)
         """One per machine; `usage_report` calls the same ones."""
         self._now = options.now or now_ms
+        self._send_locks: dict[str, asyncio.Lock] = {}
+        """One per machine: confirmed sends, key presses, resizes and clears of one machine run one at a
+        time on the hub too (the dispatcher's `mutation_lock` serialises them on the machine)."""
         self.echo = ScreenEcho(self._now, known_terms(config.remote), known_names(config.remote))
         self.inventory = Inventory(config.remote, transports, self._logger, now=options.now, observe=self.echo.observe)
         send = config.remote.send
@@ -1176,7 +1181,7 @@ class RemoteTools:
             )
         if bound_menu_hash(screen, claude_pane=True) is not None or shows_picker(screen):
             return refuse(f"{place} shows a menu, and Ctrl+C would close it. Ask me what it says.", "menu_present")
-        if claude.status != "idle":
+        if claude.status != "idle" or shows_working(screen):
             return refuse(
                 f"{place} is working or waiting for an answer, and Ctrl+C would interrupt it. Ask me again when it is idle.",
                 "not_idle",
@@ -1188,9 +1193,17 @@ class RemoteTools:
                 f"{place} asks to press Ctrl-C again to exit, so I will not press it now. Try again in a few seconds.",
                 "exit_armed",
             )
+        problem = clear_target(screen)
+        if problem == "no_input_box":
+            # Only a recognised Claude Code input box is cleared: a line that merely looks like a
+            # prompt may be a shell command or an old prompt in the transcript.
+            return refuse(
+                f"I cannot see the input box of {place} on its screen, so I will not press Ctrl+C there. Clear it at the keyboard.",
+                "no_input_box",
+            )
         draft = input_draft(screen)
         hashed = draft_hash(screen)
-        if draft is None or hashed is None:
+        if problem is not None or draft is None or hashed is None:
             return refuse(f"Nothing is typed in the input of {place}.", "nothing_to_clear")
         item, dropped = self.confirmations.add(
             client=caller.fingerprint,
@@ -1238,7 +1251,12 @@ class RemoteTools:
             )
             return ToolAnswer(NEEDS_RISKY_OK, True)
         self.confirmations.consume(key)
-        outcome, detail = await self._send(item, deadline)
+        if item.kind == CLEAR:
+            # One clear per draft: a second prepared clear of the same pane would press another Ctrl+C.
+            self.confirmations.drop_pane(item.machine, item.pane_id, CLEAR)
+        lock = self._send_locks.setdefault(item.machine, asyncio.Lock())
+        async with lock:
+            outcome, detail = await self._send(item, deadline)
         if outcome == "sent" and item.kind == TEXT:
             # The owner heard this text read back and said yes: its new words are the owner's.
             self.echo.owner_said(item.text)

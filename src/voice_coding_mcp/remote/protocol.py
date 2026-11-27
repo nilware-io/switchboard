@@ -118,7 +118,7 @@ class CaptureResponse(_Response):
     the visible rows can be captured (dispatcher 0.5.0 and newer)."""
     suggestion: Annotated[str, _capped(SUGGESTION_MAX_CHARS)] | None = None
     """Claude Code's prompt suggestion (dim text in its empty input box, nobody typed it), cut from
-    `text` (dispatcher 0.8.0 and newer; an older dispatcher leaves it in `text`, where it looks like
+    `text` (dispatcher 0.11.0 and newer; an older dispatcher leaves it in `text`, where it looks like
     a draft)."""
 
 
@@ -175,7 +175,7 @@ class HealthResponse(_Response):
 
 
 class ClearResponse(_Response):
-    """Dispatcher 0.8.0: one Ctrl+C was pressed; `cleared` when the input box is visibly empty
+    """Dispatcher 0.11.0: one Ctrl+C was pressed; `cleared` when the input box is visibly empty
     afterwards, else what is still in it (None when the second capture failed)."""
 
     pressed: bool

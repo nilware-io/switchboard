@@ -225,3 +225,50 @@ def test_accepts_suggestion() -> None:
     assert d.accepts_suggestion(["Right"])
     assert d.accepts_suggestion(["Down", "Tab"])
     assert not d.accepts_suggestion(["Escape", "Up", "Enter"])
+
+
+# --- wrapped suggestions and escape strings ------------------------------------------------------
+
+WRAPPED = fx.screen(
+    "\x1b[39m❯\xa0\x1b[2mmove the import to the top of the file and then\x1b[0m\n  \x1b[2mrun the tests again\x1b[0m"
+)
+
+
+def test_a_suggestion_that_wraps_is_cut_on_every_row_and_joined() -> None:
+    screen, suggestion = d.split_suggestion(WRAPPED)
+    assert suggestion == "move the import to the top of the file and then run the tests again"
+    assert "run the tests again" not in screen
+    assert not d.shows_draft(screen)
+    assert d.input_draft(screen) is None
+    assert d.draft_hash(screen) is None
+    assert d.clear_target(screen) == "nothing_to_clear"
+    assert d.shows_empty_input(screen)
+
+
+def test_a_typed_row_under_a_dim_line_keeps_the_whole_input() -> None:
+    styled = fx.screen("\x1b[39m❯\xa0\x1b[2mmove the import\x1b[0m\n  run the tests again")
+    screen, suggestion = d.split_suggestion(styled)
+    assert suggestion is None
+    assert d.input_draft(screen) == (["move the import", "run the tests again"], False)
+
+
+def test_without_a_bottom_border_only_the_input_line_is_cut() -> None:
+    styled = "⏺ Done.\n" + fx.RULE + "\n\x1b[39m❯\xa0\x1b[2mrun the tests\x1b[0m\n\x1b[2m  dim text\x1b[0m\n"
+    screen, suggestion = d.split_suggestion(styled)
+    assert suggestion == "run the tests"
+    assert "dim text" in screen
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    ["\x1bP1;2q\x1b\\", "\x1b^private\x1b\\", "\x1b_app\x1b\\", "\x1bXstring\x1b\\", "\x1bPunterminated"],
+)
+def test_dcs_pm_apc_and_sos_strings_are_removed_with_their_payload(sequence: str) -> None:
+    styled = f"\x1b[2m❯ x\x1b]0;title\x07y{sequence}z\n"
+    screen, _ = d.split_suggestion(styled)
+    assert "\x1b" not in screen
+    for word in ("1;2q", "private", "app", "string", "unterminated", "title"):
+        assert word not in screen
+    _, suggestion = d.split_suggestion(f"\x1b[39m❯ \x1b[2mx{sequence}y\x1b[0m\n")
+    # An unterminated string runs to the next escape: its payload is never screen text.
+    assert suggestion == ("x" if sequence == "\x1bPunterminated" else "xy")

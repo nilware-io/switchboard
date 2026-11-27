@@ -5,6 +5,7 @@ draft, and the refusals of `remote_send` and `remote_send_keys` that point to it
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -229,6 +230,20 @@ async def test_a_tall_draft_names_the_lines_above(make: Make) -> None:
             "fpga on dev asks to press Ctrl-C again to exit, so I will not press it now. Try again in a few seconds.",
             "exit_armed",
         ),
+        (
+            box("❯ fix it", below="  ✻ Thinking… (esc to interrupt)"),
+            "idle",
+            None,
+            "fpga on dev is working or waiting for an answer, and Ctrl+C would interrupt it. Ask me again when it is idle.",
+            "not_idle",
+        ),
+        (
+            "~/proj\n❯ make -j32\ncc -c a.c\ncc -c b.c\n[ 40%] Building\n",
+            "idle",
+            None,
+            "I cannot see the input box of fpga on dev on its screen, so I will not press Ctrl+C there. Clear it at the keyboard.",
+            "no_input_box",
+        ),
         (EMPTY, "idle", None, "Nothing is typed in the input of fpga on dev.", "nothing_to_clear"),
         (
             box('❯ Try "refactor <filepath>"'),
@@ -291,6 +306,11 @@ async def test_an_older_dispatcher_is_named_when_preparing(make: Make, monkeypat
         ("vim_normal", "Not cleared: that input is in vim normal mode. Clear it at the keyboard."),
         ("not_claude", "Not cleared: that pane no longer runs Claude Code."),
         (
+            "no_input_box",
+            "Not cleared: I cannot see the input box on that screen any more, so I pressed nothing. Clear it at the keyboard.",
+        ),
+        ("locked", "Not cleared: another send to dev was still running. Try again in a moment."),
+        (
             "permission_prompt",
             "Not cleared: that session is now waiting for a permission decision. Approve it at the keyboard or in the Claude app.",
         ),
@@ -299,7 +319,7 @@ async def test_an_older_dispatcher_is_named_when_preparing(make: Make, monkeypat
         ("not_allowed", "Not cleared: switchboard-remote on dev does not allow sending."),
         (
             "bad_request",
-            "Not cleared: switchboard-remote on dev refused the request. If it is older than 0.8.0, update it there.",
+            "Not cleared: switchboard-remote on dev refused the request. If it is older than 0.11.0, update it there.",
         ),
     ],
 )
@@ -360,3 +380,45 @@ def test_draft_words_clip() -> None:
     many = [" ".join(f"w{n}" for n in range(20))]
     assert draft_words(many).endswith(" ...")
     assert len(draft_words(["x" * 300])) <= 101
+
+
+async def test_confirming_a_clear_drops_the_other_prepared_clears_of_that_pane(make: Make) -> None:
+    """Two prepared clears of one draft (here by two clients), confirmed one after the other:
+    only one Ctrl+C is ever pressed, a second one would exit Claude Code."""
+    ctx = await make()
+    show(ctx.world, DRAFT, afterKeys={"text": {"%1": EMPTY}})
+    await prepare(ctx)
+    second, error = await prepare(ctx, caller=OTHER)
+    assert not error
+    assert "(confirmation 5283," in second
+    ctx.later()
+    assert await ctx.confirm("4172") == ("Cleared the input of fpga on dev.", False)
+    assert await ctx.confirm("5283", caller=OTHER) == (EXPIRED, True)
+    assert len(pressed(ctx)) == 1
+
+
+async def test_parallel_confirms_of_one_machine_run_one_at_a_time(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = await make()
+    show(ctx.world, DRAFT, afterKeys={"text": {"%1": EMPTY}})
+    running: list[int] = []
+    overlap: list[bool] = []
+    real = ctx.tools._send
+
+    async def tracked(item: Confirmation, deadline: Any) -> tuple[str, str | None]:
+        running.append(1)
+        overlap.append(len(running) > 1)
+        await asyncio.sleep(0.05)
+        try:
+            return await real(item, deadline)
+        finally:
+            running.pop()
+
+    monkeypatch.setattr(ctx.tools, "_send", tracked)
+    await prepare(ctx)
+    resize = await ctx.tools.remote_resize("dev", "fpga", 120, 40, OTHER)
+    assert "(confirmation 5283," in resize.text
+    ctx.later()
+    await asyncio.gather(
+        ctx.tools.remote_send_confirm("4172", False, OWNER), ctx.tools.remote_send_confirm("5283", False, OTHER)
+    )
+    assert overlap == [False, False]

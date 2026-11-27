@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -232,8 +234,9 @@ def test_gone_changed_and_other_sessions(world: RemoteWorld) -> None:
 
 @pytest.mark.parametrize("forced", [FORCED, [*FORCED, "--send-to-any-pane"]])
 def test_a_pane_without_claude_code_is_never_cleared(world: RemoteWorld, forced: list[str]) -> None:
-    out = call(world, f"clear %2 {SHELL_PID} none {DRAFT_HASH}", forced)
-    assert out == refused("not_claude")
+    # `none` is no valid session for clear; a session id on a shell pane is a changed pane.
+    assert call(world, f"clear %2 {SHELL_PID} none {DRAFT_HASH}", forced) == refused("bad_request")
+    assert call(world, f"clear %2 {SHELL_PID} {SESSION_A} {DRAFT_HASH}", forced) == refused("changed")
     assert pressed(world) == []
 
 
@@ -249,7 +252,10 @@ def test_a_pane_without_claude_code_is_never_cleared(world: RemoteWorld, forced:
         (box("❯ fix the parser", below="  Press Ctrl-C again to exit"), "idle", "exit_armed"),
         (EMPTY, "idle", "nothing_to_clear"),
         (HINT, "idle", "nothing_to_clear"),
-        ("⏺ Done.\n$ ", "idle", "nothing_to_clear"),
+        ("⏺ Done.\n$ ", "idle", "no_input_box"),
+        # No input box: the last prompt line is a shell command, not a draft (red team finding).
+        ("~/proj\n❯ make -j32\ncc -c a.c\ncc -c b.c\n[ 40%] Building\n", "idle", "no_input_box"),
+        (box("❯ fix the parser and then run the tests", below="  ✻ Thinking… (esc to interrupt)"), "idle", "not_idle"),
         (box("❯ fix the parser and then run the linter"), "idle", "draft_changed"),
     ],
 )
@@ -336,3 +342,86 @@ def test_draft_helpers() -> None:
     assert not d.shows_exit_armed(DRAFT)
     paste = box("❯ [Pasted text #1 +60 lines]", below="  paste again to expand")
     assert d.input_draft(paste) == (["[Pasted text #1 +60 lines]"], False)
+
+
+def test_a_shell_command_line_is_no_clear_target() -> None:
+    shell = "~/proj\n❯ make -j32\ncc -c a.c\ncc -c b.c\n[ 40%] Building\n"
+    assert d.input_box(shell) is None
+    assert d.input_draft(shell) == (["make -j32"], False), "send and keys keep the refusing fallback"
+    assert d.clear_target(shell) == "no_input_box"
+    assert d.clear_target(EMPTY) == "nothing_to_clear"
+    assert d.clear_target(DRAFT) is None
+    assert d.clear_target(TALL) is None
+
+
+def test_working_indicator() -> None:
+    assert d.shows_working(box("❯ ", below="  ✻ Thinking… (esc to interrupt)"))
+    assert d.shows_working(box("❯ ", below="  · Running… (12s · ↓ 300 tokens · Esc to interrupt)"))
+    assert not d.shows_working(DRAFT)
+
+
+# --- the mutation lock ---------------------------------------------------------------------------
+
+
+def lock_dir(world: RemoteWorld) -> Path:
+    directory = world.root / f"tmux-{os.getuid()}"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    return directory
+
+
+def test_a_clear_waits_for_the_lock_and_refuses_locked_when_it_stays_taken(
+    world: RemoteWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_dir(world)
+    monkeypatch.setattr(d, "MUTATION_LOCK_SECONDS", 0.2)
+    with d.mutation_lock(world.tmux_env()):
+        assert clear(world) == refused("locked")
+        out = call(world, f"keys %1 {CLAUDE_PID} {SESSION_A} menu none Down")
+        assert out == refused("locked")
+    assert pressed(world) == []
+
+
+def test_two_concurrent_clears_press_one_ctrl_c(world: RemoteWorld, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two clear requests at once (two dispatcher processes in the forced command or the local
+    transport; threads here, each with its own lock file description, which `flock` treats the same
+    way): the second waits for the lock, then sees the exit hint and presses nothing."""
+    lock_dir(world)
+    after = box("❯ ", below="  Press Ctrl-C again to exit")
+    show(world, DRAFT, afterKeys={"text": {"%1": after}})
+    inside = threading.Event()
+    results: list[dict[str, Any]] = []
+
+    def slow(seconds: float) -> None:
+        inside.set()
+        time.sleep(0.2)
+
+    monkeypatch.setattr(d, "_pause", slow)
+    first = threading.Thread(target=lambda: results.append(clear(world)))
+    first.start()
+    assert inside.wait(5)
+    second = clear(world)
+    first.join()
+    assert results[0]["pressed"] is True
+    assert second == refused("exit_armed")
+    assert len(pressed(world)) == 1
+
+
+def test_the_lock_refuses_a_directory_that_is_not_safe(world: RemoteWorld) -> None:
+    directory = lock_dir(world)
+    directory.chmod(0o777)
+    try:
+        with pytest.raises(d.RefusedError) as refused_error, d.mutation_lock(world.tmux_env()):
+            pass
+        assert refused_error.value.code == "locked"
+    finally:
+        directory.chmod(0o700)
+    target = world.root / "elsewhere"
+    target.write_text("", encoding="utf-8")
+    (directory / d.MUTATION_LOCK_FILE).symlink_to(target)
+    with pytest.raises(d.RefusedError), d.mutation_lock(world.tmux_env()):
+        pass
+
+
+def test_without_a_tmux_socket_directory_nothing_is_locked(world: RemoteWorld) -> None:
+    with d.mutation_lock(world.tmux_env()), d.mutation_lock(world.tmux_env(), seconds=0):
+        pass

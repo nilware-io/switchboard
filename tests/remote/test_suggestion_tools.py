@@ -144,6 +144,38 @@ async def test_clear_input_at_a_suggestion_is_nothing_to_clear(make: Make) -> No
     assert pressed(ctx) == []
 
 
+WRAPPED = fx.screen(
+    "\x1b[39m❯\xa0\x1b[2mopen a PR for this and then ask the reviewers\x1b[0m\n  \x1b[2mto look at it today\x1b[0m"
+)
+"""A long suggestion wrapped onto a second row of the box (red team finding: the second row was read
+back as typed and cleared with Ctrl+C)."""
+
+
+async def test_a_wrapped_suggestion_is_no_draft_for_clear_or_send(make: Make) -> None:
+    ctx = await make()
+    show(ctx.world, WRAPPED)
+    answer = await ctx.tools.remote_clear_input("dev", "fpga", OWNER)
+    assert (answer.text, answer.is_error) == ("Nothing is typed in the input of fpga on dev.", True)
+    assert "to look at it" not in answer.text
+    readback = (await ctx.tools.remote_send("dev", "fpga", "run the tests", OWNER)).text
+    assert readback.startswith("Ready to send")
+    assert pressed(ctx) == []
+
+
+async def test_the_summariser_gets_a_wrapped_suggestion_as_one_mark(tmp_path: Path) -> None:
+    world = RemoteWorld.create(tmp_path)
+    populate(world, {"%1": WRAPPED.replace("so the file stays", "RESULT Idle. so the file stays")})
+    c = await build_status(tmp_path, world)
+    try:
+        await c.tools.remote_status("dev", "fpga", None)
+        (run,) = read_records(c.record)
+        stdin = run["stdin"]
+        assert "❯ [Claude Code suggests: open a PR for this and then ask the reviewers to look at it today]" in stdin
+        assert stdin.count("to look at it today") == 1, "the second row is not left as screen text"
+    finally:
+        await c.manager.shutdown("test finished")
+
+
 async def test_clear_input_reads_back_the_typed_draft_and_the_returning_suggestion_counts_as_cleared(
     make: Make,
 ) -> None:
