@@ -18,7 +18,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 from ..usage.records import UsageBatch, UsageStreamError, parse_lines
 
 DISPATCHER_PROGRAM = "switchboard-remote"
-VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage", "keys", "resize")
+VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage", "keys", "resize", "health")
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -142,6 +142,33 @@ class ResizeResponse(_Response):
     rows: int = Field(ge=0)
 
 
+HEALTH_NAMES = ("root", "home", "claudeHome", "windows")
+"""The file systems `health` reports, by label (never by path)."""
+MAX_BYTES = 2**63
+
+
+class FilesystemInfo(_Response):
+    name: Annotated[str, _capped(32)]
+    """One of HEALTH_NAMES; others (a newer dispatcher) are ignored by the hub."""
+    total_bytes: int | None = Field(default=None, alias="totalBytes", ge=0, le=MAX_BYTES)
+    free_bytes: int | None = Field(default=None, alias="freeBytes", ge=0, le=MAX_BYTES)
+    read_only: bool = Field(default=False, alias="readOnly")
+    same_as: Annotated[str | None, _capped(32)] = Field(default=None, alias="sameAs")
+    error: Annotated[str | None, _capped(32)] = None
+    """`unavailable`, `timeout` or `not_mounted` (the Windows drive)."""
+
+
+class HealthResponse(_Response):
+    """`health` (dispatcher 0.9.0): numbers and fixed labels only."""
+
+    wsl: bool = False
+    filesystems: Annotated[list[FilesystemInfo], Field(max_length=8)] = Field(default_factory=list)
+    load: Annotated[list[Annotated[float, Field(ge=0, le=1e6)]], Field(max_length=3)] | None = None
+    memory_total_bytes: int | None = Field(default=None, alias="memoryTotalBytes", ge=0, le=MAX_BYTES)
+    memory_available_bytes: int | None = Field(default=None, alias="memoryAvailableBytes", ge=0, le=MAX_BYTES)
+    uptime_seconds: float | None = Field(default=None, alias="uptimeSeconds", ge=0, le=1e12)
+
+
 class UsageResponse(BaseModel):
     """The parsed JSON lines of `usage` (built with `model_construct`, already checked)."""
 
@@ -160,6 +187,7 @@ RESPONSE_MODELS: dict[str, type[_Response]] = {
     "send": SendResponse,
     "keys": KeysResponse,
     "resize": ResizeResponse,
+    "health": HealthResponse,
 }
 
 

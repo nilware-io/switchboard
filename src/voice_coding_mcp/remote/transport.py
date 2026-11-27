@@ -3,7 +3,9 @@
 
 `Transport.call` never raises. Every failure maps to a fixed code that the speech layer turns into
 words: `timeout`, `host_key`, `auth`, `refused`, `dispatcher_missing`, `bad_response`,
-`refused_by_policy` (the dispatcher said no; its own code is in `detail`) or `other`; an `agent`
+`refused_by_policy` (the dispatcher said no; its own code is in `detail`), `remote_failed` (the
+dispatcher ran but the machine could not do it, such as `tmux_failed`; the code is in `detail`) or
+`other`; an `agent`
 machine (`agents.AgentTransport`) adds `not_connected` (nothing was sent) and `disconnected` (the
 connection closed after the request went out). Processes run
 from argv (never a shell) in a new session and are killed as a process group on timeout and when
@@ -42,6 +44,7 @@ TransportError = Literal[
     "dispatcher_missing",
     "bad_response",
     "refused_by_policy",
+    "remote_failed",
     "other",
     "not_connected",
     "disconnected",
@@ -57,6 +60,15 @@ TEST_ENV_RE = re.compile(r"SWITCHBOARD_REMOTE_TEST\w*|FAKE_TMUX_\w+")
 """Test hooks passed on to a local dispatcher when the server itself has them."""
 
 
+REMOTE_FAILURES = ("tmux_failed",)
+"""Dispatcher error codes that mean something failed on the machine, not that the request was refused."""
+
+
+def dispatcher_error(code: str) -> TransportError:
+    """The transport error of a dispatcher's own error code (`{"ok": false, "error": code}`)."""
+    return "remote_failed" if code in REMOTE_FAILURES else "refused_by_policy"
+
+
 @dataclass(frozen=True)
 class TransportResult:
     ok: bool
@@ -64,7 +76,8 @@ class TransportResult:
     """The parsed response (protocol model of the verb) when ok."""
     error: TransportError | None = None
     detail: str | None = None
-    """With `refused_by_policy`: the dispatcher's error code (`gone`, `bad_request`, ...)."""
+    """With `refused_by_policy` and `remote_failed`: the dispatcher's error code (`gone`,
+    `bad_request`, `tmux_failed`, ...)."""
     elapsed_ms: int = 0
 
 
@@ -233,7 +246,7 @@ def interpret(verb: str, result: ProcessResult, *, via_ssh: bool, started: float
     except ResponseError as err:
         return failed("bad_response" if err.code == "bad_response" else "dispatcher_missing")
     if isinstance(parsed, str):
-        return failed("refused_by_policy", parsed)
+        return failed(dispatcher_error(parsed), parsed)
     return TransportResult(ok=True, data=parsed, elapsed_ms=elapsed)
 
 

@@ -36,7 +36,8 @@ from KEY_NAMES, only with --allow-send; bound to the menu or permission dialog t
 `resize <paneId> <panePid> <sessionId|none> <columns> <rows>` (the pane's window, only with
 --allow-send),
 `usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
-only with --allow-usage). Every response is one JSON document on stdout,
+only with --allow-usage), `health` (free space and the read-only flag of the file systems that matter,
+load, memory and uptime; read-only, no opt-in, 0.9.0). Every response is one JSON document on stdout,
 `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`, except a
 successful `usage`, which is JSON lines (a header document, then file headers and token records
 without any text, then `{"done": true, ...}`); the exit code is 0 also for refusals. Nothing from the request ever reaches a shell: tmux runs from argv with
@@ -65,9 +66,9 @@ import unicodedata
 from collections.abc import Iterator
 from typing import BinaryIO
 
-VERSION = "0.6.0"
+VERSION = "0.9.0"
 PROTOCOL = 1
-VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize")
+VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize", "health")
 PROGRAM = "switchboard-remote"
 
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}")
@@ -793,7 +794,7 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
     verb, args = tokens[0], tokens[1:]
     if verb not in VERBS:
         raise RefusedError("bad_request")
-    if verb in ("version", "list") and args:
+    if verb in ("version", "list", "health") and args:
         raise RefusedError("bad_request")
     if verb == "capture":
         if len(args) != 2 or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
@@ -1326,6 +1327,136 @@ def verb_resize(policy: Policy, env: dict[str, str], args: list[str]) -> dict[st
     return {"resized": True, "columns": int(columns), "rows": int(rows)}
 
 
+# --- health ------------------------------------------------------------------------------------
+
+WSL_HOST_DRIVE = "/mnt/c"
+"""The Windows drive a WSL machine's disk image usually lives on, as DrvFs mounts it."""
+HOST_PROBE_SECONDS = 3.0
+"""Longest wait for the statvfs of the Windows drive: DrvFs goes through the Windows host, which may
+hang. The probe runs in a daemon thread; while one hangs, no second one starts."""
+_host_probe_lock = threading.Lock()
+_host_probe_busy = [False]
+
+
+def _filesystem(name: str, path: str) -> dict[str, object]:
+    """Free and total bytes of the file system holding `path` (statvfs, never a walk) and whether it
+    is mounted read-only. `freeBytes` is what an unprivileged user may still write."""
+    try:
+        info = os.statvfs(path)
+        device = os.stat(path).st_dev
+    except OSError:
+        return {"name": name, "error": "unavailable"}
+    return {
+        "name": name,
+        "totalBytes": info.f_blocks * info.f_frsize,
+        "freeBytes": info.f_bavail * info.f_frsize,
+        "readOnly": bool(info.f_flag & os.ST_RDONLY),
+        "_device": device,
+    }
+
+
+def _read_small(path: str, limit: int = 65536) -> str:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def is_wsl(proc: str = "/proc") -> bool:
+    """A WSL kernel names Microsoft in its release (`6.6.87.2-microsoft-standard-WSL2`)."""
+    text = _read_small(os.path.join(proc, "sys", "kernel", "osrelease")) or _read_small(os.path.join(proc, "version"))
+    return "microsoft" in text.lower()
+
+
+def is_mounted(path: str, proc: str = "/proc") -> bool:
+    """`path` is a mount point in /proc/self/mounts (read, never walked)."""
+    for line in _read_small(os.path.join(proc, "self", "mounts"), 1024 * 1024).splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == path:
+            return True
+    return False
+
+
+def _probe_host_drive(path: str, seconds: float) -> dict[str, object]:
+    with _host_probe_lock:
+        if _host_probe_busy[0]:
+            return {"name": "windows", "error": "timeout"}
+        _host_probe_busy[0] = True
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            result.update(_filesystem("windows", path))
+        finally:
+            with _host_probe_lock:
+                _host_probe_busy[0] = False
+
+    worker = threading.Thread(target=run, name="host-drive-probe", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        return {"name": "windows", "error": "timeout"}
+    return dict(result)
+
+
+def _meminfo(proc: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for line in _read_small(os.path.join(proc, "meminfo")).splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if key in ("MemTotal", "MemAvailable") and parts and parts[0].isdigit():
+            out[key] = int(parts[0]) * 1024
+    return out
+
+
+def verb_health(
+    policy: Policy, env: dict[str, str], proc: str = "/proc", host_drive: str = WSL_HOST_DRIVE
+) -> dict[str, object]:
+    """Free space and the read-only flag of `/`, `$HOME` and the Claude Code home, on WSL also of the
+    Windows drive (statvfs of `/mnt/c` when it is mounted), plus load, memory and uptime. Labels
+    only, never paths. A file system already reported under an earlier label says `sameAs`."""
+    wsl = is_wsl(proc)
+    systems = [
+        _filesystem("root", "/"),
+        _filesystem("home", home_dir(env)),
+        _filesystem("claudeHome", claude_home(policy, env)),
+    ]
+    if wsl:
+        systems.append(
+            _probe_host_drive(host_drive, HOST_PROBE_SECONDS)
+            if is_mounted(host_drive, proc)
+            else {"name": "windows", "error": "not_mounted"}
+        )
+    seen: dict[object, str] = {}
+    for entry in systems:
+        device = entry.pop("_device", None)
+        if device is None:
+            continue
+        if device in seen:
+            entry["sameAs"] = seen[device]
+        else:
+            seen[device] = str(entry["name"])
+    try:
+        load: list[float] | None = [round(value, 2) for value in os.getloadavg()]
+    except (OSError, AttributeError):
+        load = None
+    memory = _meminfo(proc)
+    uptime_text = _read_small(os.path.join(proc, "uptime")).split()
+    try:
+        uptime: float | None = round(float(uptime_text[0]), 1) if uptime_text else None
+    except ValueError:
+        uptime = None
+    return {
+        "wsl": wsl,
+        "filesystems": systems,
+        "load": load,
+        "memoryTotalBytes": memory.get("MemTotal"),
+        "memoryAvailableBytes": memory.get("MemAvailable"),
+        "uptimeSeconds": uptime,
+    }
+
+
 # --- usage -------------------------------------------------------------------------------------
 
 _TIMESTAMP_RE = re.compile(
@@ -1601,6 +1732,8 @@ def run_request(
             body = verb_keys(policy, env, args)
         elif verb == "resize":
             body = verb_resize(policy, env, args)
+        elif verb == "health":
+            body = verb_health(policy, env)
         elif verb == "usage":
             lines = verb_usage(policy, env, args, stdin)
             body = {"stream": "usage"}

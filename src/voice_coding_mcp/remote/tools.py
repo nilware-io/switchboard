@@ -23,9 +23,11 @@ from dataclasses import dataclass, field
 from ..clock import now_ms
 from ..config import Config
 from ..log import Logger
+from ..notify import TextSender
 from ..projects import MatchOk
 from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
+from ..usage.compute import PeriodError, parse_period
 from .agents import AgentHub
 from .audit import AuditLog
 from .check import check_machine
@@ -46,6 +48,22 @@ from .dispatcher import (
     keys_problem,
     shows_draft,
     shows_picker,
+)
+from .health import HealthPoller, HealthPollerOptions
+from .incidents import (
+    HUB,
+    Incident,
+    IncidentLog,
+    IncidentTracker,
+    ObservedTransport,
+    TrackerOptions,
+    format_spoken,
+    link_down,
+    link_up,
+    open_clause,
+    owner_incident,
+    relay_problem,
+    zone_of,
 )
 from .inventory import Inventory, resolve_machine
 from .menu import footer_block, screen_menu
@@ -128,6 +146,14 @@ KEYS_REFUSAL = {
     "too_many": f"That is too many keys at once; I press at most {MAX_KEYS}.",
     "unknown": f"I can only press {_SPOKEN_KEYS}.",
 }
+SUMMARY_FAILURES = {
+    "auth_failed": "the summariser's Claude Code login was refused (an expired or revoked token, HTTP 401); "
+    "run claude setup-token for the hub user",
+    "timeout": "the summariser did not answer within remote.summary.timeoutSeconds",
+    "error": "the summariser's claude -p run failed (details in the hub's journal)",
+}
+CALL_COMPONENTS = ("transport", "dispatcher", "tmux", "agent_link")
+"""Incidents an answer that says the machine failed already covers."""
 UNREACHED_ERRORS = ("refused", "host_key", "auth", "not_connected")
 """ssh failed before it connected, or an agent machine had no connection: nothing was typed. Every other failure after the request was
 handed over (also `dispatcher_missing`, which an unexpected banner can cause) is an unknown outcome."""
@@ -166,6 +192,8 @@ class RemoteToolsOptions:
     agents: AgentHub | None = None
     """The relay socket server for `agent` machines. Default: one when an agent machine is
     configured (started by `start`, stopped by `stop`)."""
+    notify: TextSender | None = None
+    """Plain-text pushes (`HttpNotifier.send_text`), used for incidents with `incidents.notify`."""
 
 
 class _Deadline:
@@ -186,10 +214,31 @@ class RemoteTools:
         self.agents = options.agents
         if self.agents is None and any(m.transport == "agent" for m in config.remote.machines):
             self.agents = AgentHub(config.remote, config.state_dir, options.logger)
-        transports = options.transports or {
+        incidents = config.incidents
+        self.incident_tz = zone_of(incidents)
+        self.incident_log = IncidentLog(
+            config.state_dir,
+            max_bytes=incidents.max_kilobytes * 1024,
+            keep_files=incidents.keep_files,
+            tz=self.incident_tz,
+            logger=self._logger,
+        )
+        self.incidents = IncidentTracker(
+            TrackerOptions(
+                log=self.incident_log,
+                settle_seconds=incidents.settle_seconds,
+                enabled=incidents.enabled,
+                logger=self._logger.child({"component": "incidents"}),
+                now=options.now,
+                notify=options.notify if incidents.notify else None,
+            )
+        )
+        raw = options.transports or {
             m.name: make_transport(m, config.remote, config.state_dir, options.base_env, self.agents)
             for m in config.remote.machines
         }
+        # Every dispatcher call, also those of `usage_report`, opens and ends incidents.
+        transports = {name: ObservedTransport(transport, self.incidents) for name, transport in raw.items()}
         self.transports: dict[str, Transport] = dict(transports)
         """One per machine; `usage_report` calls the same ones."""
         self._now = options.now or now_ms
@@ -213,6 +262,7 @@ class RemoteTools:
                 logger=self._logger,
                 base_env=options.base_env,
                 now=options.now,
+                report=self._summary_outcome,
             )
         )
         self._background: set[asyncio.Task[str | None]] = set()
@@ -226,15 +276,167 @@ class RemoteTools:
             )
         )
 
+        self.health = HealthPoller(
+            HealthPollerOptions(
+                remote=config.remote,
+                health=incidents.health,
+                transports=self.transports,
+                tracker=self.incidents,
+                state_dir=config.state_dir,
+                logger=self._logger.child({"component": "incidents"}),
+                tz=self.incident_tz,
+                now=options.now,
+            )
+        )
+
     async def start(self) -> None:
-        """Starts serving agent machines (the app's lifespan)."""
+        """Starts serving agent machines and the incident loop (the app's lifespan)."""
+        await self.health.start()
         if self.agents is not None:
             self.agents.check = self._agent_check
+            self.agents.on_link = self._on_link
+            self.agents.on_relay_problem = self._on_relay_problem
             await self.agents.start()
 
     async def stop(self) -> None:
         if self.agents is not None:
             await self.agents.stop()
+        await self.health.stop()
+
+    # --- incidents -------------------------------------------------------------------------------
+
+    def _on_link(self, machine: str, up: bool, reason: str | None, at_ms: int) -> None:
+        try:
+            if up:
+                link_up(self.incidents, machine, at_ms)
+                self.health.poll_soon(machine)
+            else:
+                link_down(self.incidents, machine, reason, at_ms)
+        except Exception as err:
+            self._logger.error("incident observation failed", {"error": type(err).__name__})
+
+    def _on_relay_problem(self, code: str, machine: str | None) -> None:
+        relay_problem(self.incidents, code, machine)
+
+    def _summary_outcome(self, failure: str | None) -> None:
+        """The summariser's outcome: None when it answered, else its failure code."""
+        try:
+            if failure is None:
+                self.incidents.recovered(HUB, components=["summariser"], recovery="a summary worked again")
+            else:
+                self.incidents.fail(
+                    HUB,
+                    "summariser",
+                    failure,
+                    what="screen summaries failed",
+                    why=SUMMARY_FAILURES.get(failure, SUMMARY_FAILURES["error"]),
+                    effect="remote_status answered with the last screen line instead of a summary",
+                )
+        except Exception as err:
+            self._logger.error("incident observation failed", {"error": type(err).__name__})
+
+    def tool_failed(self, tool: str, error: BaseException) -> None:
+        """A tool raised: an incident with the exception's type only (its text may hold anything)."""
+        try:
+            self.incidents.fail(
+                HUB,
+                "tool",
+                tool,
+                what=f"the tool {tool} failed",
+                why=f"it raised {type(error).__name__} (details in the hub's journal)",
+                effect=f"a {tool} call got an error instead of an answer",
+                instant=True,
+            )
+        except Exception as err:
+            self._logger.error("incident observation failed", {"error": type(err).__name__})
+
+    def open_incidents(self, machine: str, *, failed_now: bool = False) -> list[Incident]:
+        """The machine's incidents that are still open and not just recovering. With `failed_now`
+        (the answer already says the machine failed) without those of its link, dispatcher and tmux."""
+        incidents, _ = self.incident_log.read()
+        return [
+            i
+            for i in incidents
+            if i.machine == machine
+            and i.open
+            and not self.incidents.recovering(i.id)
+            and not (failed_now and i.component in CALL_COMPONENTS)
+        ]
+
+    def _with_clause(self, machine: str, text: str, *, failed_now: bool = False) -> str:
+        return text + open_clause(self.open_incidents(machine, failed_now=failed_now))
+
+    def incidents_report(
+        self, machine: str | None, since: str | None, open_only: bool, *, details: bool = False
+    ) -> ToolAnswer:
+        """The `incidents` tool: the period's incidents (default today) plus every one still open."""
+        names = [m.name for m in self.inventory.machines]
+        wanted: str | None = None
+        if machine is not None and machine.strip():
+            spoken = machine.strip().lower()
+            if spoken in (HUB, "the hub"):
+                wanted = HUB
+            else:
+                found = resolve_machine(self.inventory.machines, machine)
+                if not isinstance(found, MatchOk):
+                    return ToolAnswer(
+                        format_machine_problem(machine, names, ambiguous=found.reason == "ambiguous"), True
+                    )
+                wanted = found.item.name
+        now = self._now()
+        try:
+            period = parse_period(since or "today", now, self.incident_tz)
+        except PeriodError:
+            return ToolAnswer(f"I did not understand the period {since!r}. Try today, yesterday or this week.", True)
+        incidents, _ = self.incident_log.read()
+        chosen = [
+            i
+            for i in incidents
+            if (wanted is None or i.machine == wanted)
+            and (
+                (i.open and not self.incidents.recovering(i.id))
+                if open_only
+                else (
+                    i.open
+                    or (period.start_ms <= i.start_ms < period.end_ms)
+                    or (i.end_ms is not None and period.start_ms <= i.end_ms < period.end_ms)
+                )
+            )
+        ]
+        label = "open now" if open_only else period.label
+        self._logger.info("tool call", {"tool": "incidents", "machine": wanted, "count": len(chosen)})
+        return ToolAnswer(
+            format_spoken(
+                chosen,
+                label=label,
+                now=now,
+                tz=self.incident_tz,
+                recovering=self.incidents.recovering,
+                with_why=details,
+            )
+        )
+
+    def incident_note(self, machine: str, what: str, why: str | None) -> ToolAnswer:
+        """The `incident_note` tool: the owner's own report, recorded as a closed note. Nothing else
+        happens because of it."""
+        spoken = machine.strip().lower()
+        if spoken in (HUB, "the hub"):
+            name = HUB
+        else:
+            found = resolve_machine(self.inventory.machines, machine)
+            if not isinstance(found, MatchOk):
+                names = [m.name for m in self.inventory.machines]
+                return ToolAnswer(format_machine_problem(machine, names, ambiguous=found.reason == "ambiguous"), True)
+            name = found.item.name
+        now = self._now()
+        incident = owner_incident(machine=name, what=what, why=why or "", source="owner", start_ms=now, end_ms=now)
+        if not incident.what:
+            return ToolAnswer("What went wrong? Tell me in a few words and I will note it.", True)
+        written = self.incident_log.write(incident)
+        self._logger.info("tool call", {"tool": "incident_note", "machine": name, "id": incident.id, "ok": written})
+        if not written:
+            return ToolAnswer("I could not write the note: the hub's disk refused it.", True)
+        return ToolAnswer(f"Noted for {'the hub' if name == HUB else name}: {incident.what}.")
 
     async def _agent_check(self, name: str) -> tuple[list[str], bool]:
         """`remote-check <machine>` for an agent machine, asked through the control socket."""
@@ -260,7 +462,11 @@ class RemoteTools:
         self._logger.info(
             "tool call", {"tool": "list_remote_sessions", "machines": len(views), "reachable": sum(v.ok for v in views)}
         )
-        return ToolAnswer(format_list(views, total_machines=len(machines)))
+        clauses = {
+            view.machine.name: open_clause(self.open_incidents(view.machine.name, failed_now=not view.ok))
+            for view in views
+        }
+        return ToolAnswer(format_list(views, total_machines=len(machines), notes=clauses))
 
     async def pending_input(self, machine: str | None) -> ToolAnswer:
         """Which sessions wait on the owner: every machine plus the hub's own registry, or one machine."""
@@ -310,7 +516,8 @@ class RemoteTools:
         name = found.item.name
         view = await self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left())
         if not view.ok:
-            return ToolAnswer(unreachable_sentence(name, view.error, view.detail), True)
+            sentence = unreachable_sentence(name, view.error, view.detail)
+            return ToolAnswer(self._with_clause(name, sentence, failed_now=True), True)
         resolved = resolve_target(view, target)
         if not isinstance(resolved, Resolved):
             return ToolAnswer(format_target_problem(name, resolved), True)
@@ -345,7 +552,7 @@ class RemoteTools:
             if cut or (rows < RESIZE_ROWS[0] and (unread or len(screen.lstrip("\n").split("\n")) >= rows)):
                 note = cut_note(rows, found.item.allow_send and rows < RESIZE_ROWS[1], menu_cut=cut)
         answer = await self._describe(name, pane, label, screen, deadline)
-        return ToolAnswer(answer.text + note, answer.is_error) if note else answer
+        return ToolAnswer(self._with_clause(name, answer.text + note), answer.is_error)
 
     def _log_answer(self, machine: str, pane: PaneInfo, path: str, reason: str | None = None) -> None:
         """Which path answered `remote_status` (no screen text)."""
@@ -950,7 +1157,7 @@ class RemoteTools:
             return "sent", None
         if result.ok:
             return "unknown", None
-        if result.error == "refused_by_policy":
+        if result.error in ("refused_by_policy", "remote_failed"):
             if result.detail == "pasted_no_enter":
                 return "pasted_no_enter", None
             return f"not_sent:{result.detail or 'other'}", result.detail
