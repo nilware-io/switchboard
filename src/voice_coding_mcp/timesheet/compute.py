@@ -12,7 +12,8 @@
 - The time between two events belongs to the project of the later event (its own `cwd`'s
   repository); a lone event's minute to its own project.
 - Voice: every Switchboard tool call of the owner is an event pair (start, end) of the project it
-  targeted (`(voice)` when none); chains as above, all owner time.
+  targeted (`(voice)` when none); chains as above, all owner time. `(voice)` time counts only where
+  no project has owner time at that moment.
 - Per project and day: owner time is the union of the owner parts and voice chains, agent time the
   union of the agent parts. With `ownerOverlap` `split` a moment of owner time in several projects is
   divided equally between them, so owner hours never exceed wall-clock hours; `full` counts it in
@@ -190,6 +191,24 @@ def days_of(period: Period, tz: tzinfo | None) -> list[tuple[str, int, int]]:
         day += timedelta(days=1)
 
 
+def subtract(intervals: Sequence[Interval], minus: Sequence[Interval]) -> list[Interval]:
+    """`intervals` (sorted, disjoint) without the parts covered by `minus` (sorted, disjoint)."""
+    out: list[Interval] = []
+    for a, b in intervals:
+        start = a
+        for c, d in minus:
+            if d <= start or c >= b:
+                continue
+            if c > start:
+                out.append((start, c))
+            start = max(start, d)
+            if start >= b:
+                break
+        if start < b:
+            out.append((start, b))
+    return out
+
+
 def _split(owner: dict[str, list[Interval]]) -> tuple[dict[str, float], dict[str, float], int]:
     """Owner ms per project with shared moments divided equally, the shared ms per project, and the
     wall-clock total."""
@@ -245,6 +264,11 @@ def compute_time(
     result = TimeResult()
     for label, start, end in days_of(period, tz):
         day_owner = {p: union(clip(i, start, end)) for p, i in owner.items()}
+        loose = day_owner.get(VOICE_PROJECT)
+        if loose:
+            # Voice calls that named no project add only time no project already has.
+            others = union(i for p, items in day_owner.items() if p != VOICE_PROJECT for i in items)
+            day_owner[VOICE_PROJECT] = subtract(loose, others)
         day_owner = {p: i for p, i in day_owner.items() if i}
         share, shared, wall = _split(day_owner)
         result.wall_owner_ms += wall

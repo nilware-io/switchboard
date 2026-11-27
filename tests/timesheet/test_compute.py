@@ -244,3 +244,16 @@ def test_default_period_is_last_week_monday_to_sunday() -> None:
 )
 def test_rounding(ms: int, step: int, mode: Any, expected: int) -> None:
     assert round_minutes(ms, step, mode) == expected
+
+
+def test_unattributed_voice_time_does_not_take_from_projects() -> None:
+    t = transcript([u(T0), a(T0 + 10 * MIN)])
+    voice = [
+        VoiceEvent(T0 + 5 * MIN, T0 + 5 * MIN + 1_000, None),
+        VoiceEvent(T0 + 12 * MIN, T0 + 12 * MIN + 1_000, None),
+    ]
+    result = run([Source("dev", t)], voice)
+    assert minutes(result, "alpha", "2026-11-17", "owner") == 10
+    # The voice chain from 5 to 12 minutes and 1 second counts only after 10 minutes.
+    assert result.days[VOICE_PROJECT]["2026-11-17"].owner_ms == 2 * MIN + 1_000
+    assert result.wall_owner_ms == 12 * MIN + 1_000
