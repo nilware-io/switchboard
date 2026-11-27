@@ -29,6 +29,21 @@ from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from ..usage.compute import PeriodError, parse_period
 from .agents import AgentHub
+from .attachments import (
+    BUSY_WORDS,
+    EMBED_MAX_BYTES,
+    LINK_FETCH_SECONDS,
+    MAX_CONCURRENT_FETCHES,
+    FetchLimiter,
+    Media,
+    Reservation,
+    format_attachments,
+    format_link,
+    format_sent,
+    format_still_coming,
+    pick,
+    refusal_words,
+)
 from .audit import AuditLog
 from .check import check_machine
 from .config import MachineConfig, command_timeout_seconds, known_names, known_terms
@@ -43,9 +58,11 @@ from .dispatcher import (
     SEND_ANSWER,
     SEND_CHECK_LINES,
     SEND_MESSAGE,
+    RefusedError,
     bound_menu_hash,
     dialog_bound,
     keys_problem,
+    media_check,
     shows_draft,
     shows_picker,
 )
@@ -66,6 +83,7 @@ from .incidents import (
     zone_of,
 )
 from .inventory import Inventory, resolve_machine
+from .links import LINK_PATH, LINK_TTL_MS, Link, LinkStore
 from .menu import footer_block, screen_menu
 from .pending import (
     PendingChecker,
@@ -75,7 +93,17 @@ from .pending import (
     waiting_for_text,
     waits_for_permission,
 )
-from .protocol import CaptureResponse, KeysResponse, PaneInfo, ResizeResponse, SendResponse, VersionResponse
+from .protocol import (
+    AttachmentInfo,
+    AttachmentResponse,
+    AttachmentsResponse,
+    CaptureResponse,
+    KeysResponse,
+    PaneInfo,
+    ResizeResponse,
+    SendResponse,
+    VersionResponse,
+)
 from .redact import clean_name, clean_screen
 from .send import (
     KEYS,
@@ -107,6 +135,7 @@ from .speech import (
     format_status,
     format_target_problem,
     pane_label,
+    quote,
     send_place,
     text_refusal,
     unreachable_sentence,
@@ -172,6 +201,33 @@ class Caller:
 class ToolAnswer:
     text: str
     is_error: bool = False
+    media: Media | None = None
+    """`remote_attachment`: the checked media to return as MCP content after the text."""
+
+
+class _FetchSlot:
+    """The one fetch slot a `remote_attachment` call takes; released exactly once, by the call or,
+    once handed over, by the background fetch for a link (a cancelled call must not release a slot
+    its fetch still holds)."""
+
+    def __init__(self, release: Callable[[], None]) -> None:
+        self._release = release
+        self.handed_over = False
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._release()
+
+
+@dataclass
+class _LinkFetch:
+    """A large video on its way to a link: the fetch outlives the tool call that started it."""
+
+    machine: str
+    entry: AttachmentInfo
+    task: asyncio.Task[ToolAnswer]
 
 
 @dataclass
@@ -266,6 +322,11 @@ class RemoteTools:
             )
         )
         self._background: set[asyncio.Task[str | None]] = set()
+        self.fetches = FetchLimiter(now=self._now)
+        self._fetching = 0
+        self.links = LinkStore(now=self._now, on_end=self._link_ended)
+        """Large videos held in memory for their one-time link (served by the HTTP app)."""
+        self._link_fetch: _LinkFetch | None = None
         self._verbs: dict[str, tuple[int, frozenset[str]]] = {}
         self._pending = PendingChecker(
             PendingCheckerOptions(
@@ -299,6 +360,12 @@ class RemoteTools:
             await self.agents.start()
 
     async def stop(self) -> None:
+        waiting, self._link_fetch = self._link_fetch, None
+        if waiting is not None and not waiting.task.done():
+            waiting.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiting.task
+        self.links.close()
         if self.agents is not None:
             await self.agents.stop()
         await self.health.stop()
@@ -1097,6 +1164,297 @@ class RemoteTools:
             },
         )
         return ToolAnswer(format_confirm_outcome(item, outcome, detail), outcome != "sent")
+
+    # --- attachments ---------------------------------------------------------------------------
+
+    def _attachment_machine(self, machine: str | None) -> MachineConfig | ToolAnswer:
+        found = resolve_machine(self.inventory.machines, machine)
+        if not isinstance(found, MatchOk):
+            return ToolAnswer(
+                format_machine_problem(
+                    machine, [m.name for m in self.inventory.machines], ambiguous=found.reason == "ambiguous"
+                ),
+                True,
+            )
+        if not found.item.allow_attachments:
+            return ToolAnswer(
+                f"Attachments are off for {found.item.name} in the hub's config (allowAttachments).", True
+            )
+        return found.item
+
+    async def _list_attachments(
+        self, name: str, deadline: _Deadline
+    ) -> tuple[AttachmentsResponse | None, ToolAnswer | None]:
+        transport = self.inventory.transport(name)
+        left = min(float(command_timeout_seconds(self._remote, transport.machine)), deadline.left())
+        result = await transport.call("attachments", timeout_seconds=max(0.5, left))
+        self._logger.info(
+            "remote call",
+            {
+                "machine": name,
+                "verb": "attachments",
+                "ok": result.ok,
+                "error": result.error,
+                "detail": result.detail,
+                "ms": result.elapsed_ms,
+            },
+        )
+        if result.ok and isinstance(result.data, AttachmentsResponse):
+            return result.data, None
+        if result.ok:
+            return None, ToolAnswer(unreachable_sentence(name, "bad_response"), True)
+        words = refusal_words(result.detail, name, None) if result.error == "refused_by_policy" else None
+        return None, ToolAnswer(words or unreachable_sentence(name, result.error, result.detail), True)
+
+    async def remote_attachments(self, machine: str | None, kind: str | None = None) -> ToolAnswer:
+        """The media files in a machine's outbox, newest first (names quoted as the machine's)."""
+        found = self._attachment_machine(machine)
+        if isinstance(found, ToolAnswer):
+            return found
+        listing, problem = await self._list_attachments(found.name, self._deadline())
+        self._logger.info(
+            "tool call",
+            {
+                "tool": "remote_attachments",
+                "machine": found.name,
+                "count": len(listing.attachments) if listing else None,
+            },
+        )
+        if listing is None:
+            assert problem is not None
+            return problem
+        return ToolAnswer(
+            format_attachments(
+                found.name,
+                listing.attachments,
+                skipped=listing.skipped,
+                outbox=listing.outbox,
+                now=self._now(),
+                kind=kind,
+            )
+        )
+
+    async def remote_attachment(
+        self, machine: str | None, name: str | None, kind: str | None, caller: Caller
+    ) -> ToolAnswer:
+        """One media file from a machine's outbox (the newest, of `kind`, without a name), checked
+        again here before it goes to the client."""
+        found = self._attachment_machine(machine)
+        if isinstance(found, ToolAnswer):
+            return found
+        machine_name = found.name
+        waiting = self._link_fetch
+        if waiting is not None:
+            # A large video still on its way: asking for it again waits for it instead of
+            # fetching it a second time. Once it is done it is forgotten (`_fetch_done`); a link
+            # it made is found again by `links.find`, as long as it is live.
+            if waiting.machine == machine_name and pick([waiting.entry], name, kind) is not None:
+                return await self._link_answer(waiting, self._deadline())
+            return ToolAnswer(BUSY_WORDS, True)
+        if self._fetching >= MAX_CONCURRENT_FETCHES:
+            return ToolAnswer(BUSY_WORDS, True)
+        self._fetching += 1
+        slot = _FetchSlot(self._release_fetch)
+        try:
+            return await self._remote_attachment(machine_name, name, kind, caller, slot)
+        finally:
+            if not slot.handed_over:
+                slot.release()
+
+    async def _link_answer(self, waiting: _LinkFetch, deadline: _Deadline) -> ToolAnswer:
+        """The answer of a large video's fetch once it is done, or that it is still coming."""
+        done, _ = await asyncio.wait({waiting.task}, timeout=max(0.0, deadline.left()))
+        if not done:
+            return ToolAnswer(format_still_coming(waiting.machine, waiting.entry))
+        return waiting.task.result()
+
+    def _release_fetch(self) -> None:
+        self._fetching -= 1
+
+    def _fetch_done(self, waiting: _LinkFetch, slot: _FetchSlot) -> None:
+        """A background fetch ended: its slot is free, and it is no longer the one being waited for."""
+        slot.release()
+        if self._link_fetch is waiting:
+            self._link_fetch = None
+
+    async def _remote_attachment(
+        self, machine_name: str, name: str | None, kind: str | None, caller: Caller, slot: _FetchSlot
+    ) -> ToolAnswer:
+        """The answer; `slot` is handed over when a background fetch for a link takes it."""
+        if not self.fetches.allows(machine_name):
+            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
+        deadline = self._deadline()
+        listing, problem = await self._list_attachments(machine_name, deadline)
+        if listing is None:
+            assert problem is not None
+            return problem
+        entry = pick(listing.attachments, name, kind)
+        if entry is None:
+            what = {"image": "image", "audio": "audio file", "video": "video"}.get(kind or "", "media file")
+            if name:
+                return ToolAnswer(f"I found no {what} called {quote(name)} in the outbox on {machine_name}.", True)
+            return ToolAnswer(f"The outbox on {machine_name} has no {what}.", True)
+        large = entry.kind == "video" and entry.size > EMBED_MAX_BYTES
+        if large:
+            held = self.links.find(machine_name, entry.name, entry.size, entry.mtime)
+            if held is not None:
+                # The same file is still held for a link: hand that link out again.
+                self._audit_fetch(machine_name, entry, entry.kind, 0, outcome="link_again", caller=caller)
+                return ToolAnswer(format_link(held, self._link_url(held), entry.mtime, self._now()))
+        if not self.fetches.fits(entry.size):
+            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
+        # Counted before the machine is asked, so refused, failed and rejected transfers count too.
+        reservation = self.fetches.reserve(machine_name, entry.size)
+        if not large:
+            return await self._fetch_and_audit(machine_name, entry, deadline, reservation, caller)
+        # Too large for the tool call's time: the fetch runs on in the background (holding the
+        # fetch slot) for up to LINK_FETCH_SECONDS, and a later call for it gets the link.
+        task = asyncio.create_task(
+            self._background_fetch(machine_name, entry, _Deadline(LINK_FETCH_SECONDS), reservation, caller)
+        )
+        # Handed over before anything is awaited: if this call is cancelled while it waits, the
+        # slot stays with the fetch.
+        slot.handed_over = True
+        waiting = _LinkFetch(machine=machine_name, entry=entry, task=task)
+        task.add_done_callback(lambda _task: self._fetch_done(waiting, slot))
+        self._link_fetch = waiting
+        return await self._link_answer(waiting, deadline)
+
+    async def _background_fetch(
+        self, machine: str, entry: AttachmentInfo, deadline: _Deadline, reservation: Reservation, caller: Caller
+    ) -> ToolAnswer:
+        try:
+            return await self._fetch_and_audit(machine, entry, deadline, reservation, caller)
+        except Exception as err:
+            self._logger.error("attachment fetch failed", {"machine": machine, "error": err})
+            return ToolAnswer(unreachable_sentence(machine, "other"), True)
+
+    def _audit_fetch(
+        self, machine: str, entry: AttachmentInfo, kind: str | None, size: int, *, outcome: str, caller: Caller
+    ) -> None:
+        self.audit.record_attachment(
+            machine=machine,
+            name=entry.name,
+            kind=kind,
+            size=size,
+            outcome=outcome,
+            client=caller.fingerprint,
+            client_name=caller.name,
+        )
+        self._logger.info(
+            "tool call",
+            {"tool": "remote_attachment", "machine": machine, "kind": entry.kind, "bytes": size, "outcome": outcome},
+        )
+
+    async def _fetch_and_audit(
+        self, machine: str, entry: AttachmentInfo, deadline: _Deadline, reservation: Reservation, caller: Caller
+    ) -> ToolAnswer:
+        answer, outcome, size = await self._fetch_attachment(machine, entry, deadline, reservation)
+        kind = answer.media.kind if answer.media else entry.kind
+        self._audit_fetch(machine, entry, kind, size, outcome=outcome, caller=caller)
+        return answer
+
+    def _link_url(self, link: Link) -> str:
+        return f"{self._config.public_url}{LINK_PATH}{link.token}"
+
+    def _link_ended(self, link: Link, reason: str) -> None:
+        self.audit.record_link(
+            link=link.fingerprint,
+            machine=link.machine,
+            name=link.name,
+            kind=link.kind,
+            size=link.size,
+            outcome=reason,
+            requests=link.requests,
+            ranges=link.ranges,
+            served=link.served,
+        )
+        self._logger.info(
+            "attachment link ended",
+            {
+                "link": link.fingerprint,
+                "machine": link.machine,
+                "reason": reason,
+                "requests": link.requests,
+                "ranges": link.ranges,
+                "bytes": link.served,
+            },
+        )
+
+    async def _fetch_attachment(
+        self, machine: str, entry: AttachmentInfo, deadline: _Deadline, reservation: Reservation
+    ) -> tuple[ToolAnswer, str, int]:
+        """(answer, audit outcome, bytes sent to the client). The reservation keeps the listed size
+        unless the machine sent bytes, which then count instead."""
+        transport = self.inventory.transport(machine)
+        result = await transport.call("attachment", [entry.name], timeout_seconds=max(0.5, deadline.left()))
+        self._logger.info(
+            "remote call",
+            {
+                "machine": machine,
+                "verb": "attachment",
+                "ok": result.ok,
+                "error": result.error,
+                "detail": result.detail,
+                "ms": result.elapsed_ms,
+            },
+        )
+        if not result.ok:
+            words = refusal_words(result.detail, machine, entry.name) if result.error == "refused_by_policy" else None
+            outcome = f"refused:{result.detail}" if words else f"failed:{result.error}"
+            return ToolAnswer(words or unreachable_sentence(machine, result.error, result.detail), True), outcome, 0
+        data = result.data
+        rejected = ToolAnswer(
+            f"{machine} sent something for {quote(entry.name)} that is not the image, audio or video file it "
+            "listed, so I did not pass it on.",
+            True,
+        )
+        if not isinstance(data, AttachmentResponse):
+            return rejected, "rejected", 0
+        reservation.size = len(data.data)
+        if data.name != entry.name:
+            return rejected, "rejected", 0
+        # The machine is not trusted: the bytes must be a whole media file of the kind and type it
+        # claims, within the caps, by the hub's own check. The check is pure Python (bounded by
+        # MAX_MEDIA_ELEMENTS), so it runs in a worker thread and the event loop keeps serving.
+        try:
+            kind, mime, clean = await asyncio.to_thread(media_check, entry.name, data.data)
+        except RefusedError:
+            return rejected, "rejected", 0
+        if kind != data.kind or mime != data.mime:
+            return rejected, "rejected", 0
+        if kind == "video" and len(clean) > EMBED_MAX_BYTES:
+            return (
+                self._make_link(machine, entry, kind=kind, mime=mime, clean=clean, mtime=data.mtime),
+                "link",
+                len(clean),
+            )
+        media = Media(machine=machine, name=entry.name, kind=kind, mime=mime, data=clean)
+        return ToolAnswer(format_sent(media, data.mtime, self._now()), media=media), "sent", len(clean)
+
+    def _make_link(
+        self, machine: str, entry: AttachmentInfo, *, kind: str, mime: str, clean: bytes | bytearray, mtime: int | None
+    ) -> ToolAnswer:
+        """Holds the hub's cleaned copy in memory for a one-time link and answers with it."""
+        link = self.links.add(
+            machine=machine, name=entry.name, kind=kind, mime=mime, data=clean, size=entry.size, mtime=entry.mtime
+        )
+        self.audit.record_link(
+            link=link.fingerprint,
+            machine=machine,
+            name=entry.name,
+            kind=kind,
+            size=len(clean),
+            outcome="created",
+            expires=link.expires,
+        )
+        self._logger.info(
+            "attachment link created", {"link": link.fingerprint, "machine": machine, "bytes": len(clean)}
+        )
+        with contextlib.suppress(RuntimeError):
+            # The memory goes back when the link expires, also when nobody asks for it again.
+            asyncio.get_running_loop().call_later(LINK_TTL_MS / 1000 + 1, self.links.sweep)
+        return ToolAnswer(format_link(link, self._link_url(link), mtime, self._now()))
 
     def _machine(self, name: str) -> MachineConfig | None:
         return next((m for m in self.inventory.machines if m.name == name), None)

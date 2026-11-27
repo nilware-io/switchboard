@@ -22,7 +22,8 @@ async def check_machine(inventory: Inventory, name: str, warnings: Sequence[str]
     if isinstance(data, VersionResponse):
         lines.append(
             f"  switchboard-remote {data.version}, verbs {', '.join(data.verbs)}, "
-            f"send {'allowed' if data.allow_send else 'off'}, usage {'allowed' if data.allow_usage else 'off'}"
+            f"send {'allowed' if data.allow_send else 'off'}, usage {'allowed' if data.allow_usage else 'off'}, "
+            f"attachments {'allowed' if data.allow_attachments else 'off'}"
         )
     view = await inventory.view(name)
     lines.append("  " + machine_line(view))

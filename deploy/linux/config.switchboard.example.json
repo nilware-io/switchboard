@@ -31,7 +31,8 @@
         "allowUsage": true,
         "allowSend": false,
         "allowPermissionAnswers": false,
-        "sendToAnyPane": false
+        "sendToAnyPane": false,
+        "allowAttachments": false
       },
       {
         "name": "buildbox",

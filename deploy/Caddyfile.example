@@ -20,12 +20,14 @@ vcm.example.com {
 
 	# Optional hardening: Claude's connector traffic comes from
 	# 160.79.104.0/21. Everything except /authorize (which the owner opens in
-	# a browser to enter the pairing code) can be limited to that range.
+	# a browser to enter the pairing code) and /attachments/* (a large video's
+	# one-time link, which the owner's phone opens) can be limited to that
+	# range.
 	# Uncomment to enable. Note that /healthz then also answers 403 from
 	# outside; check it on the server with curl http://127.0.0.1:8787/healthz.
 	#
 	# @notClaude {
-	# 	not path /authorize
+	# 	not path /authorize /attachments/*
 	# 	not remote_ip 160.79.104.0/21
 	# }
 	# respond @notClaude "Forbidden" 403
@@ -39,7 +41,9 @@ vcm.example.com {
 			dial_timeout 5s
 			# Tool calls wait up to about 25 s (syncWaitSeconds) and voice
 			# mode gives up after roughly 30 to 40 s. Allow comfortably more
-			# than that before Caddy treats the backend as hung.
+			# than that before Caddy treats the backend as hung. A video
+			# link streams as fast as the phone reads; Range requests keep
+			# each response short.
 			response_header_timeout 90s
 			read_timeout 120s
 			write_timeout 120s
