@@ -1,5 +1,5 @@
 """Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher,
-remote-connector, agent-relay, audit, usage, set-public-url (argparse; usage errors exit 2).
+remote-connector, agent-relay, audit, usage, timesheet, set-public-url (argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -44,6 +44,7 @@ from .remote.inventory import Inventory
 from .remote.transport import DISPATCHER_PATH, make_transport
 from .sessions import claude_home_dir
 from .tasks.manager import TaskManager, TaskManagerOptions, load_tasks
+from .timesheet import cli as timesheet_cli
 from .usage.cache import HUB
 from .usage.compute import PERIOD_HELP, Grouping, PeriodError, parse_period
 from .usage.report import format_csv, format_table
@@ -191,6 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--by", choices=("project", "session", "day"), default="project", help="rows (default: project)")
     usage.add_argument("--csv", action="store_true", help="CSV with a header row instead of a table")
     usage.add_argument("--cached", action="store_true", help="use the cached records, do not read the machines")
+    timesheet_cli.add_parser(command)
     public_url = command(
         "set-public-url", "set publicUrl in the config file (deploy/linux/sb-linux on calls it); restart to apply"
     )
@@ -214,6 +216,7 @@ class ParsedArgs:
     cached: bool = False
     url: str | None = None
     socket: str | None = None
+    timesheet: timesheet_cli.TimesheetArgs | None = None
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -234,6 +237,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         cached=getattr(ns, "cached", False),
         url=getattr(ns, "url", None),
         socket=getattr(ns, "socket", None),
+        timesheet=timesheet_cli.args_of(ns) if ns.command == "timesheet" else None,
     )
 
 
@@ -907,6 +911,9 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
                 return _cmd_audit(config, args, io)
             case "usage":
                 return await _cmd_usage(config, args, io)
+            case "timesheet":
+                assert args.timesheet is not None
+                return await timesheet_cli.run(config, args.timesheet, io.out, io.err, io.env)
             case "set-public-url":
                 return _cmd_set_public_url(config_path, config, args.url or "", io)
     except Exception as err:
