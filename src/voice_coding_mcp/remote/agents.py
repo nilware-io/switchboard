@@ -58,7 +58,7 @@ FLAP_WINDOW_MS = 60_000
 FLAP_LIMIT = 3
 """More replacements of one machine than this within FLAP_WINDOW_MS log a warning."""
 HOUR_MS = 3_600_000
-READ_ONLY_VERBS = ("version", "list", "capture", "usage")
+READ_ONLY_VERBS = ("version", "list", "capture", "usage", "attachments", "attachment")
 """Retried once on the new connection when the one they went out on was replaced."""
 SOCKET_DIR_MODE = 0o2750
 CONTROL_SOCKET_NAME = "agents-control.sock"
@@ -120,12 +120,16 @@ class Hello:
     allow_usage: bool
     policy: str
     """`ok`, or `bad_policy` when the dispatcher's command line is broken (it refuses everything)."""
+    allow_attachments: bool = False
+    """Sent (as true) only by a dispatcher 0.7.0 or newer started with `--allow-attachments`."""
 
 
 def parse_hello(line: bytes) -> Hello | None:
     data = _object(line)
     keys = {"t", "protocol", "version", "verbs", "allowSend", "allowUsage", "policy"}
-    if data is None or set(data) != keys or data["t"] != "hello":
+    if data is None or not keys <= set(data) <= keys | {"allowAttachments"} or data["t"] != "hello":
+        return None
+    if data.get("allowAttachments", True) is not True:
         return None
     if type(data["protocol"]) is not int or data["protocol"] != PROTOCOL:
         return None
@@ -146,6 +150,7 @@ def parse_hello(line: bytes) -> Hello | None:
         allow_send=data["allowSend"],
         allow_usage=data["allowUsage"],
         policy=data["policy"],
+        allow_attachments="allowAttachments" in data,
     )
 
 
@@ -657,6 +662,11 @@ class AgentHub:
             out.append(
                 f"allowUsage is {'on' if machine.allow_usage else 'off'} on the hub, --allow-usage is not the same"
             )
+        if machine.allow_attachments != hello.allow_attachments:
+            out.append(
+                f"allowAttachments is {'on' if machine.allow_attachments else 'off'} on the hub, "
+                "--allow-attachments is not the same"
+            )
         return out
 
     # --- status and control ------------------------------------------------------------------
@@ -682,6 +692,7 @@ class AgentHub:
                         "verbs": list(conn.hello.verbs),
                         "allowSend": conn.hello.allow_send,
                         "allowUsage": conn.hello.allow_usage,
+                        "allowAttachments": conn.hello.allow_attachments,
                         "policy": conn.hello.policy,
                         "peer": conn.peer,
                         "warnings": self.disagreements(name, conn.hello),

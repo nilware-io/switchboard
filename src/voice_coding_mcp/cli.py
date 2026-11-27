@@ -355,7 +355,8 @@ async def _agent_status_lines(config: Config, now: int) -> list[str]:
             line = (
                 f"  - {name}: connected since {format_time(since)} ({format_ago(since, now)}), "
                 f"dispatcher {_clean(entry.get('version'))}, send {'allowed' if entry.get('allowSend') else 'off'}, "
-                f"usage {'allowed' if entry.get('allowUsage') else 'off'}{peer}"
+                f"usage {'allowed' if entry.get('allowUsage') else 'off'}, "
+                f"attachments {'allowed' if entry.get('allowAttachments') else 'off'}{peer}"
             )
         else:
             last = entry.get("lastDisconnectMs")

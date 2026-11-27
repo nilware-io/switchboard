@@ -27,6 +27,7 @@ from ..projects import MatchOk
 from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from .agents import AgentHub
+from .attachments import FetchLimiter, Media, format_attachments, format_sent, pick, refusal_words
 from .audit import AuditLog
 from .check import check_machine
 from .config import MachineConfig, command_timeout_seconds, known_names, known_terms
@@ -41,9 +42,11 @@ from .dispatcher import (
     SEND_ANSWER,
     SEND_CHECK_LINES,
     SEND_MESSAGE,
+    RefusedError,
     bound_menu_hash,
     dialog_bound,
     keys_problem,
+    media_check,
     shows_draft,
     shows_picker,
 )
@@ -57,7 +60,17 @@ from .pending import (
     waiting_for_text,
     waits_for_permission,
 )
-from .protocol import CaptureResponse, KeysResponse, PaneInfo, ResizeResponse, SendResponse, VersionResponse
+from .protocol import (
+    AttachmentInfo,
+    AttachmentResponse,
+    AttachmentsResponse,
+    CaptureResponse,
+    KeysResponse,
+    PaneInfo,
+    ResizeResponse,
+    SendResponse,
+    VersionResponse,
+)
 from .redact import clean_name, clean_screen
 from .send import (
     KEYS,
@@ -89,6 +102,7 @@ from .speech import (
     format_status,
     format_target_problem,
     pane_label,
+    quote,
     send_place,
     text_refusal,
     unreachable_sentence,
@@ -146,6 +160,8 @@ class Caller:
 class ToolAnswer:
     text: str
     is_error: bool = False
+    media: Media | None = None
+    """`remote_attachment`: the checked media to return as MCP content after the text."""
 
 
 @dataclass
@@ -216,6 +232,7 @@ class RemoteTools:
             )
         )
         self._background: set[asyncio.Task[str | None]] = set()
+        self.fetches = FetchLimiter(now=self._now)
         self._verbs: dict[str, tuple[int, frozenset[str]]] = {}
         self._pending = PendingChecker(
             PendingCheckerOptions(
@@ -890,6 +907,162 @@ class RemoteTools:
             },
         )
         return ToolAnswer(format_confirm_outcome(item, outcome, detail), outcome != "sent")
+
+    # --- attachments ---------------------------------------------------------------------------
+
+    def _attachment_machine(self, machine: str | None) -> MachineConfig | ToolAnswer:
+        found = resolve_machine(self.inventory.machines, machine)
+        if not isinstance(found, MatchOk):
+            return ToolAnswer(
+                format_machine_problem(
+                    machine, [m.name for m in self.inventory.machines], ambiguous=found.reason == "ambiguous"
+                ),
+                True,
+            )
+        if not found.item.allow_attachments:
+            return ToolAnswer(
+                f"Attachments are off for {found.item.name} in the hub's config (allowAttachments).", True
+            )
+        return found.item
+
+    async def _list_attachments(
+        self, name: str, deadline: _Deadline
+    ) -> tuple[AttachmentsResponse | None, ToolAnswer | None]:
+        transport = self.inventory.transport(name)
+        left = min(float(command_timeout_seconds(self._remote, transport.machine)), deadline.left())
+        result = await transport.call("attachments", timeout_seconds=max(0.5, left))
+        self._logger.info(
+            "remote call",
+            {
+                "machine": name,
+                "verb": "attachments",
+                "ok": result.ok,
+                "error": result.error,
+                "detail": result.detail,
+                "ms": result.elapsed_ms,
+            },
+        )
+        if result.ok and isinstance(result.data, AttachmentsResponse):
+            return result.data, None
+        if result.ok:
+            return None, ToolAnswer(unreachable_sentence(name, "bad_response"), True)
+        words = refusal_words(result.detail, name, None) if result.error == "refused_by_policy" else None
+        return None, ToolAnswer(words or unreachable_sentence(name, result.error, result.detail), True)
+
+    async def remote_attachments(self, machine: str | None, kind: str | None = None) -> ToolAnswer:
+        """The media files in a machine's outbox, newest first (names quoted as the machine's)."""
+        found = self._attachment_machine(machine)
+        if isinstance(found, ToolAnswer):
+            return found
+        listing, problem = await self._list_attachments(found.name, self._deadline())
+        self._logger.info(
+            "tool call",
+            {
+                "tool": "remote_attachments",
+                "machine": found.name,
+                "count": len(listing.attachments) if listing else None,
+            },
+        )
+        if listing is None:
+            assert problem is not None
+            return problem
+        return ToolAnswer(
+            format_attachments(
+                found.name,
+                listing.attachments,
+                skipped=listing.skipped,
+                outbox=listing.outbox,
+                now=self._now(),
+                kind=kind,
+            )
+        )
+
+    async def remote_attachment(
+        self, machine: str | None, name: str | None, kind: str | None, caller: Caller
+    ) -> ToolAnswer:
+        """One media file from a machine's outbox (the newest, of `kind`, without a name), checked
+        again here before it goes to the client."""
+        found = self._attachment_machine(machine)
+        if isinstance(found, ToolAnswer):
+            return found
+        machine_name = found.name
+        if not self.fetches.allows(machine_name):
+            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
+        deadline = self._deadline()
+        listing, problem = await self._list_attachments(machine_name, deadline)
+        if listing is None:
+            assert problem is not None
+            return problem
+        entry = pick(listing.attachments, name, kind)
+        if entry is None:
+            what = {"image": "image", "audio": "audio file", "video": "video"}.get(kind or "", "media file")
+            if name:
+                return ToolAnswer(f"I found no {what} called {quote(name)} in the outbox on {machine_name}.", True)
+            return ToolAnswer(f"The outbox on {machine_name} has no {what}.", True)
+        if not self.fetches.fits(entry.size):
+            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
+        answer, outcome, size = await self._fetch_attachment(machine_name, entry, deadline)
+        self.audit.record_attachment(
+            machine=machine_name,
+            name=entry.name,
+            kind=answer.media.kind if answer.media else entry.kind,
+            size=size,
+            outcome=outcome,
+            client=caller.fingerprint,
+            client_name=caller.name,
+        )
+        self._logger.info(
+            "tool call",
+            {
+                "tool": "remote_attachment",
+                "machine": machine_name,
+                "kind": entry.kind,
+                "bytes": size,
+                "outcome": outcome,
+            },
+        )
+        return answer
+
+    async def _fetch_attachment(
+        self, machine: str, entry: AttachmentInfo, deadline: _Deadline
+    ) -> tuple[ToolAnswer, str, int]:
+        """(answer, audit outcome, bytes sent to the client)."""
+        transport = self.inventory.transport(machine)
+        result = await transport.call("attachment", [entry.name], timeout_seconds=max(0.5, deadline.left()))
+        self._logger.info(
+            "remote call",
+            {
+                "machine": machine,
+                "verb": "attachment",
+                "ok": result.ok,
+                "error": result.error,
+                "detail": result.detail,
+                "ms": result.elapsed_ms,
+            },
+        )
+        if not result.ok:
+            words = refusal_words(result.detail, machine, entry.name) if result.error == "refused_by_policy" else None
+            outcome = f"refused:{result.detail}" if words else f"failed:{result.error}"
+            return ToolAnswer(words or unreachable_sentence(machine, result.error, result.detail), True), outcome, 0
+        data = result.data
+        rejected = ToolAnswer(
+            f"{machine} sent something for {quote(entry.name)} that is not the image, audio or video file it "
+            "listed, so I did not pass it on.",
+            True,
+        )
+        if not isinstance(data, AttachmentResponse) or data.name != entry.name:
+            return rejected, "rejected", 0
+        # The machine is not trusted: the bytes must be a whole media file of the kind and type it
+        # claims, within the caps, by the hub's own check.
+        try:
+            kind, mime, clean = media_check(entry.name, data.data)
+        except RefusedError:
+            return rejected, "rejected", 0
+        if kind != data.kind or mime != data.mime:
+            return rejected, "rejected", 0
+        media = Media(machine=machine, name=entry.name, kind=kind, mime=mime, data=clean)
+        self.fetches.record(machine, len(clean))
+        return ToolAnswer(format_sent(media, data.mtime, self._now()), media=media), "sent", len(clean)
 
     def _machine(self, name: str) -> MachineConfig | None:
         return next((m for m in self.inventory.machines if m.name == name), None)

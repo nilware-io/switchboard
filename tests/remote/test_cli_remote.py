@@ -60,7 +60,8 @@ async def test_remote_check_reports_each_machine(tmp_path: Path) -> None:
     assert code == 1, io.stderr
     assert io.stdout == (
         "dev (ssh owner@localhost:22)\n"
-        "  switchboard-remote 0.6.0, verbs version, list, capture, send, usage, keys, resize, send off, usage off\n"
+        "  switchboard-remote 0.7.0, verbs version, list, capture, send, usage, keys, resize, attachments, attachment, "
+        "send off, usage off, attachments off\n"
         "  dev: 2 sessions. fpga, Claude Code idle. notes, no Claude Code.\n"
         "buildbox (ssh bot@example-host:22)\n"
         "  warning: remote machine buildbox: sessions allows every tmux session (*); list the session names instead\n"
@@ -121,6 +122,8 @@ async def test_audit_prints_the_send_log_as_a_table(tmp_path: Path) -> None:
         "ok",
         "chars",
         "keys",
+        "kind",
+        "bytes",
         "client",
     ]
     assert lines[1].split() == [
@@ -134,9 +137,11 @@ async def test_audit_prints_the_send_log_as_a_table(tmp_path: Path) -> None:
         "yes",
         "15",
         "-",
+        "-",
+        "-",
         "Claude?[31m",
     ]
-    assert lines[2].split()[5:] == ["not_sent:gone", "-", "no", "13", "-", "Claude?[31m"]
+    assert lines[2].split()[5:] == ["not_sent:gone", "-", "no", "13", "-", "-", "-", "Claude?[31m"]
     assert "push the branch" not in io.stdout
     assert io.stderr.startswith("warning: 1 unreadable line(s) in ")
     code, io = await run_cli("audit", "--limit", "1", "--config", path)

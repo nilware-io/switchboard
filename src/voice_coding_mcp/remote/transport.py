@@ -289,6 +289,7 @@ class LocalTransport:
             (machine.allow_send, "--allow-send"),
             (machine.allow_permission_answers, "--allow-permission-answers"),
             (machine.send_to_any_pane, "--send-to-any-pane"),
+            (machine.allow_attachments, "--allow-attachments"),
         )
         args += [flag for enabled, flag in flags if enabled]
         if self.slash_commands:
