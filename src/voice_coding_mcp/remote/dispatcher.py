@@ -25,7 +25,8 @@ Invocation, one of:
 
 Policy options: --sessions <globs> (comma separated, required), --allow-usage, --allow-events,
 --allow-send, --allow-permission-answers, --send-to-any-pane, --slash-commands <names>,
---claude-home <path>, --allow-attachments, --outbox <path>.
+--claude-home <path>, --allow-attachments, --outbox <path>, --allow-self-update (0.13.0; never with
+--policy-from-hub).
 Test only (refused unless SWITCHBOARD_REMOTE_TEST=1 is in the environment): --tmux-socket-name.
 
 Verbs: `version`, `list`, `capture <paneId> <lines>`, `send <paneId> <panePid> <sessionId|none> message`
@@ -43,7 +44,11 @@ of them, checked to be a whole image, audio or video file, in base64 chunks; bot
 --allow-attachments), `health` (free space and the read-only flag of the file systems that matter,
 load, memory and uptime; read-only, no opt-in, 0.9.0), `events [<eventId>...]` (only with
 --allow-events, 0.12.0: deletes the named events of the switchboard-hook spool, which the hub has
-taken, and answers the next ones, oldest first). Every response is one JSON document on stdout,
+taken, and answers the next ones, oldest first), `update` (only with --allow-self-update, 0.13.0:
+a release bundle signed with the owner's OpenSSH key on stdin, checked with `ssh-keygen -Y verify`
+against the pinned `~/.config/switchboard-remote/release_signers`, then installed over this file and
+the connector and hook next to it, each kept as `.prev`). `switchboard-remote --rollback`, run by the
+owner at the machine, swaps the `.prev` files back. Every response is one JSON document on stdout,
 `{"protocol": 1, "ok": true, ...}` or `{"protocol": 1, "ok": false, "error": "<code>"}`, except a
 successful `usage`, which is JSON lines (a header document, then file headers and token records
 without any text, then `{"done": true, ...}`), and a successful `attachment` (a header document,
@@ -71,9 +76,11 @@ import re
 import secrets
 import select
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -83,7 +90,7 @@ from collections.abc import Callable, Iterator
 from stat import S_ISREG
 from typing import BinaryIO
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 PROTOCOL = 1
 VERBS = (
     "version",
@@ -98,6 +105,7 @@ VERBS = (
     "health",
     "clear",
     "events",
+    "update",
 )
 PROGRAM = "switchboard-remote"
 
@@ -225,6 +233,7 @@ FLAG_OPTIONS = (
     "--send-to-any-pane",
     "--allow-attachments",
     "--allow-events",
+    "--allow-self-update",
 )
 VALUE_OPTIONS = ("--sessions", "--slash-commands", "--claude-home", "--outbox", "--tmux-socket-name")
 
@@ -256,6 +265,9 @@ class Policy:
         self.allow_attachments = False
         self.outbox: str | None = None
         self.tmux_socket_name: str | None = None
+        self.allow_self_update = False
+        """`--allow-self-update` (0.13.0): only from the machine's own command line, never from the
+        hub (`--policy-from-hub`) or a policy file."""
 
     def allows(self, session_name: str) -> bool:
         return any(fnmatch.fnmatchcase(session_name, glob) for glob in self.sessions)
@@ -1040,6 +1052,7 @@ def policy_from_options(options: dict[str, object]) -> Policy:
     policy.sessions = _split_list(sessions, GLOB_RE, "--sessions")
     policy.allow_usage = options.get("--allow-usage") is True
     policy.allow_events = options.get("--allow-events") is True
+    policy.allow_self_update = options.get("--allow-self-update") is True
     policy.allow_send = options.get("--allow-send") is True
     policy.allow_permission_answers = options.get("--allow-permission-answers") is True
     policy.send_to_any_pane = options.get("--send-to-any-pane") is True
@@ -1118,6 +1131,9 @@ def resolve_request(argv: list[str], env: dict[str, str]) -> tuple[Policy, list[
     if from_hub:
         if "SSH_ORIGINAL_COMMAND" in env or "SSH_CONNECTION" in env:
             raise RefusedError("bad_policy")
+        if "--allow-self-update" in options:
+            # The hub's bundled dispatcher is the hub's own code: it never replaces itself.
+            raise RefusedError("bad_policy")
         return policy_from_options(options), rest
     if rest:
         # Explicit path: the hub sent the whole command line, so it may carry no options.
@@ -1143,7 +1159,7 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
     verb, args = tokens[0], tokens[1:]
     if verb not in VERBS:
         raise RefusedError("bad_request")
-    if verb in ("version", "list", "attachments", "health") and args:
+    if verb in ("version", "list", "attachments", "health", "update") and args:
         raise RefusedError("bad_request")
     if verb == "capture":
         if len(args) != 2 or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
@@ -1425,6 +1441,7 @@ def verb_version(policy: Policy) -> dict[str, object]:
         "allowSend": policy.allow_send,
         "allowUsage": policy.allow_usage,
         "allowAttachments": policy.allow_attachments,
+        "allowSelfUpdate": policy.allow_self_update,
     }
 
 
@@ -4272,6 +4289,819 @@ def verb_attachment(
     return header, documents()
 
 
+# --- self-update (0.13.0) ----------------------------------------------------------------------
+#
+# docs/SWITCHBOARD.md, "Self-update". The hub hands over a release bundle that the owner built and
+# signed on their own computer with an OpenSSH key. This machine checks the signature with
+# `ssh-keygen -Y verify` against its own pinned signers file (which the hub can never write), every
+# file's size and SHA-256 against the signed manifest, that the version is newer than anything
+# installed here before, and that the new files compile and the new dispatcher starts; only then it
+# replaces its files, each atomically in its own directory, keeping the previous ones as `.prev`.
+# Nothing of the bundle runs before its signature checked out.
+
+UPDATE_NAMESPACE = "switchboard-release"
+"""The `ssh-keygen -Y` namespace of release signatures, and the principal of the signers file: a
+signature the key made for anything else (a git tag uses `git`) never verifies here."""
+UPDATE_PRODUCT = "switchboard-remote"
+UPDATE_FORMAT = 1
+UPDATE_TARGETS = ("switchboard-remote", "switchboard-connect", "switchboard-hook")
+"""The only file names an update writes, each next to the running dispatcher. A bundle that names
+anything else is refused (`unknown_target`), so no name in it is ever used as a path."""
+UPDATE_ORDER = ("switchboard-hook", "switchboard-connect", "switchboard-remote")
+"""Replace order: the dispatcher last, so a failure before it leaves the old dispatcher answering."""
+MAX_UPDATE_TOTAL_BYTES = 1024 * 1024
+"""All files of a bundle together (0.13.0: about 260 KB)."""
+UPDATE_CHUNK_BYTES = 256 * 1024
+MAX_MANIFEST_BYTES = 16 * 1024
+MAX_SIGNATURE_BYTES = 8 * 1024
+MAX_SIGNERS_BYTES = 64 * 1024
+MAX_UPDATE_INPUT_BYTES = 1536 * 1024
+"""The bundle on stdin (JSON lines, files as base64): fits the hub's 2 MiB serve-mode frame."""
+UPDATE_VERSION_RE = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}")
+UPDATE_CREATED_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
+TEST_SSH_KEYGEN = "SWITCHBOARD_REMOTE_TEST_SSH_KEYGEN"
+"""Test only (with SWITCHBOARD_REMOTE_TEST=1): another ssh-keygen (an old or missing one)."""
+MIN_OPENSSH = (8, 1)
+"""`ssh-keygen -Y sign` and `-Y verify` appeared in OpenSSH 8.1."""
+_OPENSSH_RE = re.compile(r"OpenSSH_([0-9]{1,3})\.([0-9]{1,3})")
+UPDATE_SUBPROCESS_SECONDS = 20
+SIGNERS_FILE = os.path.join(".config", "switchboard-remote", "release_signers")
+"""Relative to HOME: the pinned allowed-signers file (`ssh-keygen` format, principal
+`switchboard-release`), installed by the owner on the machine itself."""
+UPDATE_STATE_DIR = os.path.join(".local", "state", "switchboard-remote")
+UPDATE_STATE_FILE = "update.json"
+UPDATE_LOCK_FILE = "update.lock"
+EXIT_UPDATED = 77
+"""Serve mode's exit code after a successful update: the connector starts the new dispatcher."""
+UPDATE_ERRORS = (
+    "not_allowed",
+    "not_installed",
+    "install_unsafe",
+    "too_large",
+    "bad_bundle",
+    "unknown_target",
+    "bad_signature",
+    "wrong_namespace",
+    "no_openssh",
+    "old_openssh",
+    "no_signers",
+    "signers_unsafe",
+    "bad_manifest",
+    "file_mismatch",
+    "not_newer",
+    "min_version",
+    "bad_state",
+    "self_test_failed",
+    "install_failed",
+    "locked",
+)
+"""Every refusal code of `update` (docs/SWITCHBOARD.md, "Self-update")."""
+
+
+def version_tuple(value: object) -> tuple[int, int, int] | None:
+    """(major, minor, patch) of `x.y.z`, None for anything else."""
+    if not isinstance(value, str) or not UPDATE_VERSION_RE.fullmatch(value):
+        return None
+    major, minor, patch = (int(part) for part in value.split("."))
+    return major, minor, patch
+
+
+def _ssh_string(blob: bytes, offset: int) -> tuple[bytes, int]:
+    """One SSH wire-format string (uint32 length, bytes) at `offset`; ValueError when it is cut."""
+    if offset + 4 > len(blob):
+        raise ValueError("cut")
+    length = int.from_bytes(blob[offset : offset + 4], "big")
+    end = offset + 4 + length
+    if end > len(blob):
+        raise ValueError("cut")
+    return blob[offset + 4 : end], end
+
+
+def parse_signature(text: object) -> dict[str, str]:
+    """The namespace, key type and SHA-256 fingerprint (as `ssh-keygen -l` prints it) of an armored
+    `ssh-keygen -Y sign` signature. Only reads it: whether it is valid is `ssh-keygen`'s answer.
+    Raises RefusedError("bad_signature")."""
+    if not isinstance(text, str) or len(text) > MAX_SIGNATURE_BYTES or not text.isascii():
+        raise RefusedError("bad_signature")
+    lines = text.strip("\n").split("\n")
+    if len(lines) < 3 or lines[0] != "-----BEGIN SSH SIGNATURE-----" or lines[-1] != "-----END SSH SIGNATURE-----":
+        raise RefusedError("bad_signature")
+    try:
+        blob = base64.b64decode("".join(lines[1:-1]).encode("ascii"), validate=True)
+        if blob[:6] != b"SSHSIG" or int.from_bytes(blob[6:10], "big") != 1:
+            raise ValueError("magic")
+        offset = 10
+        public_key, offset = _ssh_string(blob, offset)
+        namespace, offset = _ssh_string(blob, offset)
+        _reserved, offset = _ssh_string(blob, offset)
+        _hash, offset = _ssh_string(blob, offset)
+        _signature, offset = _ssh_string(blob, offset)
+        if offset != len(blob):
+            raise ValueError("trailing")
+        key_type, _ = _ssh_string(public_key, 0)
+        key_name = key_type.decode("ascii")
+        space = namespace.decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        raise RefusedError("bad_signature") from None
+    digest = base64.b64encode(hashlib.sha256(public_key).digest()).decode("ascii").rstrip("=")
+    return {"namespace": space, "keyType": key_name, "fingerprint": "SHA256:" + digest}
+
+
+def read_bundle(data: bytes) -> tuple[bytes, str, dict[str, bytes]]:
+    """(manifest bytes, signature text, {target: file bytes}) of a bundle: JSON lines, first
+    `{"bundle": 1, "manifest": <base64>, "signature": <armored>}`, then `{"file", "chunk", "data"}`
+    documents (each file's chunks in order from 0, every chunk but a file's last exactly
+    UPDATE_CHUNK_BYTES, a file never twice), then `{"done": true}` and nothing after it. Raises
+    RefusedError (`too_large`, `bad_bundle`, `unknown_target`)."""
+    if len(data) > MAX_UPDATE_INPUT_BYTES:
+        raise RefusedError("too_large")
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+
+    def document(line: bytes) -> dict[str, object]:
+        try:
+            value = json.loads(line.decode("ascii"), object_pairs_hook=_unique_keys)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            raise RefusedError("bad_bundle") from None
+        if not isinstance(value, dict):
+            raise RefusedError("bad_bundle")
+        return value
+
+    if len(lines) < 3:
+        raise RefusedError("bad_bundle")
+    head = document(lines[0])
+    if set(head) != {"bundle", "manifest", "signature"} or type(head["bundle"]) is not int or head["bundle"] != 1:
+        raise RefusedError("bad_bundle")
+    manifest_text, signature = head["manifest"], head["signature"]
+    if not isinstance(manifest_text, str) or not isinstance(signature, str):
+        raise RefusedError("bad_bundle")
+    if len(manifest_text) > 4 * (MAX_MANIFEST_BYTES // 3 + 1) or len(signature) > MAX_SIGNATURE_BYTES:
+        raise RefusedError("bad_bundle")
+    try:
+        manifest = base64.b64decode(manifest_text.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        raise RefusedError("bad_bundle") from None
+    if not manifest or len(manifest) > MAX_MANIFEST_BYTES:
+        raise RefusedError("bad_bundle")
+    files: dict[str, bytearray] = {}
+    current: str | None = None
+    short = False
+    total = 0
+    last = document(lines[-1])
+    if set(last) != {"done"} or last["done"] is not True:
+        raise RefusedError("bad_bundle")
+    for line in lines[1:-1]:
+        chunk = document(line)
+        if set(chunk) != {"file", "chunk", "data"}:
+            raise RefusedError("bad_bundle")
+        target, index, text = chunk["file"], chunk["chunk"], chunk["data"]
+        if not isinstance(target, str) or target not in UPDATE_TARGETS:
+            raise RefusedError("unknown_target")
+        if type(index) is not int or not isinstance(text, str) or len(text) > 4 * (UPDATE_CHUNK_BYTES // 3 + 1):
+            raise RefusedError("bad_bundle")
+        if target != current:
+            if target in files or index != 0:
+                raise RefusedError("bad_bundle")
+            files[target] = bytearray()
+            current, short = target, False
+        elif short or index != files_chunks(files[target]):
+            raise RefusedError("bad_bundle")
+        try:
+            part = base64.b64decode(text.encode("ascii"), validate=True)
+        except (ValueError, UnicodeEncodeError):
+            raise RefusedError("bad_bundle") from None
+        if not part or len(part) > UPDATE_CHUNK_BYTES:
+            raise RefusedError("bad_bundle")
+        short = len(part) < UPDATE_CHUNK_BYTES
+        total += len(part)
+        if total > MAX_UPDATE_TOTAL_BYTES:
+            raise RefusedError("too_large")
+        files[target].extend(part)
+    if not files:
+        raise RefusedError("bad_bundle")
+    return manifest, signature, {name: bytes(value) for name, value in files.items()}
+
+
+def files_chunks(data: bytearray) -> int:
+    """How many full chunks `data` holds: the index the next chunk of that file must have."""
+    return len(data) // UPDATE_CHUNK_BYTES
+
+
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """A JSON object that names a key twice is refused: hub and machine must read the same values."""
+    out: dict[str, object] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def parse_manifest(raw: bytes) -> dict[str, object]:
+    """The release manifest, checked strictly: `{"format": 1, "product": "switchboard-remote",
+    "version", "minVersion", "created", "files": [{"target", "size", "sha256"}]}` with nothing else,
+    known and distinct targets (the dispatcher among them), sizes adding up to at most
+    MAX_UPDATE_TOTAL_BYTES. Raises RefusedError (`bad_manifest`, `unknown_target`)."""
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise RefusedError("bad_manifest") from None
+    keys = {"format", "product", "version", "minVersion", "created", "files"}
+    if not isinstance(data, dict) or set(data) != keys:
+        raise RefusedError("bad_manifest")
+    if data["format"] != UPDATE_FORMAT or type(data["format"]) is not int or data["product"] != UPDATE_PRODUCT:
+        raise RefusedError("bad_manifest")
+    version, minimum = version_tuple(data["version"]), version_tuple(data["minVersion"])
+    if version is None or minimum is None or minimum > version:
+        raise RefusedError("bad_manifest")
+    created = data["created"]
+    if not isinstance(created, str) or not UPDATE_CREATED_RE.fullmatch(created):
+        raise RefusedError("bad_manifest")
+    entries = data["files"]
+    if not isinstance(entries, list) or not 1 <= len(entries) <= len(UPDATE_TARGETS):
+        raise RefusedError("bad_manifest")
+    seen: list[str] = []
+    total = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"target", "size", "sha256"}:
+            raise RefusedError("bad_manifest")
+        target, size, digest = entry["target"], entry["size"], entry["sha256"]
+        if not isinstance(target, str) or target not in UPDATE_TARGETS:
+            raise RefusedError("unknown_target")
+        if target in seen or type(size) is not int or not 1 <= size <= MAX_UPDATE_TOTAL_BYTES:
+            raise RefusedError("bad_manifest")
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise RefusedError("bad_manifest")
+        seen.append(target)
+        total += size
+    if UPDATE_PRODUCT not in seen or total > MAX_UPDATE_TOTAL_BYTES:
+        raise RefusedError("bad_manifest")
+    return data
+
+
+def ssh_keygen_path(env: dict[str, str]) -> str:
+    override = env.get(TEST_SSH_KEYGEN)
+    if override and env.get(TEST_FLAG) == "1" and os.path.isabs(override):
+        return override
+    return SSH_KEYGEN
+
+
+def _tool_env() -> dict[str, str]:
+    """ssh-keygen and the self tests run with this environment only."""
+    return {"PATH": TMUX_PATH, "LC_ALL": "C"}
+
+
+def openssh_problem(keygen: str) -> str | None:
+    """`no_openssh` without ssh-keygen, `old_openssh` when the `ssh` next to it reports a version
+    older than 8.1 (no `-Y verify`). An `ssh` that cannot be asked is no refusal: an ssh-keygen
+    without `-Y` then fails the verification, which `verify_signature` reports as `old_openssh`."""
+    try:
+        info = os.stat(keygen)
+    except OSError:
+        return "no_openssh"
+    if not stat.S_ISREG(info.st_mode):
+        return "no_openssh"
+    try:
+        done = subprocess.run(
+            [os.path.join(os.path.dirname(keygen), "ssh"), "-V"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env=_tool_env(),
+            timeout=UPDATE_SUBPROCESS_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = _OPENSSH_RE.search((done.stderr + done.stdout).decode("utf-8", "replace"))
+    if found and (int(found.group(1)), int(found.group(2))) < MIN_OPENSSH:
+        return "old_openssh"
+    return None
+
+
+def _safe_dir(path: str, follow: bool = False) -> bool:
+    """A directory owned by this user or root that neither group nor others can write."""
+    try:
+        info = os.stat(path) if follow else os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid in (os.getuid(), 0) and not info.st_mode & 0o022
+
+
+def load_signers(env: dict[str, str]) -> bytes:
+    """The pinned signers file `~/.config/switchboard-remote/release_signers`: a regular file (no
+    symlink) owned by this user or root, not writable by group or others, in directories that are
+    not either (HOME, `.config`, `switchboard-remote`), at most 64 KB, with at least one key line.
+    Raises RefusedError (`no_signers`, `signers_unsafe`)."""
+    home = home_dir(env)
+    path = os.path.join(home, SIGNERS_FILE)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        raise RefusedError("no_signers") from None
+    except OSError:
+        raise RefusedError("signers_unsafe") from None
+    parents = [os.path.join(home, ".config"), os.path.dirname(path)]
+    if not _safe_dir(home, follow=True) or not all(_safe_dir(parent) for parent in parents):
+        raise RefusedError("signers_unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise RefusedError("signers_unsafe") from None
+    try:
+        info = os.fstat(fd)
+        if (
+            not S_ISREG(info.st_mode)
+            or info.st_uid not in (os.getuid(), 0)
+            or info.st_mode & 0o022
+            or info.st_size > MAX_SIGNERS_BYTES
+        ):
+            raise RefusedError("signers_unsafe")
+        data = _read_exactly(fd, info.st_size)
+    finally:
+        os.close(fd)
+    if data is None:
+        raise RefusedError("signers_unsafe")
+    keys = [line for line in data.split(b"\n") if line.strip() and not line.lstrip().startswith(b"#")]
+    if not keys:
+        raise RefusedError("no_signers")
+    return data
+
+
+def _private_file(directory: str, name: str, data: bytes) -> str:
+    path = os.path.join(directory, name)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        _write_all(fd, data)
+    finally:
+        os.close(fd)
+    return path
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def verify_signature(keygen: str, signers: bytes, manifest: bytes, signature: str) -> None:
+    """`ssh-keygen -Y verify` of the manifest bytes, from a fixed argv without a shell: the signers
+    as read and checked (a private copy, so the file cannot change between the check and the
+    verification), principal and namespace `switchboard-release`. Raises RefusedError
+    (`bad_signature`, `old_openssh`)."""
+    work = tempfile.mkdtemp(prefix="switchboard-update-")
+    try:
+        signers_path = _private_file(work, "release_signers", signers)
+        signature_path = _private_file(work, "manifest.sig", signature.encode("ascii"))
+        argv = [
+            keygen,
+            "-Y",
+            "verify",
+            "-f",
+            signers_path,
+            "-I",
+            UPDATE_NAMESPACE,
+            "-n",
+            UPDATE_NAMESPACE,
+            "-s",
+            signature_path,
+        ]
+        try:
+            done = subprocess.run(
+                argv,
+                input=manifest,
+                capture_output=True,
+                env=_tool_env(),
+                timeout=UPDATE_SUBPROCESS_SECONDS,
+                check=False,
+                close_fds=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise RefusedError("bad_signature") from None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if done.returncode != 0:
+        said = (done.stderr + done.stdout).decode("utf-8", "replace").lower()
+        if "usage:" in said or "illegal option" in said or "unknown option" in said or "invalid option" in said:
+            raise RefusedError("old_openssh")
+        raise RefusedError("bad_signature")
+
+
+def check_bundle(
+    data: bytes,
+    signers: bytes,
+    *,
+    installed: str,
+    highest: str | None,
+    keygen: str,
+) -> dict[str, object]:
+    """Everything a machine checks before it writes anything: the bundle's form, the signature
+    (namespace first, then `ssh-keygen -Y verify` with the pinned signers), the manifest, that the
+    files are exactly the manifest's (sizes and SHA-256), that the version is newer than `installed`
+    and than `highest` (the newest version ever installed here, so an older signed bundle is never
+    applied again, also after a rollback), and that `installed` is at least its `minVersion`.
+    Returns {"version", "minVersion", "created", "fingerprint", "keyType", "files": {target: bytes}}.
+    Raises RefusedError with one of UPDATE_ERRORS."""
+    manifest_raw, signature, files = read_bundle(data)
+    signed = parse_signature(signature)
+    if signed["namespace"] != UPDATE_NAMESPACE:
+        raise RefusedError("wrong_namespace")
+    problem = openssh_problem(keygen)
+    if problem is not None:
+        raise RefusedError(problem)
+    verify_signature(keygen, signers, manifest_raw, signature)
+    manifest = parse_manifest(manifest_raw)
+    entries = manifest["files"]
+    assert isinstance(entries, list)
+    listed = {str(entry["target"]): entry for entry in entries}
+    if set(listed) != set(files):
+        raise RefusedError("file_mismatch")
+    for target, entry in listed.items():
+        content = files[target]
+        if len(content) != entry["size"] or hashlib.sha256(content).hexdigest() != entry["sha256"]:
+            raise RefusedError("file_mismatch")
+    version = version_tuple(manifest["version"])
+    minimum = version_tuple(manifest["minVersion"])
+    current = version_tuple(installed)
+    assert version is not None
+    assert minimum is not None
+    if current is None:
+        raise RefusedError("bad_state")
+    floor = max(current, version_tuple(highest) or current)
+    if version <= floor:
+        raise RefusedError("not_newer")
+    if current < minimum:
+        raise RefusedError("min_version")
+    return {
+        "version": manifest["version"],
+        "minVersion": manifest["minVersion"],
+        "created": manifest["created"],
+        "fingerprint": signed["fingerprint"],
+        "keyType": signed["keyType"],
+        "files": files,
+    }
+
+
+def _file_problem(path: str) -> str | None:
+    """Why an installed file must not be replaced: `install_unsafe` unless it is a regular file (no
+    symlink) of this user that neither group nor others can write."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return "not_installed"
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        return "install_unsafe"
+    return None
+
+
+def install_targets(self_path: str) -> tuple[str, dict[str, str]]:
+    """The directory of the running dispatcher and the installed files of UPDATE_TARGETS in it
+    (a file that is not there is not installed, so an update skips it). The dispatcher must be
+    installed under its own name (`not_installed` otherwise: the hub's bundled copy, a checkout),
+    in a directory of this user or root that neither group nor others can write, as a regular file
+    of this user (`install_unsafe`). Raises RefusedError."""
+    path = os.path.abspath(self_path)
+    directory = os.path.dirname(path)
+    if os.path.basename(path) != UPDATE_PRODUCT:
+        raise RefusedError("not_installed")
+    if not _safe_dir(directory):
+        raise RefusedError("install_unsafe")
+    problem = _file_problem(path)
+    if problem is not None:
+        raise RefusedError(problem)
+    found = {UPDATE_PRODUCT: path}
+    for target in UPDATE_TARGETS:
+        other = os.path.join(directory, target)
+        if target == UPDATE_PRODUCT or not os.path.lexists(other):
+            continue
+        problem = _file_problem(other)
+        if problem is not None:
+            raise RefusedError("install_unsafe")
+        found[target] = other
+    return directory, found
+
+
+def update_state_dir(env: dict[str, str]) -> str:
+    return os.path.join(home_dir(env), UPDATE_STATE_DIR)
+
+
+def read_update_state(env: dict[str, str]) -> dict[str, object]:
+    """`~/.local/state/switchboard-remote/update.json`: {} when there is none, RefusedError
+    ("bad_state") when it cannot be read or is not this program's."""
+    path = os.path.join(update_state_dir(env), UPDATE_STATE_FILE)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        raise RefusedError("bad_state") from None
+    try:
+        info = os.fstat(fd)
+        if not S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_POLICY_BYTES:
+            raise RefusedError("bad_state")
+        raw = _read_exactly(fd, info.st_size)
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads((raw or b"").decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise RefusedError("bad_state") from None
+    if not isinstance(data, dict) or version_tuple(data.get("highest")) is None:
+        raise RefusedError("bad_state")
+    return data
+
+
+def _ensure_private_dir(path: str) -> None:
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RefusedError("bad_state")
+
+
+def _replace_file(directory: str, name: str, data: bytes, mode: int) -> None:
+    """Writes `data` as `directory/name` atomically: a new temporary file (O_EXCL, never through a
+    symlink) in the same directory, fsync, then rename over the old name."""
+    temporary = _stage(directory, name, data, mode)
+    try:
+        os.rename(temporary, os.path.join(directory, name))
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def _stage(directory: str, name: str, data: bytes, mode: int) -> str:
+    """A new file `.<name>.update-<random>` in `directory` with `data`, mode `mode`, synced."""
+    path = os.path.join(directory, "." + name + ".update-" + secrets.token_hex(8))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        _write_all(fd, data)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    except OSError:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    os.close(fd)
+    return path
+
+
+def _sync_dir(directory: str) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def write_update_state(env: dict[str, str], state: dict[str, object]) -> None:
+    directory = update_state_dir(env)
+    _ensure_private_dir(directory)
+    data = (json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    _replace_file(directory, UPDATE_STATE_FILE, data, 0o600)
+    _sync_dir(directory)
+
+
+@contextlib.contextmanager
+def update_lock(env: dict[str, str]) -> Iterator[None]:
+    """One update or rollback at a time per user (`locked` when another one runs)."""
+    directory = update_state_dir(env)
+    try:
+        _ensure_private_dir(directory)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(os.path.join(directory, UPDATE_LOCK_FILE), flags, 0o600)
+    except OSError:
+        raise RefusedError("bad_state") from None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RefusedError("locked") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _self_test(target: str, path: str, version: str, env: dict[str, str]) -> bool:
+    """The staged file compiles under this Python, and the new dispatcher, connector or hook starts
+    and reports its version (the dispatcher exactly the manifest's, with the `update` verb)."""
+    try:
+        with open(path, "rb") as handle:
+            compile(handle.read(), target, "exec", dont_inherit=True)
+    except (OSError, SyntaxError, ValueError):
+        return False
+    if target == UPDATE_PRODUCT:
+        argv = [sys.executable, "-I", path, "--policy-from-hub", "--sessions", "none", "--", "version"]
+    elif target == "switchboard-connect":
+        argv = [sys.executable, "-I", path, "--version"]
+    else:
+        argv = [sys.executable, "-I", path, "version"]
+    try:
+        done = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env={**_tool_env(), "HOME": home_dir(env), "LC_ALL": "C.UTF-8"},
+            timeout=UPDATE_SUBPROCESS_SECONDS,
+            check=False,
+            close_fds=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if done.returncode != 0:
+        return False
+    if target != UPDATE_PRODUCT:
+        return bool(done.stdout.strip())
+    try:
+        answer = json.loads(done.stdout.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return (
+        isinstance(answer, dict)
+        and answer.get("ok") is True
+        and answer.get("version") == version
+        and "update" in (answer.get("verbs") or [])
+    )
+
+
+def _read_installed(path: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        data = _read_exactly(fd, info.st_size)
+    finally:
+        os.close(fd)
+    if data is None:
+        raise OSError("changed while read")
+    return data
+
+
+def install_update(
+    directory: str, installed: dict[str, str], files: dict[str, bytes], version: str, env: dict[str, str]
+) -> list[str]:
+    """Stages every new file that has an installed counterpart, runs the self tests on the staged
+    files, then per file: the current one is copied to `<name>.prev` and the new one renamed over
+    it (dispatcher last). A failure before the first rename changes nothing; one after it puts back
+    the files already replaced. Returns the targets written. Raises RefusedError
+    (`self_test_failed`, `install_failed`)."""
+    order = [target for target in UPDATE_ORDER if target in files and target in installed]
+    staged: dict[str, str] = {}
+    old: dict[str, bytes] = {}
+    try:
+        try:
+            for target in order:
+                old[target] = _read_installed(installed[target])
+                staged[target] = _stage(directory, target, files[target], 0o755)
+        except OSError:
+            raise RefusedError("install_failed") from None
+        if not all(_self_test(target, staged[target], version, env) for target in order):
+            raise RefusedError("self_test_failed")
+        done: list[str] = []
+        try:
+            for target in order:
+                _replace_file(directory, target + ".prev", old[target], 0o755)
+                os.rename(staged[target], installed[target])
+                del staged[target]
+                done.append(target)
+        except OSError:
+            for target in done:
+                with contextlib.suppress(OSError):
+                    _replace_file(directory, target, old[target], 0o755)
+            raise RefusedError("install_failed") from None
+        _sync_dir(directory)
+        return done
+    finally:
+        for path in staged.values():
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+
+def read_update_input(stdin: object) -> bytes:
+    """The bundle from stdin (bytes or a binary file), at most MAX_UPDATE_INPUT_BYTES."""
+    if isinstance(stdin, bytes):
+        data = stdin
+    elif stdin is not None and hasattr(stdin, "read"):
+        data = stdin.read(MAX_UPDATE_INPUT_BYTES + 1)
+    else:
+        data = b""
+    if not isinstance(data, bytes):
+        raise RefusedError("bad_bundle")
+    if len(data) > MAX_UPDATE_INPUT_BYTES:
+        raise RefusedError("too_large")
+    if not data:
+        raise RefusedError("bad_bundle")
+    return data
+
+
+def verb_update(policy: Policy, env: dict[str, str], stdin: object, self_path: str | None = None) -> dict[str, object]:
+    """0.13.0: installs a signed release bundle (on stdin) over this dispatcher and the connector
+    and hook next to it. Only with `--allow-self-update` (forced command or serve mode, never from
+    the hub). Returns {"updated": true, "from", "to", "files", "skipped", "signer"}."""
+    if not policy.allow_self_update:
+        raise RefusedError("not_allowed")
+    data = read_update_input(stdin)
+    directory, installed = install_targets(self_path or os.path.abspath(__file__))
+    with update_lock(env):
+        state = read_update_state(env)
+        signers = load_signers(env)
+        highest = state.get("highest")
+        release = check_bundle(
+            data,
+            signers,
+            installed=VERSION,
+            highest=highest if isinstance(highest, str) else None,
+            keygen=ssh_keygen_path(env),
+        )
+        files = release["files"]
+        version = release["version"]
+        assert isinstance(files, dict)
+        assert isinstance(version, str)
+        written = install_update(directory, installed, files, version, env)
+        with contextlib.suppress(OSError, RefusedError):
+            write_update_state(
+                env,
+                {
+                    "highest": version,
+                    "installed": version,
+                    "previous": VERSION,
+                    "signer": release["fingerprint"],
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+            )
+    return {
+        "updated": True,
+        "from": VERSION,
+        "to": version,
+        "files": written,
+        "skipped": [target for target in UPDATE_TARGETS if target in files and target not in written],
+        "signer": release["fingerprint"],
+    }
+
+
+_VERSION_LINE_RE = re.compile(rb'^VERSION = "([0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4})"$', re.M)
+
+
+def file_version(data: bytes) -> str | None:
+    """The `VERSION = "x.y.z"` of one of the three programs."""
+    found = _VERSION_LINE_RE.search(data)
+    return found.group(1).decode("ascii") if found else None
+
+
+def rollback(self_path: str, env: dict[str, str], out: Callable[[str], None]) -> int:
+    """`switchboard-remote --rollback`, run by the owner at the machine: for each installed file with
+    a `.prev` next to it, the two swap (each rename atomic), so running it again goes forward again.
+    The newest version ever installed stays recorded: the hub still cannot offer a version up to it
+    again. Exit code 0, or 1 when there was nothing to restore or something failed."""
+    if "SSH_ORIGINAL_COMMAND" in env or "SSH_CONNECTION" in env:
+        out("switchboard-remote: --rollback runs only at the machine itself, not under sshd")
+        return 1
+    try:
+        state = read_update_state(env)
+    except RefusedError:
+        state = {}
+    try:
+        directory, installed = install_targets(self_path)
+        restored = 0
+        with update_lock(env):
+            for target in UPDATE_ORDER:
+                if target not in installed:
+                    continue
+                previous = installed[target] + ".prev"
+                if _file_problem(previous) is not None:
+                    continue
+                older = _read_installed(previous)
+                current = _read_installed(installed[target])
+                _replace_file(directory, target, older, 0o755)
+                _replace_file(directory, target + ".prev", current, 0o755)
+                restored += 1
+                out(
+                    f"{target}: restored {file_version(older) or 'the previous copy'} "
+                    f"(the replaced {file_version(current) or 'copy'} is now {target}.prev)"
+                )
+            _sync_dir(directory)
+    except (RefusedError, OSError) as error:
+        out(f"switchboard-remote: rollback failed: {getattr(error, 'code', None) or type(error).__name__}")
+        return 1
+    if not restored:
+        out("switchboard-remote: nothing to roll back (no .prev files next to it)")
+        return 1
+    highest = state.get("highest")
+    if isinstance(highest, str):
+        out(f"Updates up to {highest} stay refused here; the next signed release must be newer.")
+    out("Restart the connector (systemctl --user restart switchboard-connect) to run the restored files.")
+    return 0
+
+
 def respond(argv: list[str], env: dict[str, str], stdin: object = None) -> Iterator[dict[str, object]]:
     """The response documents for one invocation: one document, or for a successful `usage` a header
     document followed by the usage lines. Never raises for a bad request. `stdin` (bytes or a binary
@@ -4363,6 +5193,8 @@ def run_request(
             body = verb_attachments(policy, env)
         elif verb == "attachment":
             body, lines = verb_attachment(policy, env, args[0])
+        elif verb == "update":
+            body = verb_update(policy, env, stdin)
         else:
             body = verb_capture(policy, env, args[0], int(args[1]))
     except RefusedError as refused:
@@ -4398,10 +5230,12 @@ SERVE_WORKERS = 4
 SERVE_MAX_ARGS = 16
 SERVE_SILENCE_SECONDS = 180.0
 """End serve mode after this long without any frame from the hub (it pings far more often)."""
+SERVE_POLL_SECONDS = 0.25
+"""How often the reader looks up from its wait (to end after an installed update)."""
 EXIT_REPLACED = 75
 EXIT_REFUSED = 76
 BYE_EXIT = {"replaced": EXIT_REPLACED, "unknown_machine": EXIT_REFUSED, "protocol": EXIT_REFUSED, "shutdown": 0}
-STDIN_VERBS = ("send", "usage")
+STDIN_VERBS = ("send", "usage", "update")
 STREAM_VERBS = ("usage", "attachment")
 """Verbs whose answer is several documents; `cancel` stops them at the next one."""
 FRAME_ERRORS = ("bad_frame", "frame_too_large", "duplicate_id", "busy", "crashed")
@@ -4539,6 +5373,9 @@ class Server:
         self.inflight: dict[int, threading.Event] = {}
         self.workers: list[threading.Thread] = []
         self.broken = threading.Event()
+        self.updated = threading.Event()
+        """Set once an `update` answered success: the loop then ends with EXIT_UPDATED, so the
+        connector starts the new dispatcher (this process still runs the old code)."""
 
     def write(self, frame: dict[str, object]) -> bool:
         line = frame_line(frame)
@@ -4602,7 +5439,9 @@ class Server:
                     return
                 following = next(docs, None)
                 if following is None:
-                    self.write({"t": "res", "id": request_id, "doc": current})
+                    written = self.write({"t": "res", "id": request_id, "doc": current})
+                    if verb == "update" and current.get("updated") is True and written:
+                        self.updated.set()
                     return
                 self.write({"t": "res", "id": request_id, "doc": current, "more": True})
                 current = following
@@ -4641,10 +5480,19 @@ class Server:
         worker.start()
 
     def loop(self, reader: LineReader, silence_seconds: float) -> int:
-        """Reads frames until the hub closes, says bye or goes silent; the exit code."""
+        """Reads frames until the hub closes, says bye or goes silent, or an update was installed
+        (EXIT_UPDATED); the exit code."""
+        quiet_until = time.monotonic() + silence_seconds
         while not self.broken.is_set():
-            line = reader.next(silence_seconds)
-            if line in (_EOF, _SILENCE):
+            if self.updated.is_set():
+                return EXIT_UPDATED
+            line = reader.next(min(SERVE_POLL_SECONDS, max(0.0, quiet_until - time.monotonic())))
+            if line == _SILENCE:
+                if time.monotonic() >= quiet_until:
+                    return 0
+                continue
+            quiet_until = time.monotonic() + silence_seconds
+            if line == _EOF:
                 return 0
             if line == _TOO_LARGE:
                 self.write({"t": "error", "id": None, "error": "frame_too_large"})
@@ -4683,7 +5531,7 @@ def serve(
 ) -> int:
     """Serve mode on `in_fd` (frames from the hub) and `out_fd` (frames to the hub); the exit code:
     0 at the end of input, after silence or after `bye shutdown`, 75 after `bye replaced`, 76 after
-    `bye unknown_machine` or `bye protocol` or an oversized frame."""
+    `bye unknown_machine` or `bye protocol` or an oversized frame, 77 after an installed update."""
     if "SSH_ORIGINAL_COMMAND" in env or "SSH_CONNECTION" in env:
         # Someone made serve mode a forced command: answer like a broken forced command does.
         os.write(out_fd, frame_line(refusal("bad_policy")))
@@ -4698,6 +5546,8 @@ def serve(
 
 def main() -> int:
     argv = sys.argv[1:]
+    if argv == ["--rollback"]:
+        return rollback(os.path.abspath(__file__), dict(os.environ), print)
     if serve_requested(argv):
         return serve(argv, dict(os.environ), sys.stdin.fileno(), sys.stdout.fileno())
     for document in respond(argv, dict(os.environ), sys.stdin.buffer):
