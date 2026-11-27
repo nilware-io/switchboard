@@ -157,6 +157,10 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 8. Off: `systemctl --user stop switchboard-connect` (and `disable` to keep it off after a reboot). The hub then says "laptop is not connected right now." You decide when the machine can be reached.
 
+## Updating the dispatcher (0.9.0: machine health)
+
+Dispatcher 0.9.0 adds the read-only `health` verb (free disk space, read-only file systems, memory; on WSL also the Windows disk C:), which the hub polls for the [incident log](SWITCHBOARD.md#incident-log). It needs no new flag. On each machine, from your own copy at the new verified commit: read `git diff <old>..<new> -- deploy/remote`, then install `switchboard-remote` and `switchboard-connect` again as in part 2.2 (`sha256sum` both copies), and `systemctl --user restart switchboard-connect`. `remote-check` shows `switchboard-remote 0.9.0` with `health` among its verbs. Until a machine is updated the hub polls it with `version` instead and reports no health incidents for it. For SSH machines the same install (SETUP-WSL.md steps 5.2 and 6.1) is enough; the forced command does not change.
+
 ## 3. Moving a machine from the ssh transport
 
 1. Set the machine up as in part 2 while its `ssh` entry still works.

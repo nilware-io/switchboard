@@ -52,7 +52,7 @@ KIND_NOUNS = {"image": "image", "audio": "audio file", "video": "video"}
 
 REFUSALS = {
     "not_allowed": "switchboard-remote on {machine} does not allow attachments; it needs --allow-attachments.",
-    "bad_request": "switchboard-remote on {machine} is too old for attachments; it needs version 0.7.0.",
+    "bad_request": "switchboard-remote on {machine} is too old for attachments; it needs version 0.9.0.",
     "bad_outbox": (
         "The outbox on {machine} is not a plain folder of that user, or others can write to it, so I do not read it."
     ),

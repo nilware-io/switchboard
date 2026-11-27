@@ -89,6 +89,22 @@ def is_status_line(line: str) -> bool:
     return _STATUS_RE.search(line) is not None or MENU_FOOTER_RE.search(line) is not None
 
 
+_AUTH_FAILED_RE = re.compile(
+    r"\b401\b|authentication[_ ](?:error|failed)|invalid (?:api key|bearer token)|oauth token (?:has )?expired"
+    r"|please run /login|not logged in",
+    re.I,
+)
+
+
+def failure_code(result: RunResult) -> str:
+    """`auth_failed` (a refused login, such as HTTP 401), `timeout` or `error`, from the run's outcome,
+    result text and stderr tail; only the code leaves this function."""
+    if result.outcome == "timeout":
+        return "timeout"
+    text = f"{result.result or ''}\n{result.error or ''}\n{result.stderr_tail}"
+    return "auth_failed" if _AUTH_FAILED_RE.search(text) else "error"
+
+
 def last_meaningful_line(screen: str) -> str | None:
     """The last line that is not empty, a box border, a status bar or an empty input prompt,
     stripped of box edges and clipped to HEURISTIC_MAX_CHARS."""
@@ -111,6 +127,9 @@ class SummarizerOptions:
     base_env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     run: Callable[[RunOptions], Awaitable[RunResult]] | None = None
     now: Callable[[], int] | None = None
+    report: Callable[[str | None], None] | None = None
+    """Gets each run's outcome for the incident log: None when it answered, else `auth_failed`,
+    `timeout` or `error` (never text)."""
 
 
 @dataclass(frozen=True)
@@ -177,6 +196,7 @@ class Summarizer:
             result = await run(self.build_options(screen, lease.abort))
         except Exception as err:
             self._opts.logger.warn("summary failed", {"error": type(err).__name__})
+            self._report("error")
             return None
         finally:
             lease.release()
@@ -185,10 +205,17 @@ class Summarizer:
             self._opts.logger.info(
                 "summary failed", {"outcome": result.outcome, "exitCode": result.exit_code, "key": key}
             )
+            if result.outcome != "aborted":
+                self._report(failure_code(result))
             return None
+        self._report(None)
         text = clip(" ".join(redact(result.result).split()), SUMMARY_MAX_CHARS)
         self._cache[key] = _Cached(digest=screen_hash(screen), at_ms=self._now(), text=text)
         return text
+
+    def _report(self, failure: str | None) -> None:
+        if self._opts.report is not None:
+            self._opts.report(failure)
 
     def _record_usage(self, result: RunResult) -> None:
         usage = result.usage or {}
