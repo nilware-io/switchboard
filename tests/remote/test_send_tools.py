@@ -20,6 +20,7 @@ from voice_coding_mcp.config import Config, parse_config
 from voice_coding_mcp.log import silent_logger
 from voice_coding_mcp.remote import dispatcher
 from voice_coding_mcp.remote.audit import read_audit
+from voice_coding_mcp.remote.send import ScreenEcho
 from voice_coding_mcp.remote.tools import EARLY, EXPIRED, NEEDS_RISKY_OK, Caller, RemoteTools, RemoteToolsOptions
 from voice_coding_mcp.tasks.manager import TaskManager, TaskManagerOptions
 
@@ -119,7 +120,7 @@ async def build(tmp: Path, *, dev: dict[str, Any] | None = None, log_prompts: bo
         )
     )
     clock = FakeClock(T0)
-    ids = ["4172", "5283", "6394", "7405", "8516"]
+    ids = ["4172", "5283", "6394", "7405", "8516", "9627"]
     pool = iter(ids)
     log = LogCapture()
     tools = RemoteTools(
@@ -270,6 +271,7 @@ def answer_screen(text: str) -> str:
 async def test_words_the_owner_said_first_are_not_screen_words(ctx: Ctx) -> None:
     """The owner's voice test: GreenArrays and fringes were the owner's words before Claude Code used
     them on the screen, so a later send with them and common words is not echo."""
+    ctx.later(ScreenEcho.START_GRACE_MS / 1000)  # no owner words right after the hub starts
     await ctx.prepare("Πες μου για τα fringes στο GreenArrays")
     ctx.later()
     assert (await ctx.confirm("4172"))[0] == "Sent to fpga on dev."
@@ -315,11 +317,20 @@ async def test_only_confirmed_typed_text_sends_make_owner_words(ctx: Ctx) -> Non
     ctx.world.configure(verbModes={"send": "hang_after"})
     ctx.later()
     assert (await ctx.confirm("7405"))[0].startswith("I do not know whether it arrived")
+    await ctx.prepare("pasted GreenArrays fringes")
+    ctx.world.configure(verbModes={})
+    ctx.world.set_panes(
+        [pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX}, afterPaste={"text": {"%1": DIALOG}}
+    )
+    ctx.later()
+    assert (await ctx.confirm("8516"))[0].startswith("I typed it but did not press Enter")
+    assert ctx.audit()[-1]["outcome"] == "pasted_no_enter"
+    ctx.world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
     assert said == []
     ctx.world.configure(verbModes={})
     await ctx.prepare("typed GreenArrays fringes")
     ctx.later()
-    assert (await ctx.confirm("8516"))[0] == "Sent to fpga on dev."
+    assert (await ctx.confirm("9627"))[0] == "Sent to fpga on dev."
     assert said == ["typed GreenArrays fringes"]
 
 

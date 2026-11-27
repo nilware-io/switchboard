@@ -29,7 +29,7 @@ from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from .agents import AgentHub
 from .audit import AuditLog
 from .check import check_machine
-from .config import MachineConfig, command_timeout_seconds, known_terms
+from .config import MachineConfig, command_timeout_seconds, known_names, known_terms
 from .dispatcher import (
     KEY_NAMES,
     KEYS_MENU,
@@ -193,7 +193,7 @@ class RemoteTools:
         self.transports: dict[str, Transport] = dict(transports)
         """One per machine; `usage_report` calls the same ones."""
         self._now = options.now or now_ms
-        self.echo = ScreenEcho(self._now, known_terms(config.remote))
+        self.echo = ScreenEcho(self._now, known_terms(config.remote), known_names(config.remote))
         self.inventory = Inventory(config.remote, transports, self._logger, now=options.now, observe=self.echo.observe)
         send = config.remote.send
         self.confirmations = ConfirmationStore(

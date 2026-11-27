@@ -312,12 +312,18 @@ def command_timeout_seconds(remote: RemoteConfig, machine: MachineConfig) -> int
 
 
 def known_terms(remote: RemoteConfig) -> list[str]:
-    """Terms that do not count as echoed screen text: `send.knownTerms`, the machine names and the
-    plain (non-glob) session names, all from the owner's hub config, never from what a machine
-    reports."""
+    """Terms the owner chose that do not count as echoed screen text: `send.knownTerms`."""
+    return list(remote.send.known_terms)
+
+
+def known_names(remote: RemoteConfig) -> list[str]:
+    """Names that do not count as echoed screen text when they are long enough (`ScreenEcho`
+    applies its owner-word minimum, since the owner never chose them as terms): the machine names
+    and the plain (non-glob) session names, all from the owner's hub config, never from what a
+    machine reports."""
     names = [machine.name for machine in remote.machines]
     sessions = [s for machine in remote.machines for s in machine.sessions if "*" not in s and "?" not in s]
-    return [*remote.send.known_terms, *names, *sessions]
+    return [*names, *sessions]
 
 
 def known_hosts_path(machine: MachineConfig, state_dir: str) -> str:

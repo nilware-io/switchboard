@@ -246,6 +246,7 @@ def yes_phrase(reasons: Sequence[str]) -> str:
 
 
 _WORD_RE = re.compile(r"\w+")
+_LETTERS_RE = re.compile(r"[^\W\d_]+")
 
 
 class ScreenEcho:
@@ -255,10 +256,12 @@ class ScreenEcho:
     Three tables, all keyed blake2b digests with a random per-process key:
 
     - `_seen`: every 20-character shingle of screen text, with the time last seen (10 minutes count);
-    - `_screen_words`: every word of `MIN_WORD` or more letters in screen text, with the time last
-      seen (24 hours count), so the owner's vocabulary can tell which words a screen showed first;
+    - `_screen_words`: every word of `MIN_WORD` or more letters in screen text, also inside
+      identifiers (`_screen_word_digests`), with the time last seen (24 hours count), so the owner's
+      vocabulary can tell which words a screen showed first;
     - `_owner_words`: words of the owner's own sends (`owner_said`, only after a confirmed, typed
-      text send) that no screen showed in the 24 hours before, with the time last said.
+      text send, not in the first `START_GRACE_MS` after start) that no screen showed in the 24 hours
+      before, with the time last said.
 
     A send is echoed when at least 20 of its normalised characters lie in a recent screen shingle and
     are not explained: not part of an owner-introduced word or a known term (hub config), and not a
@@ -274,11 +277,24 @@ class ScreenEcho:
     MAX_SCREEN_WORDS = 200_000
     MAX_OWNER_WORDS = 20_000
     MIN_TERM = 3
-    """Known terms come from the owner's hub config; shorter ones (and names such as "pc") are left
-    out."""
+    """Explicit known terms (`remote.send.knownTerms`, chosen by the owner) shorter than this are
+    left out. Names that only come in implicitly (machine and session names, never chosen as terms)
+    need `MIN_WORD`, like owner words, so "dev" or "main" are no free pass."""
+    START_GRACE_MS = 60 * 60 * SECOND_MS
+    """For this long after the process starts no owner words are recorded: the screen-first records
+    of the previous process are gone, while the voice model may still relay screen text it read
+    before the restart (docs/DESIGN.md, "Screen echo provenance")."""
 
-    def __init__(self, now: Callable[[], int], known_terms: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        now: Callable[[], int],
+        known_terms: Sequence[str] = (),
+        known_names: Sequence[str] = (),
+        *,
+        start_grace_ms: int | None = None,
+    ) -> None:
         self._now = now
+        self._owner_words_from = now() + (self.START_GRACE_MS if start_grace_ms is None else start_grace_ms)
         self._key = secrets.token_bytes(16)
         self._seen: dict[bytes, int] = {}
         self._screen_words: dict[bytes, int] = {}
@@ -286,8 +302,11 @@ class ScreenEcho:
         self._words_lost_until = -1
         """While now is at most this, screen word records that may still have counted were dropped
         (memory bound): no new owner words are recorded, since a dropped one may have come first."""
-        normalised = {self._normalise(term) for term in known_terms}
-        terms = sorted((term for term in normalised if len(term) >= self.MIN_TERM), key=len, reverse=True)
+        explicit = {self._normalise(term) for term in known_terms}
+        implicit = {self._normalise(name) for name in known_names}
+        chosen = {term for term in explicit if len(term) >= self.MIN_TERM}
+        chosen |= {name for name in implicit if len(name) >= self.MIN_WORD}
+        terms = sorted(chosen, key=len, reverse=True)
         self._terms = (
             re.compile(r"(?<!\w)(?:" + "|".join(re.escape(term) for term in terms) + r")(?!\w)") if terms else None
         )
@@ -313,6 +332,29 @@ class ScreenEcho:
             if len(m.group()) >= self.MIN_WORD and m.group().isalpha()
         ]
 
+    def _screen_word_digests(self, text: str, norm: str) -> set[bytes]:
+        """Digests of every word a screen shows, as `_words` would hash it in a send: the whole
+        letters-only tokens, and also every letter run inside a longer token (split at digits,
+        underscores and other non-letters: `exfiltrate_credentials`, `exfiltrate2`) and every
+        CamelCase part (`ExfiltrateCredentials`, split before casefolding), each at least `MIN_WORD`
+        long. A word shown only inside an identifier still counts as shown first. A superset of the
+        send-side words, so it can only make screen-first stricter."""
+        found = {digest for _, _, digest in self._words(norm)}
+        parts: set[str] = {m.group() for m in _LETTERS_RE.finditer(norm)}
+        for m in _LETTERS_RE.finditer(unicodedata.normalize("NFKC", text)):
+            run = m.group()
+            start = 0
+            for i in range(1, len(run)):
+                if run[i].isupper() and (
+                    run[i - 1].islower() or (run[i - 1].isupper() and i + 1 < len(run) and run[i + 1].islower())
+                ):
+                    parts.add(run[start:i].casefold())
+                    start = i
+            parts.add(run[start:].casefold())
+            parts.add(run.casefold())
+        found |= {self._hash("\x00w" + part) for part in parts if len(part) >= self.MIN_WORD}
+        return found
+
     def observe(self, text: str | None) -> None:
         if not text:
             return
@@ -326,7 +368,7 @@ class ScreenEcho:
             if len(self._seen) > self.MAX_ENTRIES:
                 newest = sorted(self._seen.items(), key=lambda item: item[1])[-self.MAX_ENTRIES // 2 :]
                 self._seen = dict(newest)
-        for _, _, digest in self._words(norm):
+        for digest in self._screen_word_digests(text, norm):
             self._screen_words[digest] = now
         if len(self._screen_words) > self.MAX_SCREEN_WORDS:
             cutoff = now - self.WORD_WINDOW_MS
@@ -344,7 +386,7 @@ class ScreenEcho:
         owner's only when no screen showed it in the last 24 hours (the screen came first otherwise,
         even if the owner repeats it now); a word already recorded as the owner's is refreshed."""
         now = self._now()
-        if now <= self._words_lost_until:
+        if now <= self._words_lost_until or now < self._owner_words_from:
             return
         cutoff = now - self.WORD_WINDOW_MS
         for _, _, digest in self._words(self._normalise(text)):

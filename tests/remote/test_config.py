@@ -12,7 +12,7 @@ import pytest
 from tests.helpers import config_data
 from tests.remote.helpers import machine
 from voice_coding_mcp.config import ConfigError, config_warnings, parse_config
-from voice_coding_mcp.remote.config import known_hosts_path, known_terms, remote_warnings
+from voice_coding_mcp.remote.config import known_hosts_path, known_names, known_terms, remote_warnings
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -185,7 +185,8 @@ def test_known_terms_come_from_the_hub_config_only(tmp_path: Path) -> None:
     terms = ["GreenArrays", "polly2-rtl", "voice coding", "O'Brien", "sh4"]
     config = parse(tmp_path, {"machines": [machine("dev")], "send": {"knownTerms": terms}})
     assert config.remote.send.known_terms == terms
-    assert known_terms(config.remote) == [*terms, "dev", "fpga", "notes"], "globs such as work-* are left out"
+    assert known_terms(config.remote) == terms
+    assert known_names(config.remote) == ["dev", "fpga", "notes"], "globs such as work-* are left out"
     assert parse(tmp_path, {}).remote.send.known_terms == []
 
 
