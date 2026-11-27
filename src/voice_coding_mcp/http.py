@@ -10,7 +10,10 @@ Routing is our own rather than Starlette's:
 - paths match case-insensitively with one optional trailing slash, on the raw (undecoded) path;
 - a known path with a method it does not serve is 404 `Not found.` (Starlette would answer 405),
   except `GET`/`DELETE /mcp`, which are 405 with `Allow: POST` and a JSON-RPC error;
-- `GET /healthz` is answered before the Host check, everything else after Host and Origin.
+- `GET /healthz` is answered before the Host check, everything else after Host and Origin;
+- `GET`/`HEAD /attachments/<token>` serves a large video's one-time link (`remote/links.py`):
+  case-sensitive (the token is), 404 for an unknown or expired token, and those misses are rate
+  limited per IP like `/authorize`. The request log shows only the token's fingerprint.
 
 uvicorn runs with `proxy_headers=False`, `access_log=False`, `log_config=None`,
 `server_header=False`; `web.client_ip` trusts forwarding headers only from loopback proxies.
@@ -35,6 +38,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .auth.bearer import BearerMiddleware, bearer_token
 from .auth.cimd import CimdResolver
+from .auth.rate_limit import RateLimiter, RateLimitOptions
 from .auth.router import DEFAULT_AUTHORIZE_RATE_LIMIT, AuthRouterOptions, RateLimitSettings, create_auth_routes
 from .auth.store import OAuthStore
 from .clock import Clock
@@ -44,6 +48,7 @@ from .log import Logger, fingerprint, strip_query
 from .mcp import McpServerOptions, build_remote_control, create_mcp_server
 from .notify import TextSender
 from .remote.discord import DiscordNotifier, combine
+from .remote.links import LINK_PATH, LinkStore, serve_link, token_fingerprint
 from .remote.tools import RemoteTools, RemoteToolsOptions
 from .remote.watcher import Watcher, WatcherOptions
 from .tasks.manager import TaskManager
@@ -108,6 +113,14 @@ def _original_url(scope: Scope) -> str:
     query = scope.get("query_string", b"")
     path = _raw_path(scope)
     return f"{path}?{query.decode('latin-1')}" if query else path
+
+
+def _logged_path(url: str) -> str:
+    """The path for log lines: without the query, and a link token only as its fingerprint."""
+    path = strip_query(url)
+    if path.startswith(LINK_PATH):
+        return f"{LINK_PATH}({token_fingerprint(path[len(LINK_PATH) :])})"
+    return path
 
 
 class _McpEndpoint:
@@ -176,8 +189,23 @@ class _App:
         options: CreateAppOptions,
         auth_routes: list[BaseRoute],
         mcp_endpoint: ASGIApp,
+        links: LinkStore | None = None,
+        link_limit: RateLimitSettings | None = None,
     ) -> None:
         self._app = app
+        self._links = links
+        self._link_misses = (
+            RateLimiter(
+                RateLimitOptions(
+                    max=link_limit.max,
+                    window_ms=link_limit.window_ms,
+                    now=options.auth.now,
+                    on_limited=lambda ip: self._logger.warn("rate limited", {"ip": ip, "path": LINK_PATH}),
+                )
+            )
+            if link_limit is not None
+            else None
+        )
         config = options.config
         self._logger = options.logger.child({"component": "http"})
         self._allowed_origins = {config.issuer, *CLAUDE_ORIGINS}
@@ -212,7 +240,7 @@ class _App:
                     "request",
                     {
                         "method": scope["method"],
-                        "path": strip_query(original_url),
+                        "path": _logged_path(original_url),
                         "status": status[0],
                         "ms": int((time.monotonic() - start) * 1000),
                         "ip": client_ip(HTTPConnection(scope)),
@@ -253,17 +281,32 @@ class _App:
         # Browsers send Origin; only our own origin and the Claude apps are allowed.
         origin = headers.get("origin")
         if origin is not None and origin.lower() not in self._allowed_origins:
-            self._logger.warn("origin refused", {"origin": origin[:100], "path": strip_query(original_url)})
+            self._logger.warn("origin refused", {"origin": origin[:100], "path": _logged_path(original_url)})
             await _text(403, "Forbidden: origin not allowed.", NO_STORE)(scope, receive, send)
             return
 
         try:
-            await self._route(scope, receive, send, path, method)
+            raw = _raw_path(scope)
+            if raw.startswith(LINK_PATH):
+                await self._link(scope, receive, send, raw[len(LINK_PATH) :], method)
+            else:
+                await self._route(scope, receive, send, path, method)
         except Exception as err:
             if status:
                 raise
-            self._logger.error("request failed", {"path": strip_query(original_url), "error": err})
+            self._logger.error("request failed", {"path": _logged_path(original_url), "error": err})
             await _text(500, "Internal error.")(scope, receive, send)
+
+    async def _link(self, scope: Scope, receive: Receive, send: Send, token: str, method: str) -> None:
+        """A large video's one-time link. No bearer token (a phone's browser or player opens it):
+        the 256-bit token in the path is the credential."""
+        link = self._links.get(token) if self._links is not None and method in ("GET", "HEAD") else None
+        if link is None:
+            limited = self._link_misses.check(client_ip(HTTPConnection(scope))) if self._link_misses else None
+            await (limited or _text(404, "Not found.", NO_STORE))(scope, receive, send)
+            return
+        assert self._links is not None
+        await serve_link(self._links, link, scope, receive, send)
 
     async def _route(self, scope: Scope, receive: Receive, send: Send, path: str | None, method: str) -> None:
         if path is not None:
@@ -383,6 +426,8 @@ def create_app(options: CreateAppOptions) -> Starlette:
                 options=options,
                 auth_routes=auth_routes,
                 mcp_endpoint=_McpEndpoint(session_manager),
+                links=remote_tools.links,
+                link_limit=overrides.rate_limit,
             )
         ],
     )

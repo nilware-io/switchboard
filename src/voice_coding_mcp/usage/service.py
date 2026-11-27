@@ -188,6 +188,10 @@ class UsageService:
         skipped = 0
         for name, cache in self.caches(names).items():
             for transcript in cache.files.values():
+                if transcript.is_agent_file:
+                    # Agent transcripts (dispatcher 0.10.0) feed the timesheet's agent time; usage
+                    # keeps counting sessions only, as before.
+                    continue
                 if transcript.skipped:
                     if period is None or transcript.mtime >= period.start_ms:
                         skipped += 1

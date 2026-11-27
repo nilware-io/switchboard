@@ -312,7 +312,7 @@ async def test_status_and_remote_check_through_the_control_socket(ctx: Ctx) -> N
     assert code == 0
     line = next(x for x in io.stdout.splitlines() if x.startswith("  - laptop:"))
     assert line.startswith("  - laptop: connected since ")
-    assert f"dispatcher {d.VERSION}, send allowed, usage allowed, from 203.0.113.5" in line
+    assert f"dispatcher {d.VERSION}, send allowed, usage allowed, attachments off, from 203.0.113.5" in line
     code, io = await run_cli("remote-check", "laptop", "--config", ctx.config_path)
     assert code == 0, io.stdout
     lines = io.stdout.splitlines()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -44,7 +45,7 @@ def u(t: int) -> Record:
     return Record(t=t, kind="u")
 
 
-def a(t: int, msg: str | None = None, model: str = "claude-opus-4-8", **tokens: int) -> Record:
+def a(t: int, msg: str | None = None, model: str = "claude-opus-4-8", **tokens: Any) -> Record:
     return Record(t=t, kind="a", model=model, msg_id=msg, req_id="r" if msg else None, **tokens)
 
 

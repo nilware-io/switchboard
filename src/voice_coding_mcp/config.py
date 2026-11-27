@@ -36,6 +36,7 @@ from .remote.config import (
     check_remote,
     remote_warnings,
 )
+from .timesheet.config import TimesheetConfig
 from .urls import is_loopback_ip, parse_url
 from .usage.config import UsageConfig
 
@@ -261,6 +262,7 @@ class _ConfigFile(_Section):
     remote: RemoteConfig = Field(default_factory=RemoteConfig)
     watch: WatchConfig = Field(default_factory=WatchConfig)
     usage: UsageConfig = Field(default_factory=UsageConfig)
+    timesheet: TimesheetConfig = Field(default_factory=TimesheetConfig)
     incidents: IncidentsConfig = Field(default_factory=IncidentsConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -295,6 +297,8 @@ class Config:
     """The Switchboard notification watcher (off unless `intervalSeconds` > 0)."""
     usage: UsageConfig = field(default_factory=UsageConfig)
     """Switchboard usage accounting: idle gap, hourly rate, prices (docs/SWITCHBOARD.md)."""
+    timesheet: TimesheetConfig = field(default_factory=TimesheetConfig)
+    """Draft timesheets: project to client map, owner identities, rounding (docs/SWITCHBOARD.md)."""
     incidents: IncidentsConfig = field(default_factory=IncidentsConfig)
     """The Switchboard incident log and machine health polls (docs/SWITCHBOARD.md)."""
     events: EventsConfig = field(default_factory=EventsConfig)
@@ -396,6 +400,11 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
     project_roots = _check_project_roots(
         parsed.project_roots, parsed.state_dir, home_dir if home_dir is not None else os.path.expanduser("~")
     )
+    for name, mapping in parsed.timesheet.projects.items():
+        for path in mapping.paths:
+            real = os.path.realpath(path)
+            if not any(real == root or real.startswith(root.rstrip("/") + "/") for root in project_roots):
+                raise ConfigError(f"timesheet.projects.{name}.paths: {path} is not inside projectRoots")
 
     return Config(
         public_url=issuer,
@@ -415,6 +424,7 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
         remote=parsed.remote,
         watch=parsed.watch,
         usage=parsed.usage,
+        timesheet=parsed.timesheet,
         incidents=parsed.incidents,
         events=parsed.events,
         discord=parsed.discord,
