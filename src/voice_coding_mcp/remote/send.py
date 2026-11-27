@@ -245,37 +245,80 @@ def yes_phrase(reasons: Sequence[str]) -> str:
     return "yes, send it anyway"
 
 
+_WORD_RE = re.compile(r"\w+")
+
+
 class ScreenEcho:
-    """Remembers, as keyed hashes of 20-character shingles of normalised text (no text), what screen
-    text the hub returned in the last 10 minutes, so a send that repeats it is marked risky: an
-    injected screen is the likely source of such words."""
+    """Remembers, as keyed hashes of normalised text (no text), what screen text the hub returned, so
+    a send that repeats it is marked risky: an injected screen is the likely source of such words.
+
+    Three tables, all keyed blake2b digests with a random per-process key:
+
+    - `_seen`: every 20-character shingle of screen text, with the time last seen (10 minutes count);
+    - `_screen_words`: every word of `MIN_WORD` or more letters in screen text, with the time last
+      seen (24 hours count), so the owner's vocabulary can tell which words a screen showed first;
+    - `_owner_words`: words of the owner's own sends (`owner_said`, only after a confirmed, typed
+      text send) that no screen showed in the 24 hours before, with the time last said.
+
+    A send is echoed when at least 20 of its normalised characters lie in a recent screen shingle and
+    are not explained: not part of an owner-introduced word or a known term (hub config), and not a
+    space between two explained characters (docs/DESIGN.md, "Screen echo provenance")."""
 
     SHINGLE = 20
     WINDOW_MS = 10 * 60 * SECOND_MS
     MAX_ENTRIES = 400_000
+    MIN_WORD = 5
+    """Owner words shorter than this never explain anything: function words ("the", "και", "this")
+    are no free pass."""
+    WORD_WINDOW_MS = 24 * 60 * 60 * SECOND_MS
+    MAX_SCREEN_WORDS = 200_000
+    MAX_OWNER_WORDS = 20_000
+    MIN_TERM = 3
+    """Known terms come from the owner's hub config; shorter ones (and names such as "pc") are left
+    out."""
 
-    def __init__(self, now: Callable[[], int]) -> None:
+    def __init__(self, now: Callable[[], int], known_terms: Sequence[str] = ()) -> None:
         self._now = now
         self._key = secrets.token_bytes(16)
         self._seen: dict[bytes, int] = {}
+        self._screen_words: dict[bytes, int] = {}
+        self._owner_words: dict[bytes, int] = {}
+        self._words_lost_until = -1
+        """While now is at most this, screen word records that may still have counted were dropped
+        (memory bound): no new owner words are recorded, since a dropped one may have come first."""
+        normalised = {self._normalise(term) for term in known_terms}
+        terms = sorted((term for term in normalised if len(term) >= self.MIN_TERM), key=len, reverse=True)
+        self._terms = (
+            re.compile(r"(?<!\w)(?:" + "|".join(re.escape(term) for term in terms) + r")(?!\w)") if terms else None
+        )
 
     @staticmethod
     def _normalise(text: str) -> str:
         return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
-    def _shingles(self, text: str) -> set[bytes]:
-        norm = self._normalise(text)
+    def _hash(self, value: str) -> bytes:
+        return hashlib.blake2b(value.encode("utf-8"), digest_size=8, key=self._key).digest()
+
+    def _shingle_spans(self, norm: str) -> list[tuple[int, bytes]]:
         size = self.SHINGLE
-        return {
-            hashlib.blake2b(norm[i : i + size].encode("utf-8"), digest_size=8, key=self._key).digest()
-            for i in range(len(norm) - size + 1)
-        }
+        return [(i, self._hash(norm[i : i + size])) for i in range(len(norm) - size + 1)]
+
+    def _words(self, norm: str) -> list[tuple[int, int, bytes]]:
+        """(start, end, digest) of every word that can be explained: letters only (no digits or
+        underscores, so hashes and identifiers stay out of the tables), at least `MIN_WORD` long.
+        Its digest is domain-separated from shingles."""
+        return [
+            (m.start(), m.end(), self._hash("\x00w" + m.group()))
+            for m in _WORD_RE.finditer(norm)
+            if len(m.group()) >= self.MIN_WORD and m.group().isalpha()
+        ]
 
     def observe(self, text: str | None) -> None:
         if not text:
             return
         now = self._now()
-        for digest in self._shingles(text):
+        norm = self._normalise(text)
+        for _, digest in self._shingle_spans(norm):
             self._seen[digest] = now
         if len(self._seen) > self.MAX_ENTRIES:
             cutoff = now - self.WINDOW_MS
@@ -283,11 +326,66 @@ class ScreenEcho:
             if len(self._seen) > self.MAX_ENTRIES:
                 newest = sorted(self._seen.items(), key=lambda item: item[1])[-self.MAX_ENTRIES // 2 :]
                 self._seen = dict(newest)
+        for _, _, digest in self._words(norm):
+            self._screen_words[digest] = now
+        if len(self._screen_words) > self.MAX_SCREEN_WORDS:
+            cutoff = now - self.WORD_WINDOW_MS
+            words = {digest: at for digest, at in self._screen_words.items() if at >= cutoff}
+            if len(words) > self.MAX_SCREEN_WORDS:
+                ordered = sorted(words.items(), key=lambda item: item[1])
+                keep = len(ordered) - self.MAX_SCREEN_WORDS // 2
+                dropped_last = ordered[keep - 1][1] if keep > 0 else -1
+                self._words_lost_until = max(self._words_lost_until, dropped_last + self.WORD_WINDOW_MS)
+                words = dict(ordered[keep:])
+            self._screen_words = words
+
+    def owner_said(self, text: str) -> None:
+        """Records the words of a send the owner confirmed and that was typed. A word counts as the
+        owner's only when no screen showed it in the last 24 hours (the screen came first otherwise,
+        even if the owner repeats it now); a word already recorded as the owner's is refreshed."""
+        now = self._now()
+        if now <= self._words_lost_until:
+            return
+        cutoff = now - self.WORD_WINDOW_MS
+        for _, _, digest in self._words(self._normalise(text)):
+            already_owner = self._owner_words.get(digest, -1) >= cutoff
+            if already_owner or self._screen_words.get(digest, -1) < cutoff:
+                self._owner_words[digest] = now
+        if len(self._owner_words) > self.MAX_OWNER_WORDS:
+            owner = {digest: at for digest, at in self._owner_words.items() if at >= cutoff}
+            if len(owner) > self.MAX_OWNER_WORDS:
+                owner = dict(sorted(owner.items(), key=lambda item: item[1])[-self.MAX_OWNER_WORDS // 2 :])
+            self._owner_words = owner
+
+    def unexplained(self, text: str) -> int:
+        """How many characters of `text` (normalised) lie in a recent screen shingle without being
+        explained by an owner-introduced word or a known term."""
+        now = self._now()
+        cutoff = now - self.WINDOW_MS
+        norm = self._normalise(text)
+        echoed = [i for i, digest in self._shingle_spans(norm) if self._seen.get(digest, -1) >= cutoff]
+        if not echoed:
+            return 0
+        covered = bytearray(len(norm))
+        for i in echoed:
+            covered[i : i + self.SHINGLE] = b"\x01" * self.SHINGLE
+        explained = bytearray(len(norm))
+        owner_cutoff = now - self.WORD_WINDOW_MS
+        for start, end, digest in self._words(norm):
+            if self._owner_words.get(digest, -1) >= owner_cutoff:
+                explained[start:end] = b"\x01" * (end - start)
+        if self._terms is not None:
+            for m in self._terms.finditer(norm):
+                explained[m.start() : m.end()] = b"\x01" * (m.end() - m.start())
+        for i, char in enumerate(norm):
+            if char == " " and 0 < i < len(norm) - 1 and explained[i - 1] and explained[i + 1]:
+                explained[i] = 1
+        return sum(1 for i in range(len(norm)) if covered[i] and not explained[i])
 
     def echoed(self, text: str) -> bool:
-        """At least 20 characters of `text` (normalised) appeared in recent screen text."""
-        cutoff = self._now() - self.WINDOW_MS
-        return any(self._seen.get(digest, -1) >= cutoff for digest in self._shingles(text))
+        """At least 20 characters of `text` (normalised) appeared in recent screen text and are not
+        explained by the owner's own words or known terms."""
+        return self.unexplained(text) >= self.SHINGLE
 
 
 @dataclass(frozen=True)

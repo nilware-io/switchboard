@@ -103,6 +103,8 @@ def keys_calls(ctx: Ctx) -> list[str]:
 
 async def test_keys_read_back_the_menu_and_press_only_after_confirm(make: Make) -> None:
     ctx = await make()
+    said: list[str] = []
+    ctx.tools.echo.owner_said = said.append  # type: ignore[method-assign,assignment]
     show(ctx, MENU)
     readback, error = await prepare(ctx, ["down", "Enter"])
     assert not error
@@ -115,6 +117,7 @@ async def test_keys_read_back_the_menu_and_press_only_after_confirm(make: Make) 
     assert keys_calls(ctx) == []
     ctx.later()
     assert await ctx.confirm("4172") == ("Pressed down and enter in fpga on dev.", False)
+    assert said == [], "pressed keys are never the owner's words"
     assert pressed(ctx) == [["send-keys", "-t", "%1", "Down", "Enter"]]
     assert keys_calls(ctx) == [
         f"switchboard-remote keys %1 {CLAUDE_PID} {SESSION_A} menu {d.menu_hash(MENU)} Down Enter"

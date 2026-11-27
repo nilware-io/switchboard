@@ -34,6 +34,10 @@ AGENT_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
 """Paths of the agent sockets and key file (a Unix socket path has at most 108 bytes)."""
 MAX_RISKY_PATTERNS = 64
 MAX_RISKY_PATTERN_CHARS = 200
+MAX_KNOWN_TERMS = 200
+KNOWN_TERM_RE = re.compile(r"[^\W_](?:[\w .'-]{0,62}[^\W_])?")
+"""A known term: letters, digits and `_ .'-` inside, a letter or digit at both ends, 3 to 64
+characters (checked in `_known_term`)."""
 
 Transport = Literal["ssh", "local", "agent"]
 AGENT_ONLY_KEYS = (
@@ -168,6 +172,12 @@ def _risky_pattern(value: str) -> str:
     return value
 
 
+def _known_term(value: str) -> str:
+    if not 3 <= len(value) <= 64 or not KNOWN_TERM_RE.fullmatch(value) or "  " in value:
+        raise ValueError("must be 3 to 64 letters, digits and single spaces or _.'- inside")
+    return value
+
+
 SlashCommand = Annotated[
     str, AfterValidator(_matching(SLASH_COMMAND_RE, "a slash command name without the / (a-z, 0-9, : and -)"))
 ]
@@ -187,6 +197,10 @@ class SendConfig(_Section):
         list[Annotated[str, AfterValidator(_risky_pattern)]], Field(max_length=MAX_RISKY_PATTERNS)
     ] = Field(default_factory=list)
     """Case-insensitive regexes added to the built-in risky list (`send.RISKY`), never replacing it."""
+    known_terms: Annotated[
+        list[Annotated[str, AfterValidator(_known_term)]], Field(max_length=MAX_KNOWN_TERMS), AfterValidator(_globs)
+    ] = Field(default_factory=list)
+    """Words of the owner's projects that do not count as echoed screen text (`send.ScreenEcho`)."""
     client_approval: bool = False
     """`destructiveHint: true` on `remote_send_confirm`, so the Claude app asks on screen each time."""
 
@@ -295,6 +309,15 @@ def command_timeout_seconds(remote: RemoteConfig, machine: MachineConfig) -> int
     if machine.transport == "agent":
         return remote.agents.command_timeout_seconds
     return remote.ssh.command_timeout_seconds
+
+
+def known_terms(remote: RemoteConfig) -> list[str]:
+    """Terms that do not count as echoed screen text: `send.knownTerms`, the machine names and the
+    plain (non-glob) session names, all from the owner's hub config, never from what a machine
+    reports."""
+    names = [machine.name for machine in remote.machines]
+    sessions = [s for machine in remote.machines for s in machine.sessions if "*" not in s and "?" not in s]
+    return [*remote.send.known_terms, *names, *sessions]
 
 
 def known_hosts_path(machine: MachineConfig, state_dir: str) -> str:
