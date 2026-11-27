@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from voice_coding_mcp.log import silent_logger
 from voice_coding_mcp.mcp import McpServerOptions, create_mcp_server
 from voice_coding_mcp.remote import attachments as att
 from voice_coding_mcp.remote import dispatcher as d
+from voice_coding_mcp.remote import tools as tools_module
 from voice_coding_mcp.remote.audit import read_audit
 from voice_coding_mcp.remote.config import MachineConfig
 from voice_coding_mcp.remote.protocol import ATTACHMENT_CAPS as HUB_CAPS
@@ -263,6 +265,93 @@ async def test_the_hub_checks_everything_again(
         )
         rows, _ = read_audit(config.state_dir)
         assert rows[-1]["outcome"] == "rejected"
+    finally:
+        await manager.shutdown("test over")
+
+
+class SlowTransport(LyingTransport):
+    """Like LyingTransport, but `attachment` waits until the test releases it."""
+
+    def __init__(self, machine: MachineConfig, answer: AttachmentResponse, listed: dict[str, Any]) -> None:
+        super().__init__(machine, answer, listed)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def call(
+        self, verb: str, args: Sequence[str] = (), *, timeout_seconds: float, stdin: bytes | None = None
+    ) -> TransportResult:
+        if verb == "attachment":
+            self.started.set()
+            await self.release.wait()
+        return await super().call(verb, args, timeout_seconds=timeout_seconds, stdin=stdin)
+
+
+async def lying_tools(tmp_path: Path, transport_type: type[LyingTransport], data: bytes) -> tuple[RemoteTools, Any]:
+    config = make_config(tmp_path, [machine("dev", allowAttachments=True)])
+    manager = await make_manager(config)
+    info = {"name": "shot.png", "kind": "image", "mime": "image/png", "size": 10, "mtime": T0}
+    reply = AttachmentResponse(name="shot.png", kind="image", mime="image/png", mtime=T0, data=data)
+    transport = transport_type(config.remote.machines[0], reply, info)
+    transports: dict[str, Transport] = {"dev": transport}
+    tools = RemoteTools(RemoteToolsOptions(config=config, manager=manager, logger=silent_logger, transports=transports))
+    return tools, (manager, transport)
+
+
+async def test_rejected_fetches_count_against_the_limits(tmp_path: Path) -> None:
+    # A lying machine that answers every fetch with junk does not get unlimited tries.
+    tools, (manager, _) = await lying_tools(tmp_path, LyingTransport, SVG)
+    try:
+        for _ in range(att.MAX_FETCHES_PER_WINDOW):
+            answer = await tools.remote_attachment("dev", "shot.png", None, OWNER)
+            assert answer.is_error
+            assert answer.media is None
+        answer = await tools.remote_attachment("dev", "shot.png", None, OWNER)
+        assert answer.text == "That is a lot of attachments in a short time. Try again in a few minutes."
+        # The bytes the machine sent count, not the size it listed.
+        limiter = tools.fetches
+        assert not limiter.fits(att.MAX_BYTES_PER_WINDOW - att.MAX_FETCHES_PER_WINDOW * len(SVG) + 1)
+    finally:
+        await manager.shutdown("test over")
+
+
+async def test_one_fetch_at_a_time(tmp_path: Path) -> None:
+    tools, (manager, transport) = await lying_tools(tmp_path, SlowTransport, png())
+    try:
+        first = asyncio.create_task(tools.remote_attachment("dev", "shot.png", None, OWNER))
+        await asyncio.wait_for(transport.started.wait(), 5)
+        busy = await tools.remote_attachment("dev", "shot.png", None, OWNER)
+        assert busy.is_error
+        assert busy.text == att.BUSY_WORDS
+        transport.release.set()
+        assert (await first).media is not None
+        # The slot is free again.
+        assert (await tools.remote_attachment("dev", "shot.png", None, OWNER)).media is not None
+    finally:
+        await manager.shutdown("test over")
+
+
+async def test_the_hub_check_runs_off_the_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A slow check (a crafted file) must not stop the event loop: other coroutines keep running.
+    def slow_check(name: str, data: bytes) -> tuple[str, str, bytes]:
+        time.sleep(0.5)
+        return d.media_check(name, data)
+
+    monkeypatch.setattr(tools_module, "media_check", slow_check)
+    tools, (manager, _) = await lying_tools(tmp_path, LyingTransport, png())
+    try:
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        running = asyncio.create_task(ticker())
+        answer = await tools.remote_attachment("dev", "shot.png", None, OWNER)
+        running.cancel()
+        assert answer.media is not None
+        assert ticks >= 10
     finally:
         await manager.shutdown("test over")
 

@@ -35,6 +35,10 @@ MAX_FETCHES_PER_WINDOW = 20
 BYTE_WINDOW_MS = 60 * 60 * 1000
 MAX_BYTES_PER_WINDOW = 256 * 1024 * 1024
 """Bytes all machines together may send within BYTE_WINDOW_MS."""
+MAX_CONCURRENT_FETCHES = 1
+"""Attachment fetches in flight on the hub at once (each holds up to about 100 MB of buffers, and
+the media check runs in a worker thread)."""
+BUSY_WORDS = "I am already fetching an attachment. Try again in a moment."
 SPOKEN_ATTACHMENTS = 5
 KIND_WORDS = {"image": "an image", "audio": "audio", "video": "a video"}
 KIND_NOUNS = {"image": "image", "audio": "audio file", "video": "video"}
@@ -85,30 +89,46 @@ def media_content(answer_text: str, media: Media) -> CallToolResult:
 
 
 @dataclass
+class Reservation:
+    """One fetch counted against the limits; `size` is corrected to the bytes actually received."""
+
+    time: int
+    size: int
+
+
+@dataclass
 class FetchLimiter:
-    """Sliding-window limits on attachments sent to the client (in memory only)."""
+    """Sliding-window limits on attachment fetches (in memory only). A fetch is counted when it is
+    asked of the machine, whatever comes back: refused, failed and rejected transfers count too."""
 
     now: Callable[[], int] = now_ms
     _fetches: dict[str, list[int]] = field(default_factory=dict)
-    _bytes: list[tuple[int, int]] = field(default_factory=list)
+    _bytes: list[Reservation] = field(default_factory=list)
 
     def _trim(self, machine: str) -> list[int]:
         now = self.now()
         times = [t for t in self._fetches.get(machine, []) if now - t < FETCH_WINDOW_MS]
         self._fetches[machine] = times
-        self._bytes = [(t, n) for t, n in self._bytes if now - t < BYTE_WINDOW_MS]
+        self._bytes = [r for r in self._bytes if now - r.time < BYTE_WINDOW_MS]
         return times
+
+    def _total(self) -> int:
+        return sum(r.size for r in self._bytes)
 
     def allows(self, machine: str) -> bool:
         times = self._trim(machine)
-        return len(times) < MAX_FETCHES_PER_WINDOW and sum(n for _, n in self._bytes) < MAX_BYTES_PER_WINDOW
+        return len(times) < MAX_FETCHES_PER_WINDOW and self._total() < MAX_BYTES_PER_WINDOW
 
     def fits(self, size: int) -> bool:
-        return sum(n for _, n in self._bytes) + size <= MAX_BYTES_PER_WINDOW
+        return self._total() + size <= MAX_BYTES_PER_WINDOW
 
-    def record(self, machine: str, size: int) -> None:
-        self._trim(machine).append(self.now())
-        self._bytes.append((self.now(), size))
+    def reserve(self, machine: str, size: int) -> Reservation:
+        """Count a fetch of about `size` bytes before it is asked of the machine."""
+        now = self.now()
+        self._trim(machine).append(now)
+        reservation = Reservation(now, size)
+        self._bytes.append(reservation)
+        return reservation
 
 
 FILLER_WORDS = frozenset(("the", "a", "an", "my", "that", "this", "last", "latest", "newest", "file"))

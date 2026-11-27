@@ -27,7 +27,17 @@ from ..projects import MatchOk
 from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
 from .agents import AgentHub
-from .attachments import FetchLimiter, Media, format_attachments, format_sent, pick, refusal_words
+from .attachments import (
+    BUSY_WORDS,
+    MAX_CONCURRENT_FETCHES,
+    FetchLimiter,
+    Media,
+    Reservation,
+    format_attachments,
+    format_sent,
+    pick,
+    refusal_words,
+)
 from .audit import AuditLog
 from .check import check_machine
 from .config import MachineConfig, command_timeout_seconds, known_names, known_terms
@@ -233,6 +243,7 @@ class RemoteTools:
         )
         self._background: set[asyncio.Task[str | None]] = set()
         self.fetches = FetchLimiter(now=self._now)
+        self._fetching = 0
         self._verbs: dict[str, tuple[int, frozenset[str]]] = {}
         self._pending = PendingChecker(
             PendingCheckerOptions(
@@ -986,6 +997,17 @@ class RemoteTools:
         if isinstance(found, ToolAnswer):
             return found
         machine_name = found.name
+        if self._fetching >= MAX_CONCURRENT_FETCHES:
+            return ToolAnswer(BUSY_WORDS, True)
+        self._fetching += 1
+        try:
+            return await self._remote_attachment(machine_name, name, kind, caller)
+        finally:
+            self._fetching -= 1
+
+    async def _remote_attachment(
+        self, machine_name: str, name: str | None, kind: str | None, caller: Caller
+    ) -> ToolAnswer:
         if not self.fetches.allows(machine_name):
             return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
         deadline = self._deadline()
@@ -1001,7 +1023,9 @@ class RemoteTools:
             return ToolAnswer(f"The outbox on {machine_name} has no {what}.", True)
         if not self.fetches.fits(entry.size):
             return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
-        answer, outcome, size = await self._fetch_attachment(machine_name, entry, deadline)
+        # Counted before the machine is asked, so refused, failed and rejected transfers count too.
+        reservation = self.fetches.reserve(machine_name, entry.size)
+        answer, outcome, size = await self._fetch_attachment(machine_name, entry, deadline, reservation)
         self.audit.record_attachment(
             machine=machine_name,
             name=entry.name,
@@ -1024,9 +1048,10 @@ class RemoteTools:
         return answer
 
     async def _fetch_attachment(
-        self, machine: str, entry: AttachmentInfo, deadline: _Deadline
+        self, machine: str, entry: AttachmentInfo, deadline: _Deadline, reservation: Reservation
     ) -> tuple[ToolAnswer, str, int]:
-        """(answer, audit outcome, bytes sent to the client)."""
+        """(answer, audit outcome, bytes sent to the client). The reservation keeps the listed size
+        unless the machine sent bytes, which then count instead."""
         transport = self.inventory.transport(machine)
         result = await transport.call("attachment", [entry.name], timeout_seconds=max(0.5, deadline.left()))
         self._logger.info(
@@ -1050,18 +1075,21 @@ class RemoteTools:
             "listed, so I did not pass it on.",
             True,
         )
-        if not isinstance(data, AttachmentResponse) or data.name != entry.name:
+        if not isinstance(data, AttachmentResponse):
+            return rejected, "rejected", 0
+        reservation.size = len(data.data)
+        if data.name != entry.name:
             return rejected, "rejected", 0
         # The machine is not trusted: the bytes must be a whole media file of the kind and type it
-        # claims, within the caps, by the hub's own check.
+        # claims, within the caps, by the hub's own check. The check is pure Python (bounded by
+        # MAX_MEDIA_ELEMENTS), so it runs in a worker thread and the event loop keeps serving.
         try:
-            kind, mime, clean = media_check(entry.name, data.data)
+            kind, mime, clean = await asyncio.to_thread(media_check, entry.name, data.data)
         except RefusedError:
             return rejected, "rejected", 0
         if kind != data.kind or mime != data.mime:
             return rejected, "rejected", 0
         media = Media(machine=machine, name=entry.name, kind=kind, mime=mime, data=clean)
-        self.fetches.record(machine, len(clean))
         return ToolAnswer(format_sent(media, data.mtime, self._now()), media=media), "sent", len(clean)
 
     def _machine(self, name: str) -> MachineConfig | None:
