@@ -416,6 +416,12 @@ class AgentHub:
         """Why the relay socket is not served (shown by `status` and `remote-check`)."""
         self.check: Callable[[str], Awaitable[tuple[list[str], bool]]] | None = None
         """`check <machine>` of the control socket (set by RemoteTools: version and list, formatted)."""
+        self.on_link: Callable[[str, bool, str | None, int], None] | None = None
+        """Called with (machine, up, close reason, time) when a connection is accepted and when one
+        closes that was not replaced and not closed by the hub's own stop (the incident log)."""
+        self.on_relay_problem: Callable[[str, str | None], None] | None = None
+        """Called with (code, machine) for a relay socket that is not served or a relay connection
+        refused before its hello (the incident log)."""
         self._live: dict[str, AgentConnection] = {}
         self._state: dict[str, MachineState] = {name: MachineState() for name in self.machines}
         self._relay_uid: int | None = None
@@ -506,6 +512,7 @@ class AgentHub:
         if problem:
             self.problem = problem
             self.logger.warn("agent socket not served", {"problem": problem})
+            self._relay_problem("socket_not_served", None)
         else:
             self.logger.info("agent socket served", {"path": self.settings.socket_path})
         control = await self._bind(self.control_path, 0o600, self._control)
@@ -548,10 +555,12 @@ class AgentHub:
         uid = _peer_uid(writer)
         if uid is None or uid != self._relay_uid:
             self.logger.warn("agent connection from another user refused", {"uid": uid})
+            self._relay_problem("relay_wrong_user", None)
             writer.close()
             return
         if self._open >= 2 * len(self.machines) + 4:
             self.logger.warn("agent connection refused: too many connections")
+            self._relay_problem("relay_too_many", None)
             writer.close()
             return
         self._open += 1
@@ -565,11 +574,14 @@ class AgentHub:
             if conn is not None:
                 await conn.close(conn.close_reason or "eof")
                 state = self._state[conn.machine]
-                state.last_disconnect_ms = self.now()
+                closed_ms = self.now()
+                state.last_disconnect_ms = closed_ms
                 state.last_disconnect_reason = conn.close_reason
                 if self._live.get(conn.machine) is conn:
                     del self._live[conn.machine]
                 self.logger.info("agent disconnected", {"machine": conn.machine, "reason": conn.close_reason})
+                if conn.close_reason not in ("replaced", "shutdown") and self.on_link is not None:
+                    self.on_link(conn.machine, False, conn.close_reason, closed_ms)
             with contextlib.suppress(ConnectionError, OSError, RuntimeError):
                 writer.close()
 
@@ -590,11 +602,13 @@ class AgentHub:
         preamble = parse_preamble(raw) if raw is not None else None
         if preamble is None:
             self.logger.warn("agent connection without a valid relay preamble")
+            self._relay_problem("relay_protocol", None)
             await bye("protocol")
             return None
         name = preamble.machine
         if name not in self.machines:
             self.logger.warn("agent connection for an unknown machine", {"machine": name})
+            self._relay_problem("relay_unknown_machine", None)
             await bye("unknown_machine")
             return None
         if self._handshaking.get(name, 0) >= MAX_UNFINISHED_HANDSHAKES:
@@ -609,6 +623,7 @@ class AgentHub:
         hello = parse_hello(raw) if raw is not None else None
         if hello is None:
             self.logger.warn("agent connection without a valid hello", {"machine": name})
+            self._relay_problem("relay_protocol", name)
             await bye("protocol")
             return None
         conn = AgentConnection(
@@ -633,7 +648,16 @@ class AgentHub:
         )
         for problem in self.disagreements(name, hello):
             self.logger.warn("agent policy differs", {"machine": name, "problem": problem})
+        if self.on_link is not None:
+            self.on_link(name, True, None, conn.since_ms)
         return conn
+
+    def _relay_problem(self, code: str, machine: str | None) -> None:
+        if self.on_relay_problem is not None:
+            try:
+                self.on_relay_problem(code, machine)
+            except Exception as err:
+                self.logger.error("incident observation failed", {"error": type(err).__name__})
 
     def _note_replacement(self, name: str) -> None:
         now = self.now()

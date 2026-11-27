@@ -1,5 +1,5 @@
 """Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher,
-remote-connector, agent-relay, audit, usage, set-public-url (argparse; usage errors exit 2).
+remote-connector, agent-relay, audit, incidents, usage, set-public-url (argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -21,8 +21,8 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, NoReturn
+from datetime import datetime, tzinfo
+from typing import Any, Literal, NoReturn
 
 import uvicorn
 
@@ -39,7 +39,17 @@ from .remote import relay
 from .remote.agents import CONTROL_SOCKET_NAME, control_request, lint_authorized_keys
 from .remote.audit import audit_path, format_audit_table, read_audit
 from .remote.check import check_machine
-from .remote.config import remote_warnings
+from .remote.config import MACHINE_NAME_RE, remote_warnings
+from .remote.incidents import (
+    COMPONENTS,
+    MAX_RECOVERY,
+    IncidentLog,
+    owner_incident,
+    zone_of,
+)
+from .remote.incidents import HUB as INCIDENT_HUB
+from .remote.incidents import clean_text as clean_incident_text
+from .remote.incidents import format_table as format_incident_table
 from .remote.inventory import Inventory
 from .remote.transport import DISPATCHER_PATH, make_transport
 from .sessions import claude_home_dir
@@ -182,6 +192,36 @@ def build_parser() -> argparse.ArgumentParser:
     agent_relay.add_argument("--socket", help=f"the hub's relay socket (default: {relay.DEFAULT_SOCKET})")
     audit = command("audit", "print the remote_send audit log (stateDir/audit.jsonl) as a table")
     audit.add_argument("--limit", type=_limit, metavar="N", help="only the last N lines (default: all)")
+    incidents = command("incidents", "list, add or close incidents of the incident log (stateDir/incidents.jsonl)")
+    actions = incidents.add_subparsers(dest="action", metavar="<action>")
+
+    def action(name: str, help_text: str) -> argparse.ArgumentParser:
+        sub = actions.add_parser(name, help=help_text, description=help_text)
+        sub.add_argument("--config", metavar="PATH", default=argparse.SUPPRESS, help=config_help)
+        return sub
+
+    listing = action("list", "print the incidents as a table (the default action)")
+    listing.add_argument("--machine", metavar="M", help="only this machine (hub for the server itself)")
+    listing.add_argument("--since", metavar="P", help=f"only this period: {PERIOD_HELP} (open ones always show)")
+    listing.add_argument("--open", dest="open_only", action="store_true", help="only the incidents still open")
+    listing.add_argument("--details", action="store_true", help="also why, effect and recovery")
+    listing.add_argument("--json", dest="json_out", action="store_true", help="one JSON object per line")
+    add = action("add", "record an incident, for example one the owner saw")
+    add.add_argument("--machine", required=True, metavar="M", help="the machine (hub for the server itself)")
+    add.add_argument("--what", required=True, help="what failed")
+    add.add_argument("--why", default="", help="why it failed")
+    add.add_argument("--effect", default="", help="what the owner could not do")
+    add.add_argument("--recovery", default="", help="how and when it ended")
+    add.add_argument(
+        "--start", metavar="TIME", help="when it began: ISO 8601, a time without zone is local (default: now)"
+    )
+    add.add_argument("--end", metavar="TIME", help="when it ended (default: still open)")
+    add.add_argument("--component", choices=COMPONENTS, default="other", help="what failed (default: other)")
+    add.add_argument("--source", choices=("owner", "cli"), default="cli", help="who reported it (default: cli)")
+    close = action("close", "close an open incident")
+    close.add_argument("incident_id", metavar="ID", help="the incident id (8 hex digits, as list prints it)")
+    close.add_argument("--end", metavar="TIME", help="when it ended (default: now)")
+    close.add_argument("--recovery", default="", help="how it ended")
     usage = command("usage", "active hours, billable amount and token cost per project, session or day")
     usage.add_argument("--period", metavar="P", help=f"{PERIOD_HELP} (default: this month)")
     usage.add_argument(
@@ -214,6 +254,20 @@ class ParsedArgs:
     cached: bool = False
     url: str | None = None
     socket: str | None = None
+    action: str | None = None
+    incident_id: str | None = None
+    what: str = ""
+    why: str = ""
+    effect: str = ""
+    recovery: str = ""
+    start: str | None = None
+    end: str | None = None
+    component: str = "other"
+    source: str = "cli"
+    since: str | None = None
+    open_only: bool = False
+    details: bool = False
+    json_out: bool = False
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -234,6 +288,20 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         cached=getattr(ns, "cached", False),
         url=getattr(ns, "url", None),
         socket=getattr(ns, "socket", None),
+        action=getattr(ns, "action", None),
+        incident_id=getattr(ns, "incident_id", None),
+        what=getattr(ns, "what", ""),
+        why=getattr(ns, "why", ""),
+        effect=getattr(ns, "effect", ""),
+        recovery=getattr(ns, "recovery", ""),
+        start=getattr(ns, "start", None),
+        end=getattr(ns, "end", None),
+        component=getattr(ns, "component", "other"),
+        source=getattr(ns, "source", "cli"),
+        since=getattr(ns, "since", None),
+        open_only=getattr(ns, "open_only", False),
+        details=getattr(ns, "details", False),
+        json_out=getattr(ns, "json_out", False),
     )
 
 
@@ -759,6 +827,126 @@ def _cmd_audit(config: Config, args: ParsedArgs, io: CliIo) -> int:
     return EXIT_OK
 
 
+def _incident_log(config: Config) -> tuple[IncidentLog, tzinfo | None]:
+    tz = zone_of(config.incidents)
+    log = IncidentLog(
+        config.state_dir,
+        max_bytes=config.incidents.max_kilobytes * 1024,
+        keep_files=config.incidents.keep_files,
+        tz=tz,
+    )
+    return log, tz
+
+
+def _parse_when(text: str, tz: tzinfo | None) -> int | None:
+    """Epoch ms of an ISO 8601 time; one without a zone is local time (`incidents.timeZone`)."""
+    try:
+        moment = datetime.fromisoformat(text.strip())
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=tz) if tz is not None else moment.astimezone()
+    return int(moment.timestamp() * 1000)
+
+
+def _cmd_incidents(config: Config, args: ParsedArgs, io: CliIo) -> int:
+    log, tz = _incident_log(config)
+    if args.action == "add":
+        return _incidents_add(config, log, tz, args, io)
+    if args.action == "close":
+        return _incidents_close(log, tz, args, io)
+    incidents, bad = log.read()
+    if args.machine:
+        incidents = [i for i in incidents if i.machine == args.machine]
+    if args.open_only:
+        incidents = [i for i in incidents if i.open]
+    if args.since:
+        try:
+            period = parse_period(args.since, now_ms(), tz)
+        except PeriodError:
+            io.err(f"Error: unknown period {args.since!r}; use {PERIOD_HELP}\n")
+            return EXIT_USAGE
+        incidents = [
+            i
+            for i in incidents
+            if i.open
+            or period.start_ms <= i.start_ms < period.end_ms
+            or (i.end_ms is not None and period.start_ms <= i.end_ms < period.end_ms)
+        ]
+    if args.json_out:
+        for incident in incidents:
+            io.out(json.dumps(incident.to_json(tz), ensure_ascii=True) + "\n")
+    elif not incidents:
+        io.out("No incidents.\n")
+    else:
+        io.out(format_incident_table(incidents, tz, details=args.details))
+    if bad:
+        io.err(f"warning: {bad} unreadable line(s) in {log.path}\n")
+    return EXIT_OK
+
+
+def _incidents_add(config: Config, log: IncidentLog, tz: tzinfo | None, args: ParsedArgs, io: CliIo) -> int:
+    machine = args.machine or ""
+    if machine != INCIDENT_HUB and not MACHINE_NAME_RE.fullmatch(machine):
+        io.err("Error: --machine must be a machine name (lowercase letters, digits and -) or hub\n")
+        return EXIT_USAGE
+    now = now_ms()
+    start = _parse_when(args.start, tz) if args.start else now
+    end = _parse_when(args.end, tz) if args.end else None
+    if start is None or (args.end and end is None):
+        io.err("Error: --start and --end take an ISO 8601 time such as 2026-11-27T10:57:15Z\n")
+        return EXIT_USAGE
+    if end is not None and end < start:
+        io.err("Error: --end is before --start\n")
+        return EXIT_USAGE
+    source: Literal["owner", "cli"] = "owner" if args.source == "owner" else "cli"
+    incident = owner_incident(
+        machine=machine,
+        what=args.what,
+        why=args.why,
+        effect=args.effect,
+        recovery=args.recovery,
+        source=source,
+        start_ms=start,
+        end_ms=end,
+        component=args.component,
+    )
+    if not incident.what:
+        io.err("Error: --what is empty\n")
+        return EXIT_USAGE
+    if machine != INCIDENT_HUB and machine not in {m.name for m in config.remote.machines}:
+        io.err(f"warning: {machine} is not in remote.machines\n")
+    if not log.write(incident):
+        io.err(f"Error: could not write {log.path}\n")
+        return EXIT_ERROR
+    state = "open" if incident.open else "closed"
+    io.out(f"added {incident.id} ({state}): {incident.machine}, {incident.what}\n")
+    return EXIT_OK
+
+
+def _incidents_close(log: IncidentLog, tz: tzinfo | None, args: ParsedArgs, io: CliIo) -> int:
+    wanted = (args.incident_id or "").strip().lower()
+    found = next((i for i in log.read()[0] if i.id == wanted), None)
+    if found is None:
+        io.err(f"Error: no incident {wanted}\n")
+        return EXIT_ERROR
+    if not found.open:
+        io.err(f"Error: incident {wanted} is already closed\n")
+        return EXIT_ERROR
+    end = _parse_when(args.end, tz) if args.end else now_ms()
+    if end is None:
+        io.err("Error: --end takes an ISO 8601 time such as 2026-11-27T12:03:58Z\n")
+        return EXIT_USAGE
+    found.end_ms = max(end, found.start_ms)
+    if args.recovery:
+        found.recovery = clean_incident_text(args.recovery, MAX_RECOVERY)
+    if not log.write(found):
+        io.err(f"Error: could not write {log.path}\n")
+        return EXIT_ERROR
+    io.out(f"closed {found.id}: {found.machine}, {found.what}\n")
+    return EXIT_OK
+
+
 async def _cmd_usage(config: Config, args: ParsedArgs, io: CliIo) -> int:
     transports = {m.name: make_transport(m, config.remote, config.state_dir, io.env) for m in config.remote.machines}
     service = UsageService(config, transports, silent_logger, env=io.env)
@@ -905,6 +1093,8 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
                 return await _cmd_remote_check(config, args, io)
             case "audit":
                 return _cmd_audit(config, args, io)
+            case "incidents":
+                return _cmd_incidents(config, args, io)
             case "usage":
                 return await _cmd_usage(config, args, io)
             case "set-public-url":

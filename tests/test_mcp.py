@@ -125,13 +125,15 @@ async def ctx(real_tmp: Path, request: pytest.FixtureRequest) -> AsyncIterator[C
 # --- tool list ------------------------------------------------------------------------------------
 
 
-async def test_has_the_eighteen_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
+async def test_has_the_twenty_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
     tools = (await ctx.client.list_tools()).tools
     by_name = {t.name: t for t in tools}
     assert sorted(by_name) == [
         "ask_session_readonly",
         "cancel_task",
         "get_task_result",
+        "incident_note",
+        "incidents",
         "list_projects",
         "list_remote_sessions",
         "list_sessions",
@@ -165,8 +167,15 @@ async def test_has_the_eighteen_tools_with_the_design_annotations_and_server_ins
         "remote_send_keys",
         "remote_resize",
         "usage_report",
+        "incidents",
     ]:
         assert annotations(name) == {"readOnlyHint": True}
+    assert annotations("incident_note") == {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
     assert annotations("remote_send_confirm") == {
         "readOnlyHint": False,
         "destructiveHint": False,
@@ -228,6 +237,8 @@ async def test_has_the_eighteen_tools_with_the_design_annotations_and_server_ins
         "call remote_send with the owner's words unchanged",
         "never in the same turn as remote_send",
         "Set risky_ok only when the owner explicitly confirmed",
+        "call incidents",
+        "call incident_note",
     ]:
         assert needle in instructions, needle
     for tool in tools:

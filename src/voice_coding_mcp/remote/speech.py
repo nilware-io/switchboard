@@ -9,7 +9,7 @@ to 40 characters.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from ..text import clip, plural
 from .inventory import MachineView
@@ -121,11 +121,12 @@ def machine_line(view: MachineView) -> str:
     return f"{name}: {plural(len(items), 'session')}. {shown}.{more}{cut}"
 
 
-def format_list(views: Sequence[MachineView], *, total_machines: int) -> str:
+def format_list(views: Sequence[MachineView], *, total_machines: int, notes: Mapping[str, str] | None = None) -> str:
+    """One line per machine; `notes` adds a short clause to a machine's line (an open incident)."""
     if total_machines == 0:
         return "No machines are configured."
     lines = [f"{plural(len(views), 'machine')}."] if len(views) > 1 else []
-    lines += [machine_line(view) for view in views]
+    lines += [machine_line(view) + (notes or {}).get(view.machine.name, "") for view in views]
     return "\n".join(lines)
 
 
