@@ -317,3 +317,17 @@ async def test_cli_usage_leaves_agent_machines_to_the_hub(tmp_path: Path) -> Non
     code, io = await run_cli("usage", "--config", str(path), "--machine", "laptop", env=env)
     assert code == 0, io.stderr
     assert "Reading" not in io.stderr
+
+
+async def test_agent_transcripts_do_not_change_usage(ctx: Ctx) -> None:
+    seed(ctx)
+    await ctx.service.refresh(["dev", HUB])
+    before, _ = ctx.service.report(["dev", HUB], parse_period("today", NOW, UTC))
+    agents = ctx.remote_claude / "projects" / "-home-USER-projects-fpgadc" / S1 / "subagents"
+    agents.mkdir(parents=True)
+    line = assistant(T0 + 90 * MIN, "agent-msg", tokens=(5, 5, 5, 5), isSidechain=True)
+    (agents / "agent-a1.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+    await ctx.service.refresh(["dev", HUB])
+    assert any(t.is_agent_file for t in load_cache(ctx.config.state_dir, "dev").files.values())
+    after, _ = ctx.service.report(["dev", HUB], parse_period("today", NOW, UTC))
+    assert after.total == before.total
