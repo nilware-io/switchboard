@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,9 +21,11 @@ from starlette.applications import Starlette
 
 from tests.helpers import LogCapture, claude_config, config_data
 from voice_coding_mcp.auth import OAuthStore
+from voice_coding_mcp.auth.router import RateLimitSettings
 from voice_coding_mcp.cli import _bind, _Server
 from voice_coding_mcp.config import Config, parse_config
 from voice_coding_mcp.http import AuthRouterOverrides, CreateAppOptions, create_app
+from voice_coding_mcp.remote.tools import RemoteTools
 from voice_coding_mcp.tasks.manager import TaskManager, TaskManagerOptions
 
 
@@ -53,7 +55,11 @@ async def start_app(
     http_client: httpx2.AsyncClient | None = None,
     projects: list[str] | None = None,
     remote: dict[str, Any] | None = None,
+    remote_tools: Callable[[Config, TaskManager, LogCapture], RemoteTools] | None = None,
+    rate_limit: RateLimitSettings | None = None,
 ) -> AsyncIterator[AppCtx]:
+    """`remote_tools` builds the app's RemoteTools (default: from the config); `rate_limit` is the
+    per-IP limit of the OAuth endpoints and link misses (default: off)."""
     state_dir = str(root / "state")
     projects_dir = root / "projects"
     projects_dir.mkdir()
@@ -101,7 +107,8 @@ async def start_app(
             logger=log.logger,
             store=store,
             manager=manager,
-            auth=AuthRouterOverrides(rate_limit=None, http_client=http_client),
+            auth=AuthRouterOverrides(rate_limit=rate_limit, http_client=http_client),
+            remote_tools=remote_tools(config, manager, log) if remote_tools is not None else None,
         )
     )
     server = _Server(

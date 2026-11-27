@@ -14,6 +14,7 @@ import pwd
 import re
 import stat
 import sys
+import zoneinfo
 from collections.abc import Callable, Iterable
 from typing import Annotated, Literal
 
@@ -46,6 +47,7 @@ AGENT_ONLY_KEYS = (
     "sessions",
     "allow_usage",
     "allow_send",
+    "allow_attachments",
     "allow_permission_answers",
     "send_to_any_pane",
 )
@@ -148,6 +150,9 @@ class MachineConfig(_Section):
     allow_send: bool = False
     allow_permission_answers: bool = False
     send_to_any_pane: bool = False
+    allow_attachments: bool = False
+    """`remote_attachments` and `remote_attachment` (media from the machine's outbox); the
+    dispatcher must also run with `--allow-attachments`."""
 
 
 class SshConfig(_Section):
@@ -244,6 +249,47 @@ class WatchConfig(_Section):
     long_turn_minutes: Annotated[Int, Field(ge=0, le=1440)] = 10
     notify_unreachable: bool = False
     include_question: bool = False
+
+
+def _health_interval(value: int) -> int:
+    if value != 0 and not 60 <= value <= 3600:
+        raise ValueError("must be 0 (off) or 60 to 3600")
+    return value
+
+
+def _time_zone(value: str) -> str:
+    try:
+        zoneinfo.ZoneInfo(value)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        raise ValueError("must be an IANA time zone name such as Europe/Athens") from None
+    return value
+
+
+class HealthConfig(_Section):
+    """Machine health polls (docs/SWITCHBOARD.md, "Incident log")."""
+
+    interval_seconds: Annotated[Int, AfterValidator(_health_interval)] = 300
+    """0 is off. Also polled when an agent machine connects."""
+    min_free_gigabytes: Annotated[Int, Field(ge=0, le=100_000)] = 5
+    min_free_percent: Annotated[Int, Field(ge=0, le=50)] = 5
+    """A file system with less free space than either limit opens an incident."""
+    min_memory_megabytes: Annotated[Int, Field(ge=0, le=1_000_000)] = 200
+
+
+class IncidentsConfig(_Section):
+    """The incident log, `stateDir/incidents.jsonl` (docs/SWITCHBOARD.md, "Incident log")."""
+
+    enabled: bool = True
+    time_zone: Annotated[str, AfterValidator(_time_zone)] | None = None
+    """The zone of the local times in spoken answers and the CLI. None: the hub's local zone."""
+    settle_seconds: Annotated[Int, Field(ge=0, le=3600)] = 120
+    """An automatic incident closes only after this long without the failure."""
+    max_kilobytes: Annotated[Int, Field(ge=16, le=100_000)] = 1024
+    """The log is rotated past this size."""
+    keep_files: Annotated[Int, Field(ge=1, le=20)] = 3
+    notify: bool = False
+    """Push automatic incidents (opened and closed) through `notify.url`."""
+    health: HealthConfig = Field(default_factory=HealthConfig)
 
 
 def check_remote(
@@ -375,6 +421,11 @@ def remote_warnings(
     if "agents" in remote.model_fields_set and not any(m.transport == "agent" for m in remote.machines):
         warnings.append("remote.agents is set but no machine uses transport agent; it is ignored")
     for machine in remote.machines:
+        if machine.name == "hub":
+            warnings.append(
+                "remote machine hub: the incident log also names the server itself hub; rename the machine "
+                "to tell them apart"
+            )
         if "*" in machine.sessions:
             warnings.append(
                 f"remote machine {machine.name}: sessions allows every tmux session (*); list the session names instead"

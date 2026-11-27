@@ -125,13 +125,15 @@ async def ctx(real_tmp: Path, request: pytest.FixtureRequest) -> AsyncIterator[C
 # --- tool list ------------------------------------------------------------------------------------
 
 
-async def test_has_the_twenty_one_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
+async def test_has_the_twenty_three_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
     tools = (await ctx.client.list_tools()).tools
     by_name = {t.name: t for t in tools}
     assert sorted(by_name) == [
         "ask_session_readonly",
         "cancel_task",
         "get_task_result",
+        "incident_note",
+        "incidents",
         "list_projects",
         "list_remote_sessions",
         "list_sessions",
@@ -170,9 +172,16 @@ async def test_has_the_twenty_one_tools_with_the_design_annotations_and_server_i
         "usage_report",
         "timesheet_summary",
         "timesheet_approve",
+        "incidents",
     ]:
         assert annotations(name) == {"readOnlyHint": True}
     assert annotations("timesheet_approve_confirm") == {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+    assert annotations("incident_note") == {
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -244,6 +253,8 @@ async def test_has_the_twenty_one_tools_with_the_design_annotations_and_server_i
         "never in the same turn as remote_send",
         "Set risky_ok only when the owner explicitly confirmed",
         "call timesheet_approve_confirm with that number only after the owner said yes in a later turn",
+        "call incidents",
+        "call incident_note",
     ]:
         assert needle in instructions, needle
     for tool in tools:

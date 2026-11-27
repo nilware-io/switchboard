@@ -30,11 +30,13 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+
 from ..clock import now_ms
 from ..log import Logger
 from .config import MACHINE_NAME_RE, MachineConfig, RemoteConfig
-from .protocol import ARG_RE, ResponseError, parse_response, request_tokens, response_cap
-from .transport import TransportError, TransportResult
+from .protocol import ARG_RE, AttachmentStream, ResponseError, parse_response, request_tokens, response_cap
+from .transport import TransportError, TransportResult, dispatcher_error
 
 PROTOCOL = 1
 MAX_MACHINE_FRAME_BYTES = 5 * 1024 * 1024
@@ -58,7 +60,7 @@ FLAP_WINDOW_MS = 60_000
 FLAP_LIMIT = 3
 """More replacements of one machine than this within FLAP_WINDOW_MS log a warning."""
 HOUR_MS = 3_600_000
-READ_ONLY_VERBS = ("version", "list", "capture", "usage")
+READ_ONLY_VERBS = ("version", "list", "capture", "usage", "attachments", "attachment", "health")
 """Retried once on the new connection when the one they went out on was replaced."""
 SOCKET_DIR_MODE = 0o2750
 CONTROL_SOCKET_NAME = "agents-control.sock"
@@ -120,12 +122,16 @@ class Hello:
     allow_usage: bool
     policy: str
     """`ok`, or `bad_policy` when the dispatcher's command line is broken (it refuses everything)."""
+    allow_attachments: bool = False
+    """Sent (as true) only by a dispatcher 0.7.0 or newer started with `--allow-attachments`."""
 
 
 def parse_hello(line: bytes) -> Hello | None:
     data = _object(line)
     keys = {"t", "protocol", "version", "verbs", "allowSend", "allowUsage", "policy"}
-    if data is None or set(data) != keys or data["t"] != "hello":
+    if data is None or not keys <= set(data) <= keys | {"allowAttachments"} or data["t"] != "hello":
+        return None
+    if data.get("allowAttachments", True) is not True:
         return None
     if type(data["protocol"]) is not int or data["protocol"] != PROTOCOL:
         return None
@@ -146,6 +152,7 @@ def parse_hello(line: bytes) -> Hello | None:
         allow_send=data["allowSend"],
         allow_usage=data["allowUsage"],
         policy=data["policy"],
+        allow_attachments="allowAttachments" in data,
     )
 
 
@@ -314,10 +321,17 @@ class AgentConnection:
                 return
 
     async def request(
-        self, verb: str, args: Sequence[str], data: str | None, deadline: float
+        self,
+        verb: str,
+        args: Sequence[str],
+        data: str | None,
+        deadline: float,
+        sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]] | TransportResult | _Closed:
         """The documents of one request, a failed result, or _Closed (with `written` folded in:
-        _Closed is returned only after the request frame was handed to the connection)."""
+        _Closed is returned only after the request frame was handed to the connection). With
+        `sink` each document goes there as it arrives instead (the list stays empty); a
+        ResponseError from it cancels the request as `bad_response`."""
         started = time.monotonic()
 
         def failed(code: TransportError, detail: str | None = None) -> TransportResult:
@@ -359,7 +373,15 @@ class AgentConnection:
                     if size > cap:
                         self.send_later({"t": "cancel", "id": request_id})
                         return failed("bad_response")
-                    docs.append(answer["doc"])
+                    if sink is None:
+                        docs.append(answer["doc"])
+                    else:
+                        try:
+                            sink(answer["doc"])
+                        except ResponseError:
+                            if answer.get("more"):
+                                self.send_later({"t": "cancel", "id": request_id})
+                            return failed("bad_response")
                     if not answer.get("more"):
                         return docs
         except TimeoutError:
@@ -416,6 +438,12 @@ class AgentHub:
         """Why the relay socket is not served (shown by `status` and `remote-check`)."""
         self.check: Callable[[str], Awaitable[tuple[list[str], bool]]] | None = None
         """`check <machine>` of the control socket (set by RemoteTools: version and list, formatted)."""
+        self.on_link: Callable[[str, bool, str | None, int], None] | None = None
+        """Called with (machine, up, close reason, time) when a connection is accepted and when one
+        closes that was not replaced and not closed by the hub's own stop (the incident log)."""
+        self.on_relay_problem: Callable[[str, str | None], None] | None = None
+        """Called with (code, machine) for a relay socket that is not served or a relay connection
+        refused before its hello (the incident log)."""
         self._live: dict[str, AgentConnection] = {}
         self._state: dict[str, MachineState] = {name: MachineState() for name in self.machines}
         self._relay_uid: int | None = None
@@ -506,6 +534,7 @@ class AgentHub:
         if problem:
             self.problem = problem
             self.logger.warn("agent socket not served", {"problem": problem})
+            self._relay_problem("socket_not_served", None)
         else:
             self.logger.info("agent socket served", {"path": self.settings.socket_path})
         control = await self._bind(self.control_path, 0o600, self._control)
@@ -548,10 +577,12 @@ class AgentHub:
         uid = _peer_uid(writer)
         if uid is None or uid != self._relay_uid:
             self.logger.warn("agent connection from another user refused", {"uid": uid})
+            self._relay_problem("relay_wrong_user", None)
             writer.close()
             return
         if self._open >= 2 * len(self.machines) + 4:
             self.logger.warn("agent connection refused: too many connections")
+            self._relay_problem("relay_too_many", None)
             writer.close()
             return
         self._open += 1
@@ -565,11 +596,14 @@ class AgentHub:
             if conn is not None:
                 await conn.close(conn.close_reason or "eof")
                 state = self._state[conn.machine]
-                state.last_disconnect_ms = self.now()
+                closed_ms = self.now()
+                state.last_disconnect_ms = closed_ms
                 state.last_disconnect_reason = conn.close_reason
                 if self._live.get(conn.machine) is conn:
                     del self._live[conn.machine]
                 self.logger.info("agent disconnected", {"machine": conn.machine, "reason": conn.close_reason})
+                if conn.close_reason not in ("replaced", "shutdown") and self.on_link is not None:
+                    self.on_link(conn.machine, False, conn.close_reason, closed_ms)
             with contextlib.suppress(ConnectionError, OSError, RuntimeError):
                 writer.close()
 
@@ -590,11 +624,13 @@ class AgentHub:
         preamble = parse_preamble(raw) if raw is not None else None
         if preamble is None:
             self.logger.warn("agent connection without a valid relay preamble")
+            self._relay_problem("relay_protocol", None)
             await bye("protocol")
             return None
         name = preamble.machine
         if name not in self.machines:
             self.logger.warn("agent connection for an unknown machine", {"machine": name})
+            self._relay_problem("relay_unknown_machine", None)
             await bye("unknown_machine")
             return None
         if self._handshaking.get(name, 0) >= MAX_UNFINISHED_HANDSHAKES:
@@ -609,6 +645,7 @@ class AgentHub:
         hello = parse_hello(raw) if raw is not None else None
         if hello is None:
             self.logger.warn("agent connection without a valid hello", {"machine": name})
+            self._relay_problem("relay_protocol", name)
             await bye("protocol")
             return None
         conn = AgentConnection(
@@ -633,7 +670,16 @@ class AgentHub:
         )
         for problem in self.disagreements(name, hello):
             self.logger.warn("agent policy differs", {"machine": name, "problem": problem})
+        if self.on_link is not None:
+            self.on_link(name, True, None, conn.since_ms)
         return conn
+
+    def _relay_problem(self, code: str, machine: str | None) -> None:
+        if self.on_relay_problem is not None:
+            try:
+                self.on_relay_problem(code, machine)
+            except Exception as err:
+                self.logger.error("incident observation failed", {"error": type(err).__name__})
 
     def _note_replacement(self, name: str) -> None:
         now = self.now()
@@ -656,6 +702,11 @@ class AgentHub:
         if machine.allow_usage != hello.allow_usage:
             out.append(
                 f"allowUsage is {'on' if machine.allow_usage else 'off'} on the hub, --allow-usage is not the same"
+            )
+        if machine.allow_attachments != hello.allow_attachments:
+            out.append(
+                f"allowAttachments is {'on' if machine.allow_attachments else 'off'} on the hub, "
+                "--allow-attachments is not the same"
             )
         return out
 
@@ -682,6 +733,7 @@ class AgentHub:
                         "verbs": list(conn.hello.verbs),
                         "allowSend": conn.hello.allow_send,
                         "allowUsage": conn.hello.allow_usage,
+                        "allowAttachments": conn.hello.allow_attachments,
                         "policy": conn.hello.policy,
                         "peer": conn.peer,
                         "warnings": self.disagreements(name, conn.hello),
@@ -747,11 +799,16 @@ class AgentTransport:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         attempts = 2 if verb in READ_ONLY_VERBS else 1
         outcome: list[dict[str, Any]] | TransportResult | _Closed = _Closed(False)
+        stream: AttachmentStream | None = None
         for _ in range(attempts):
             conn = self._hub.live(self.machine.name)
             if conn is None:
                 return failed("not_connected")
-            outcome = await conn.request(verb, args, data, deadline)
+            # An attachment is decoded chunk by chunk as the frames arrive (a fresh stream for a
+            # retry on a new connection).
+            stream = AttachmentStream() if verb == "attachment" else None
+            sink = stream.feed if stream is not None else None
+            outcome = await conn.request(verb, args, data, deadline, sink)
             if not (isinstance(outcome, _Closed) and outcome.replaced):
                 break
         if isinstance(outcome, _Closed):
@@ -759,13 +816,17 @@ class AgentTransport:
             return failed("disconnected")
         if isinstance(outcome, TransportResult):
             return outcome
-        stdout = b"\n".join(json.dumps(doc, ensure_ascii=True).encode("ascii") for doc in outcome)
+        parsed: BaseModel | str
         try:
-            parsed = parse_response(verb, stdout)
+            if stream is not None:
+                parsed = stream.result()
+            else:
+                stdout = b"\n".join(json.dumps(doc, ensure_ascii=True).encode("ascii") for doc in outcome)
+                parsed = parse_response(verb, stdout)
         except ResponseError:
             return failed("bad_response")
         if isinstance(parsed, str):
-            return failed("refused_by_policy", parsed)
+            return failed(dispatcher_error(parsed), parsed)
         return TransportResult(ok=True, data=parsed, elapsed_ms=round((time.monotonic() - started) * 1000))
 
 

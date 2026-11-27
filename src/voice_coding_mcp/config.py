@@ -27,7 +27,7 @@ from pydantic.alias_generators import to_camel
 from .json_file import loads_json
 from .projects import is_inside
 from .remote.audit import audit_size_warning
-from .remote.config import RemoteConfig, WatchConfig, check_remote, remote_warnings
+from .remote.config import IncidentsConfig, RemoteConfig, WatchConfig, check_remote, remote_warnings
 from .timesheet.config import TimesheetConfig
 from .urls import is_loopback_ip, parse_url
 from .usage.config import UsageConfig
@@ -255,6 +255,7 @@ class _ConfigFile(_Section):
     watch: WatchConfig = Field(default_factory=WatchConfig)
     usage: UsageConfig = Field(default_factory=UsageConfig)
     timesheet: TimesheetConfig = Field(default_factory=TimesheetConfig)
+    incidents: IncidentsConfig = Field(default_factory=IncidentsConfig)
 
 
 @dataclass(frozen=True)
@@ -288,6 +289,8 @@ class Config:
     """Switchboard usage accounting: idle gap, hourly rate, prices (docs/SWITCHBOARD.md)."""
     timesheet: TimesheetConfig = field(default_factory=TimesheetConfig)
     """Draft timesheets: project to client map, owner identities, rounding (docs/SWITCHBOARD.md)."""
+    incidents: IncidentsConfig = field(default_factory=IncidentsConfig)
+    """The Switchboard incident log and machine health polls (docs/SWITCHBOARD.md)."""
 
 
 # --- checks ----------------------------------------------------------------------------------
@@ -375,6 +378,8 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
     )
     if parsed.watch.interval_seconds > 0 and parsed.notify.url is None:
         remote_problems.append("watch.intervalSeconds: the watcher needs notify.url")
+    if parsed.incidents.notify and parsed.notify.url is None:
+        remote_problems.append("incidents.notify: needs notify.url")
     if remote_problems:
         raise ConfigError("Invalid config:\n" + "\n".join(remote_problems))
 
@@ -406,6 +411,7 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
         watch=parsed.watch,
         usage=parsed.usage,
         timesheet=parsed.timesheet,
+        incidents=parsed.incidents,
     )
 
 

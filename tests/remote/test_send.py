@@ -581,6 +581,8 @@ def test_audit_text_only_with_log_prompts_and_redacted(tmp_path: Path) -> None:
         "ok",
         "chars",
         "keys",
+        "kind",
+        "bytes",
         "client",
         "text",
     ]
