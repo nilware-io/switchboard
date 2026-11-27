@@ -1,6 +1,6 @@
 # Switchboard design
 
-Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher), M3 (`remote_send`, `remote_send_confirm`, audit), M4 (usage, `usage_report`, `voice-coding-mcp usage`) and M5 (Linux and WSL hub deploy, upstream session tools on Linux, the owner guide [SETUP-WSL.md](SETUP-WSL.md)) implemented, then the menu follow-up from the first voice test (whole menus in `remote_status`, `remote_send_keys`, `remote_resize`, see [Menus and keys](#menus-and-keys-after-the-first-voice-test)). M6, outbound agents (machines connect to the hub instead of the hub connecting to them, [Outbound agents](#outbound-agents-machines-connect-to-the-hub), owner guide [SETUP-AGENTS.md](SETUP-AGENTS.md)), is implemented too. What only the owner can verify on the real setup is listed in DESIGN.md "To verify with the real app". This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
+Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher), M3 (`remote_send`, `remote_send_confirm`, audit), M4 (usage, `usage_report`, `voice-coding-mcp usage`) and M5 (Linux and WSL hub deploy, upstream session tools on Linux, the owner guide [SETUP-WSL.md](SETUP-WSL.md)) implemented, then the menu follow-up from the first voice test (whole menus in `remote_status`, `remote_send_keys`, `remote_resize`, see [Menus and keys](#menus-and-keys-after-the-first-voice-test)). M6, outbound agents (machines connect to the hub instead of the hub connecting to them, [Outbound agents](#outbound-agents-machines-connect-to-the-hub), owner guide [SETUP-AGENTS.md](SETUP-AGENTS.md)), is implemented too, and so are draft timesheets (owner and agent hours, commits and pull requests per project and client, [Timesheet](#timesheet), dispatcher 0.10.0). What only the owner can verify on the real setup is listed in DESIGN.md "To verify with the real app". This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
 
 ## Goal
 
@@ -15,6 +15,7 @@ The server can already run headless tasks and reach live sessions on the machine
 2. Remote tools over SSH and tmux: `list_remote_sessions`, `remote_status`, `pending_input`, `remote_send` plus `remote_send_confirm`, and for menus `remote_send_keys` and `remote_resize`.
 3. A notification watcher: a push when a session newly needs a decision or finishes a long turn.
 4. Usage and billing: active hours and token cost per session, `usage_report` tool and `voice-coding-mcp usage` CLI.
+5. Draft timesheets: owner hours and agent hours, commits and pull requests per project and day, grouped by client, approved by the owner before anything uses them (`voice-coding-mcp timesheet`, `timesheet_summary`).
 
 Non-goals: a web UI, multi-user access, starting new tmux sessions or Claude Code processes on remote machines, approving permission prompts by default (see [Answering permission prompts](#answering-permission-prompts)), reading whole transcripts over SSH.
 
@@ -53,7 +54,7 @@ One hub, one public address, one OAuth pairing. Remote machines need no inbound 
 
 ## Config
 
-New top-level sections. All keys are camelCase in the file, snake_case in Python, like upstream. Unknown keys are errors. Defaults shown. Implemented in M1: `remote.machines`, `remote.ssh`, `remote.captureLines`, `remote.summary`; in M2: `watch`; in M3: `remote.send` and the machine flags `allowSend`, `allowPermissionAnswers` and `sendToAnyPane` (validated since M1); in M4: `usage`.
+New top-level sections. All keys are camelCase in the file, snake_case in Python, like upstream. Unknown keys are errors. Defaults shown. Implemented in M1: `remote.machines`, `remote.ssh`, `remote.captureLines`, `remote.summary`; in M2: `watch`; in M3: `remote.send` and the machine flags `allowSend`, `allowPermissionAnswers` and `sendToAnyPane` (validated since M1); in M4: `usage`; with the timesheets: `timesheet` ([below](#timesheet-config)).
 
 ```json
 {
@@ -181,6 +182,46 @@ New top-level sections. All keys are camelCase in the file, snake_case in Python
 | `usage.maxTranscriptMegabytes` | `512` | Transcripts larger than this are skipped and reported as skipped |
 | `usage.prices` | `{}` | Per model prefix, USD per million tokens: `{"claude-opus-": {"input": n, "output": n, "cacheWrite5m": n, "cacheWrite1h": n, "cacheRead": n}}` (at most 64 prefixes of `A-Za-z0-9._:@[]-`; each price 0 to 10000; the cache prices default to 1.25x, 2x and 0.1x of `input`). Longest matching configured prefix wins. Models no configured prefix matches use the built-in table (`usage/prices.py`, Anthropic's published first-party API prices as listed on 2026-11-03, current models only: Fable, Mythos, Opus 4.6 to 5.5, Sonnet 4.6 to 5.5, Haiku 4.5 and 5.5); a built-in entry matches its model id exactly or followed by a date suffix or `[1m]`, so a newer model is never priced like an older one. A model without a price is reported as "unpriced" with its tokens, never guessed |
 
+### `timesheet` config
+
+```json
+{
+  "timesheet": {
+    "timeZone": "Europe/Zurich",
+    "clients": {"acme": {"name": "Acme AG"}, "nilware": {"name": "nilware"}},
+    "projects": {
+      "web": {"client": "acme", "aliases": ["web-*", "acme-web"], "repos": ["acme/web"]},
+      "switchboard": {"client": "nilware", "aliases": ["switchboard-*"], "repos": ["nilware-io/switchboard"]}
+    },
+    "authorEmails": ["owner@example.com"],
+    "githubLogins": ["owner-login"],
+    "roundingMinutes": 0,
+    "roundingMode": "nearest",
+    "ownerOverlap": "split",
+    "recordVoice": true,
+    "voiceApproval": true,
+    "ghBin": "gh",
+    "gitBin": "git",
+    "commandTimeoutSeconds": 20
+  }
+}
+```
+
+| Key | Default | Meaning and validation |
+|---|---|---|
+| `timesheet.timeZone` | `null` | The owner's IANA time zone (`Europe/Zurich`); days and weeks (Monday to Sunday) are cut there. `null`: the hub's local time zone. Unknown names are config errors |
+| `timesheet.clients` | `{}` | Client id (`^[a-z0-9][a-z0-9._-]{0,63}$`) to `{"name": display name}` (1 to 80 printable characters), at most 100 |
+| `timesheet.projects` | `{}` | Project key (a folder name as the usage records report it, `^[A-Za-z0-9._-][A-Za-z0-9 ._-]{0,63}$`) to `{client, aliases, repos, paths}`, at most 200. `client` is exactly one key of `clients`. `aliases` (at most 32): other folder names of the same project (a worktree, another machine's clone), exact names or `fnmatch` globs (`*`, `?`); an alias may not belong to two projects or match another project's key. `repos` (at most 8): GitHub `owner/name` read with `gh`. `paths` (at most 8): local clones read with `git log`, absolute, inside `projectRoots` |
+| `timesheet.authorEmails` | `[]` | The owner's commit identities (at most 16); only their commits are listed. Personal addresses belong only in the deployed config |
+| `timesheet.githubLogins` | `[]` | The owner's GitHub logins (at most 8); only their pull requests are listed |
+| `timesheet.roundingMinutes` | `0` | Round each day's owner and agent minutes of a project to this step, 0 (off: whole minutes) to 60 |
+| `timesheet.roundingMode` | `nearest` | `nearest` or `up` |
+| `timesheet.ownerOverlap` | `split` | Owner time in several projects at the same moment: `split` divides it equally (owner hours never exceed wall-clock hours), `full` counts it in each project |
+| `timesheet.recordVoice` | `true` | Record the times of the owner's tool calls and the project each targeted (no text) in `stateDir/timesheets/voice.jsonl` |
+| `timesheet.voiceApproval` | `true` | Allow `timesheet_approve` and `timesheet_approve_confirm`; `false` leaves approval to the CLI |
+| `timesheet.ghBin`, `timesheet.gitBin` | `gh`, `git` | Command names or absolute paths (not starting with `-`) |
+| `timesheet.commandTimeoutSeconds` | `20` | Time limit of one `gh` or `git` call, 5 to 120 |
+
 Config validation additionally rejects: two machines with the same `name`, a machine named `local` (reserved for the hub's own sessions), more than 32 machines, more than one `local` machine, a `local` machine together with `listen.allowNonLoopback`, `host`, `user`, `identityFile`, `knownHostsFile` or an explicit `dispatcher` on a `local` machine, an `ssh` machine without `host`, `user` or `identityFile`, `allowPermissionAnswers` without `allowSend`, `sendToAnyPane` without `allowSend`, `claudeHome` on an `ssh` machine, and `watch.intervalSeconds` > 0 without `notify.url` (M2).
 
 `config.example.json` gets the `dev` machine first, then one SSH machine, both with placeholder values.
@@ -221,6 +262,15 @@ src/voice_coding_mcp/usage/
   report.py        spoken summary, CLI table and CSV
   service.py       cache refresh (machines and the hub's own home), report building
   tool.py          `usage_report` (deadline, background task)
+src/voice_coding_mcp/timesheet/
+  config.py        the `timesheet` section, folder to project matching
+  activity.py      the voice activity log (tool call times and the project each targeted) and `attribute`
+  compute.py       owner and agent time per project and day (the time rules below)
+  work.py          commits and pull requests through gh and git (subjects and titles only)
+  store.py         draft, adjustment and approved files, hashes, Markdown and CSV
+  service.py       draft building from the usage caches, the voice log and the work products; speech
+  tool.py          `timesheet_summary`, `timesheet_approve`, `timesheet_approve_confirm`
+  cli.py           `voice-coding-mcp timesheet draft|show|adjust|approve|export`
 deploy/remote/switchboard-remote     byte-identical copy of remote/dispatcher.py (a test checks it)
 deploy/remote/switchboard-connect    (M6) the connector, byte-identical copy of remote/connector.py
 deploy/remote/switchboard-connect.service   (M6) example systemd --user unit
@@ -297,6 +347,13 @@ Text rules, the same on hub and dispatcher (`bad_text` otherwise): NFC-normalise
 Race guard: a permission dialog can open between the check and the keystrokes, and Enter on Claude Code's dialog selects the highlighted option, which is usually "Yes". The dispatcher therefore checks the registry status and the dialog heuristic right before `load-buffer` and again right before `send-keys Enter`; if a dialog appeared in between (or the pane is gone, changed its process, or now runs another Claude Code session) it does not press Enter, returns `pasted_no_enter`, and the hub says "I typed it but did not press Enter, because a permission question just opened. Check that session at the keyboard." The window left is the few milliseconds between the last check and Enter (residual, in the threat model). The dispatcher also refuses with `draft_present` when the capture shows text already typed in Claude Code's input box (the owner's unsent draft would be submitted with the send).
 
 `usage` (implemented in M4, dispatcher 0.4.0): for each `<claudeHome>/projects/*/<uuid>.jsonl` (top level only, no subagent directories, symlinks not followed, neither for project directories nor files; the first file of an id wins) modified since the given time, whose (id, size, mtime) differs from the hub's list: a file larger than `maxMegabytes` (the hub's `maxTranscriptMegabytes`, at most 2048) gives `{"file": "<uuid>", "size", "mtime", "skipped": true}`; any other is read as bytes (opened with `O_NOFOLLOW`, at most its stat size), lines over 1 MB skipped, only lines that contain `"usage"` or `"type":"user"` parsed, and gives a header `{"file": "<uuid>", "size", "mtime", "project": "<basename of the latest cwd of a non-sidechain line>", "records": n}` followed by its n records `{"t": <epoch ms>, "k": "a", "m": "<model>", "id": "<message id>", "rq": "<request id>", "in", "out", "cw5", "cw1", "cr"}` for assistant lines with `message.usage` (also subagent lines inside the file) and `{"t", "k": "u"}` for prompts of the session's driver (user lines that are not `isMeta`, not sidechain and not tool results; prompts of `claude -p` count, as they are activity of the hub's own tasks). The answer is the header document `{"protocol": 1, "ok": true, "stream": "usage"}`, these lines, and a last line `{"done": true, "gone": [<known ids that no longer exist>]}`; the hub treats an answer without it as cut (`bad_response`). Ids and request ids outside `^[A-Za-z0-9_.:-]{1,64}$` become `null`, models are cleaned like names, token counts are integers clamped to 0..10^12, timestamps without a zone are UTC. No message text, tool input or path leaves the machine. Duplicates (Claude Code writes one assistant message across several lines with the same usage, and a forked session copies earlier messages) are removed on the hub by (`id`, `rq`).
+
+`usage` additions of dispatcher 0.10.0 (for the [timesheet](#timesheet); optional fields, so the hub reads older dispatchers' answers as before):
+
+- Agent transcripts: `<uuid>/subagents/agent-<id>.jsonl` and `<uuid>/subagents/workflows/<run>/agent-<id>.jsonl` of each session directory (no symlinks, the same size limits) are listed with the id `<uuid>:<id>` (`<id>` lowercase letters and digits, at most 40), also in the known list and in `gone`. Their project is the basename of their own latest `cwd`. `usage_report` leaves them out, so its numbers do not change.
+- File header: `"ep"`, the entrypoint of the first line that names one (`cli`, `claude-vscode`, `sdk-cli`, ...; `^[A-Za-z0-9._-]{1,32}$`, else left out), and `"wp"`, the work project, when it differs from `project`: the basename of the nearest directory at or above the latest `cwd` that holds a `.git` entry (a repository or a worktree; `lstat` only, at most 40 levels, cached per call), else the `cwd`'s basename.
+- Records: `"p"` with the work project of the line's own `cwd` when it differs from the transcript's work project; `"o": "n"` on a prompt record the owner did not type (`origin.kind` other than `human`, such as a task notification, or a compact summary; still a `u` record, so usage counts it as activity as before); `"sc": 1` on an assistant line of a subagent inside a session's transcript.
+- The hub's usage cache is version 2 (these fields); a version 1 cache is read as empty, so the first refresh reads every transcript again.
 
 ## Transports
 
@@ -517,6 +574,12 @@ Today: no Claude Code activity.
 
 Unpriced models: "..., plus tokens of 1 model without a price". Unreachable machine: "buildbox could not be read (the connection timed out); the numbers are without it.", or with a cache from an earlier success "...; I used its records from 3 hours ago.". A dispatcher without `--allow-usage`: "dev could not be read (its switchboard-remote does not allow usage, add --allow-usage)". "Most time" is said only when there are several projects. Project names come from the machines (folder names), so they are cleaned like other names and quoted. Errors: "I did not understand the period. Say today, yesterday, ...", "Usage reading is off for buildbox." (`allowUsage` false), "I found no project called "x" in the usage records. Projects: ...". Hours are spoken as minutes below one hour, with one decimal below 10 hours, else whole; counts as "thousand", "million", "billion"; dollars as "less than 1 dollar", one decimal below 10, else whole.
 
+### `timesheet_summary`, `timesheet_approve` and `timesheet_approve_confirm`
+
+`timesheet_summary(period?)` (default last week; also this week, last month, this month, `YYYY-MM`, `2026-W47`, `YYYY-MM-DD..YYYY-MM-DD`; in `timesheet.timeZone`) refreshes the usage caches, collects commits and pull requests, writes the draft (unless the period is approved) and reads back the totals: "Last week: Acme AG 14.5 owner hours and 20 agent hours across 2 projects, 9 commits, 2 pull requests; 3 hours unassigned. This is a draft, not approved." A draft that takes longer than the tool deadline continues in the background ("I am still collecting the hours and commits. Ask me again in a minute."). Client names come from the config; project names, commit subjects and pull request titles are never spoken.
+
+`timesheet_approve(period?)` reads back the current draft with its adjustments and returns a confirmation number bound to that exact view (its SHA-256), the OAuth client and the period, approving nothing. `timesheet_approve_confirm(confirmation_id)` approves it, with the rules of `remote_send_confirm`: the same client, not sooner than `remote.send.minConfirmSeconds` and not later than `remote.send.confirmSeconds` after the read-back, once, and only while the draft and its adjustments are unchanged ("Not approved: the draft changed since it was shown; show it again before approving."). One open approval per client. With `timesheet.voiceApproval` false both refuse. Annotations: `timesheet_summary` and `timesheet_approve` are `readOnlyHint: true` (the draft is a file of the hub's own, sent nowhere); `timesheet_approve_confirm` is `readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false`.
+
 ## Usage computation
 
 Implemented in M4 (`usage/`).
@@ -530,6 +593,58 @@ Implemented in M4 (`usage/`).
 - Periods: local wall-clock days of the hub's time zone (DST aware: a day can be 23 or 25 hours); weeks start Monday. `--by day` splits intervals at local midnight; its billable hours per day are the union per project within that day.
 
 CLI: `voice-coding-mcp usage [--period P] [--machine M] [--project X] [--by project|session|day] [--csv] [--cached]` prints a table (a title line with the period and the rate, then project or machine, project and session id, or day, then sessions, active hours, billable hours, amount, currency, tokens by type and cost in USD) or CSV with the same columns and a header row, then a `total` row. Names in table cells and CSV are cleaned, and a name starting with `=`, `+`, `-` or `@` gets a leading `'` so a spreadsheet does not read it as a formula. It refreshes the caches first (with a progress line on stderr) unless `--cached`. `--machine local` selects the hub's own home; `--project` matches loosely. Notes (skipped transcripts, unreadable machines, unpriced models) follow the table, or go to stderr with `--csv`. Exit code 1 when a machine failed, after printing what is known (its cached records are used); 2 for a bad period, machine, project or option.
+
+## Timesheet
+
+Implemented with dispatcher 0.10.0 (`timesheet/`). The owner is paid for the work done, which is worth something because of what the owner knows; the timesheet records the time of that work and its products, kept apart so the owner prices them later. It is always a draft until the owner approves it, and nothing in this change sends it anywhere.
+
+### Time rules
+
+Two kinds of time per project and day:
+
+- **Owner time**: the owner's own conversations, billable as a whole. (a) Interactive Claude Code sessions: transcripts that are neither agent transcripts nor headless runs. A chain is a run of activity events (prompts and assistant lines) at most `usage.idleGapMinutes` apart. A chain that contains a prompt the owner typed (a `u` record without `"o": "n"`) is owner time from the event just before that first prompt (the answer the owner was reading) to the chain's end, including the assistant work it triggers. (b) The owner's Switchboard calls: every tool call of the OAuth grant (the hub accepts only the owner) is recorded as (start, end, project it targeted); calls are chained the same way, so a voice conversation between calls counts while the calls are at most the idle gap apart. Calls that targeted no project (`pending_input`, `list_remote_sessions`, `usage_report`, ...) go to `(voice)`, and count only where no project has owner time at that moment.
+- **Agent time**: autonomous work. Agent transcripts (subagents, workflow agents), headless runs (entrypoint `sdk-*`: the hub's own `run_task` tasks, ask and relay forks, the owner's own `claude -p` scripts), chains of an interactive session without an owner prompt (a session woken by task notifications), the leading events of a chain before the answer that preceded the owner's first prompt, and sidechain lines inside a session's transcript.
+- Every chain part lasts at least one minute. The time between two events belongs to the project of the later event (the repository of its own `cwd`: dispatcher 0.10.0 `p`, else the transcript's work project `wp`, else its `project`); a lone event's minute to its own project. Folder names are mapped to configured projects (keys, exact aliases, then glob aliases) before anything is united, so a clone and its worktree count each moment once.
+- Per project and day (local days of `timesheet.timeZone`, DST aware): owner time is the union of the owner parts and the voice chains, agent time the union of the agent parts, across sessions and machines. Owner and agent time of one project at the same moment are both kept: they are different kinds of work. `ownerOverlap` `split`: a moment of owner time in several projects is divided equally among them; `full`: it counts in each (the draft notes the wall-clock owner total either way). Agent time is never split: agents run in parallel.
+- Copies count once: per machine, assistant lines by message and request id, other lines by kind and time; the transcript that started first keeps them (a resumed or forked session repeats earlier lines with their times).
+- Rounding (`roundingMinutes`, default off) applies per project and day, to owner and agent minutes separately; totals are sums of the rounded days. Off, days are whole minutes.
+
+Limits, said plainly in the docs and the draft's notes:
+
+- The Claude apps' own chat history (claude.ai, the phone app) is not visible to the hub. A voice conversation that never called a Switchboard tool leaves no trace; one that did counts from its calls only (talking before the first and after the last call is not seen).
+- Time reflects transcript events: thinking time before the first prompt of a chain, reviews done outside Claude Code, meetings and calls are not seen; add them as adjustments.
+- Project attribution is the repository of each line's `cwd`. An agent working in another repository through absolute paths without changing its directory is attributed to its session's directory.
+- Machines with a dispatcher older than 0.10.0 report no entrypoints, origins or agent transcripts: their headless runs count as owner time, task notifications as owner prompts, their subagents are missing. The draft notes such machines.
+- The entrypoint of Remote Control sessions that the hub starts (`run_task` with `remote_control`) is not verified yet: if it is `sdk-*`, the owner's typing in such a session counts as agent time.
+
+### Commits and pull requests
+
+Per configured project, commits by `authorEmails` and pull requests by `githubLogins` in the period:
+
+- `repos` (GitHub, through `gh` on the machine that drafts, which is the hub for `timesheet_summary`): `gh api -X GET repos/<repo>/commits -f author=<email> -f since=<UTC> -f until=<UTC> --paginate --jq ...` (the default branch; the `--jq` filter keeps the hash, author date, the first line of the message and the commit URL, so bodies never reach the hub) and `gh pr list -R <repo> --state all --author <login> --search "created:<from>..<to>"` and `merged:...` with `--json number,title,url,createdAt,mergedAt`. A pull request appears on the day it was opened and the day it was merged, inside the period.
+- `paths` (local clones inside `projectRoots`, on the machine that drafts): `git --no-pager -c core.fsmonitor= -c core.hooksPath=/dev/null -C <path> log --all --since=<31 days before> --format=%H%x1f%aI%x1f%ae%x1f%s%x1e`, filtered to `authorEmails` and the period by author date. This covers branches that are not on GitHub's default branch.
+- Commits are deduplicated by hash and assigned to the day of their author date in the owner's zone. Only hashes, times, subjects, titles, numbers and URLs are kept, cleaned to printable text and cut to 200 characters; never diffs or bodies. Commands run from argv (no shell) with a minimal environment (PATH, HOME, gh's own variables, git without the system config, prompts or a pager) and `commandTimeoutSeconds`; a failure becomes a note in the draft ("commits of acme/web could not be read with gh").
+- Without a `gh` login on the hub (the dedicated user's bot identity may not see private repositories of a client), run `voice-coding-mcp timesheet draft` where `gh` is logged in with the hub's config and state, for example `sudo -u switchboard env GH_CONFIG_DIR=... voice-coding-mcp timesheet draft`, or give the hub's `gh` a read-only token. A dispatcher verb for `git log` on the machines is a possible later step; not implemented.
+
+### Files and approval
+
+Everything lives in `stateDir/timesheets/` (directory 0700, files 0600, written atomically), named by the period id `<first day>_<last day>`:
+
+- `<period>.draft.json`: the computed draft (`status: "draft"`, period, rules, per client and per project the days with `ownerMs`, `agentMs`, `ownerOverlapMs`, `ownerMinutes`, `agentMinutes`, commits, pull requests; `unassigned` projects; notes; totals; `sha256`). `.draft.md` and `.draft.csv` render it with the adjustments applied. A new draft of the period replaces it and keeps the adjustments.
+- `<period>.adjustments.json`: the owner's adjustments, never mixed into the computed numbers: `hours` (project, day, owner or agent, signed minutes, optional note), `move` (minutes of one kind from a project to a configured project on a day) and `note` (a project, optional day, text up to 300 characters, which is the owner's own and appears on the timesheet). A day's final minutes are computed plus adjustments; an adjustment that would leave a day below zero, a day outside the period, or a move to an unconfigured project is refused. The Markdown shows `final (computed + adjustment)`.
+- Approval (`voice-coding-mcp timesheet approve`, or the voice pair) writes `<period>.approved.json` once (`O_EXCL`): the view with its adjustments, `status: "approved"`, and `approval` with the time, `via` (`cli` or `voice`), the draft's hash and `sha256` of the whole document (taken with that field empty). `.approved.md` and `.csv` follow. After that the period takes no new draft and no adjustment. `approve --expect <id>` (the id `show` and `draft` print, a prefix of at least 8 characters of the view's hash) refuses when the draft or its adjustments changed since the owner looked; the voice confirmation always binds the view's hash.
+- `voice-coding-mcp timesheet export <period> [--format md|csv|json] [--out PATH]` prints or writes (0600) an approved timesheet only, after checking its `sha256` ("the approved file was changed after its approval; it is not exported"). Nothing is emailed, uploaded or posted; sending is the owner's own step.
+- Privacy: the files and the voice log hold times, project and client names, commit subjects and pull request titles, the owner's own notes; no prompt text, no screen text, no transcript content, no paths. CSV cells that a spreadsheet would read as a formula get a leading `'`; Markdown escapes subjects and titles.
+
+`stateDir/timesheets/voice.jsonl`: one line per tool call, `{"t": start ms, "e": end ms, "tool": name, "p": project folder or null}`. The project is what the call resolved: the task's project for `run_task`, `run_tasks_parallel`, `get_task_result`, `cancel_task`, `resume_task_in_remote_control`, the session tasks and `list_tasks` or `list_sessions` with a project; the Claude Code session's folder (`cwdName` of the pane) for `remote_status`, `remote_send`, `remote_send_keys`, `remote_resize` and their `remote_send_confirm`. It is never rotated (about 100 bytes per call); archive it by hand.
+
+### CLI
+
+`voice-coding-mcp timesheet draft [period] [--cached]` (refreshes the usage caches unless `--cached`, prints the Markdown and the draft id; exit 1 when a machine could not be read), `show [period] [--format md|csv|json]`, `adjust [period] --project X (--day D (--owner|--agent) DELTA [--move-to Y] | --note TEXT [--day D])` (DELTA `+1h30m`, `-0.5h`, `45m` or minutes, at most 24 hours), `approve [period] [--expect ID]`, `export [period] [--format md|csv|json] [--out PATH]`. The period defaults to last week. Exit codes: 2 for a bad period or argument, 1 for a refusal (no draft, approved already, changed since shown, not approved, tampered).
+
+### Future: a voice gateway for hours
+
+Not implemented; a design note. A voice gateway could record the owner's work that happens outside Claude Code ("start work on web", "stop work", "I was in a call with Acme for 40 minutes"): two tools, `work_start(project)` and `work_stop()`, plus `work_log(project, minutes, note)`, writing start and stop events to `stateDir/timesheets/manual.jsonl`. Start/stop pairs become owner intervals of that project (an open start is closed at the next start, at a stop, or after a configurable maximum, with a note), and enter the same unions and split as session time; `work_log` becomes an adjustment with its note. They follow the confirmation rules of this file: a read-back of what will be recorded, recorded on the owner's yes in a later turn, never because a screen or a session asked.
 
 ## Notification watcher
 
@@ -1062,6 +1177,13 @@ Done as listed, with these notes and deviations:
 - The relay's `run` takes the relay account's uid as a parameter for tests (the test hub's socket is the test user's own); the forced command and `agent-relay` always use the real uid.
 - The owner guide is its own file, [SETUP-AGENTS.md](SETUP-AGENTS.md) (hub, machine, migration, troubleshooting, compromise steps), linked from SETUP-WSL.md step 6, DEPLOY.md and the README, instead of parts inside SETUP-WSL.md and DEPLOY.md: the machine side is the same for every machine. The hub side needs the server layout (the root-owned install in `/opt/voice-coding-mcp`, readable by `sbrelay`, and an sshd the machines reach); the WSL hub layout of SETUP-WSL.md cannot host the relay (its venv is in a mode 700 home the hub user can write, and its sshd listens on loopback only), so the guide says so and treats a WSL box as a machine.
 - Tests: `tests/remote/test_dispatcher_serve.py` (a forced-mode corpus over every verb and refusal under three policies, byte-identical documents and the same tmux calls in both modes; framing, both limits, malformed frames, ids, busy, duplicate ids, one-at-a-time sends, cancel, crashes, exit codes, silence, a send completing after the connection drops, the script), `test_relay.py`, `test_agents.py` (a fake machine on the real socket), `test_agent_tools.py` (every tool, the watcher, `status` and `remote-check` over the real relay and the real serve-mode dispatcher on the fake tmux), `test_connector.py` (with `tests/fixtures/fake_ssh_out.py`, including the chain connector, fake ssh, relay, hub), `test_config_agents.py`, `test_deploy_agents.py`. Not verified yet (owner, on the real setup): see DESIGN.md "To verify with the real app".
+
+### Timesheets (implemented)
+
+- Dispatcher 0.10.0 `usage` additions (agent transcripts, entrypoints, work projects, prompt origins, sidechain marks) and the hub's cache version 2; connector 0.10.0 in step.
+- `timesheet/` package, `timesheet` config section, the voice activity log, tools `timesheet_summary`, `timesheet_approve`, `timesheet_approve_confirm`, CLI `voice-coding-mcp timesheet`.
+- Tests: `tests/usage/test_dispatcher_agents.py` (agent files and ids, known and gone, entrypoints, origins, work projects in repositories and worktrees, no paths or text, the hub's strict parsing and cache round trip), `tests/usage/test_service_tool.py` (usage unchanged by agent transcripts), `tests/timesheet/test_compute.py` (owner, agent and sidechain sessions, idle gaps, lead-in, unions, split and full, voice, renames, copies, midnight and week boundaries in the owner's zone, rounding), `test_work.py` (fake gh and git: argv, filters, deduplication, failures), `test_service_store.py` (drafts end to end on hub transcripts with the fake `tests/fixtures/fake_gh.py`, unassigned and ambiguous folders, voice calls, adjustments, approval freeze, tamper check, file modes, privacy, config validation), `test_tool_cli.py` (summary, approval in a later turn by the same client, a changed draft, expiry, voice approval off, the CLI), `tests/test_mcp.py` (tool calls recorded without text).
+- Not verified yet (owner, on the real setup): `origin.kind` on prompts across Claude Code versions (only `human` and `task-notification` were seen), the entrypoint of Remote Control sessions the hub starts, subagent and workflow agent transcript paths in newer Claude Code versions, the GitHub search syntax with times for `gh pr list` on the installed `gh`.
 
 ## Open questions from the brief, with recommendations
 
