@@ -224,7 +224,7 @@ def test_oversize_files_are_refused_before_reading(world: RemoteWorld) -> None:
 
 
 def test_serve_mode_streams_and_cancels(world: RemoteWorld) -> None:
-    put(world, "clip.mp4", mp4(mdat=os.urandom(3 * 1024 * 1024 - 1000)), 1_764_000_000)
+    put(world, "clip.mp4", mp4(mdat=os.urandom(3 * 1024 * 1024 - 2000)), 1_764_000_000)
     put(world, "shot.png", png(), 1_764_000_000)
     session = ServeSession(["--serve", *FORCED], world.tmux_env())
     try:

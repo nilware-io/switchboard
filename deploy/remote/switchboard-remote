@@ -1673,7 +1673,31 @@ PNG_KEEP = (
     b"fdAT",
 )
 """PNG chunks that are kept (an allowlist): pixels, color and animation. Every other chunk (text,
-EXIF with GPS, time, private chunks of any name) is dropped."""
+EXIF with GPS, time, private chunks of any name) is dropped. A kept chunk must also have the length
+and place the specification gives it (PNG_LENGTHS, `_png_chunk_ok`), so no allowlisted name carries
+extra bytes."""
+PNG_LENGTHS = {
+    b"IEND": 0,
+    b"gAMA": 4,
+    b"cHRM": 32,
+    b"sRGB": 1,
+    b"pHYs": 9,
+    b"cICP": 4,
+    b"mDCV": 24,
+    b"cLLI": 8,
+    b"acTL": 8,
+    b"fcTL": 26,
+}
+"""Exact payload lengths of the fixed-size kept chunks."""
+PNG_ONCE = frozenset(PNG_KEEP) - {b"IDAT", b"fcTL", b"fdAT"}
+"""Kept chunks that may appear at most once."""
+PNG_BEFORE_IDAT = PNG_ONCE - {b"IEND"}
+"""Kept chunks that must come before the first IDAT."""
+PNG_SBIT = {0: 1, 2: 3, 3: 3, 4: 2, 6: 4}
+PNG_BKGD = {0: 2, 2: 6, 3: 1, 4: 2, 6: 6}
+PNG_TRNS = {0: 2, 2: 6}
+MAX_ICC_BYTES = 1024 * 1024
+"""An embedded ICC color profile (PNG iCCP, JPEG APP2) larger than this is refused or dropped."""
 PNG_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
 """Bit depths by color type."""
 PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
@@ -1686,15 +1710,26 @@ INFLATE_STEP = 1024 * 1024
 JPEG_SEGMENTS = frozenset(range(0xC0, 0xD0)) - {0xC8} | {0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF}
 """Standard JPEG segments kept: SOFn, DHT, DAC, SOS, DQT, DNL, DRI, DHP, EXP. Other markers are
 refused, except APPn and comments, which are dropped unless JPEG_KEEP_APPS keeps them."""
-JPEG_KEEP_APPS = {0xE0: (b"JFIF\x00", b"JFXX\x00"), 0xE2: (b"ICC_PROFILE\x00",), 0xEE: (b"Adobe",)}
-"""APP segments kept by their identifier: JFIF, the ICC color profile, Adobe's color transform. An
-EXIF APP1 is replaced by a new one that holds only the orientation."""
+JPEG_JFIF = b"JFIF\x00"
+JPEG_ICC = b"ICC_PROFILE\x00"
+JPEG_ADOBE = b"Adobe"
+"""APP segments kept, each checked: JFIF (APP0, exactly 14 bytes; a thumbnail is cut off), the ICC
+color profile (APP2, the parts must add up to a whole profile, else they are all dropped) and
+Adobe's color transform (APP14, exactly 12 bytes). Every other APP segment (JFXX thumbnails, XMP,
+any longer or shorter JFIF or Adobe segment) and every comment is dropped. An EXIF APP1 is replaced
+by a new one that holds only the orientation."""
 GIF_KEEP_APPS = (b"\x0bNETSCAPE2.0", b"\x0bANIMEXTS1.0")
-"""Application extensions kept (looping); others (XMP), comments and plain text are dropped."""
+"""Application extensions kept (looping), only as exactly one 3-byte sub-block (id 1 and the loop
+count); others (XMP), longer ones, comments and plain text are dropped. A Graphic Control Extension
+is kept only as exactly one 4-byte sub-block."""
 WEBP_CHUNKS = (b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP", b"EXIF", b"XMP ")
 WEBP_STRIP = (b"EXIF", b"XMP ")
-WAV_KEEP = (b"fmt ", b"fact", b"data", b"cue ", b"smpl")
-"""WAV chunks kept (an allowlist); LIST (INFO tags), id3, bext and any other chunk are dropped."""
+WAV_KEEP = (b"fmt ", b"fact", b"data")
+"""WAV chunks kept (an allowlist), each exactly once; LIST (INFO tags), id3, bext, cue points,
+sampler data and any other chunk are dropped."""
+WAV_EXTENSIBLE = 0xFFFE
+WAV_GUID_TAIL = b"\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
+"""The fixed part of a WAVE_FORMAT_EXTENSIBLE sub-format GUID (after its 16-bit format code)."""
 OGG_CODECS = (b"OpusHead", b"\x01vorbis", b"\x7fFLAC")
 FLAC_KEEP = (0, 3, 5)
 """STREAMINFO, SEEKTABLE and CUESHEET; padding, application data, tags and pictures are dropped."""
@@ -1707,9 +1742,62 @@ _FLAC_SYNC = re.compile(b"\xff[\xf8\xf9]")
 MP4_AUDIO_BRANDS = (b"M4A ", b"M4B ")
 MP4_VIDEO_BRANDS = (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"M4V ", b"dash")
 MP4_QUICKTIME = b"qt  "
-MP4_ZERO = (b"free", b"skip", b"wide", b"uuid", b"udta", b"meta")
+MP4_ZERO = (
+    b"free",
+    b"skip",
+    b"wide",
+    b"uuid",
+    b"udta",
+    b"meta",
+    b"iods",
+    b"tref",
+    b"trgr",
+    b"load",
+    b"tapt",
+    b"clip",
+    b"matt",
+    b"txas",
+    b"imap",
+    b"elng",
+    b"gmhd",
+    b"leva",
+    b"trep",
+)
 """Boxes kept in size but renamed `free` and zeroed, so no sample offset moves: padding, private
-`uuid` boxes, user data and metadata (tags, the GPS location phones write)."""
+`uuid` boxes, user data and metadata (tags, the GPS location phones write), and boxes playback of
+the main tracks does not need (object descriptors, track references and groups, QuickTime
+clipping, mattes, apertures and base media headers, language tags, fragment levels)."""
+MP4_FIXED = {
+    b"vmhd": (12, 12),
+    b"smhd": (8, 8),
+    b"hmhd": (20, 20),
+    b"nmhd": (4, 4),
+    b"sthd": (4, 4),
+    b"mvhd": (100, 112),
+    b"tkhd": (84, 96),
+    b"mdhd": (24, 36),
+    b"mehd": (8, 12),
+    b"tfdt": (8, 12),
+    b"trex": (24, 24),
+    b"mfhd": (8, 8),
+    b"mfro": (8, 8),
+}
+"""Exact payload lengths of fixed-size boxes by version (0, 1)."""
+MP4_TIMES = (b"mvhd", b"tkhd", b"mdhd")
+"""Header boxes whose creation and modification times are zeroed (they date the recording)."""
+MP4_TABLES = {
+    b"stts": (8, 8),
+    b"ctts": (8, 8),
+    b"stss": (8, 4),
+    b"stps": (8, 4),
+    b"stsc": (8, 12),
+    b"stco": (8, 4),
+    b"co64": (8, 8),
+}
+"""Sample tables: (header bytes, bytes per entry); the payload must be exactly the entry count's
+worth of entries."""
+MP4_HANDLER_NAME = 256
+"""The longest handler name accepted; the name is zeroed (players do not need it)."""
 _MP4_STBL = (
     b"stsd",
     b"stts",
@@ -1733,12 +1821,13 @@ _MP4_STBL = (
 )
 MP4_CHILDREN = {
     b"": (b"ftyp", b"moov", b"mdat", b"moof", b"mfra", b"sidx", b"styp", b"prft"),
-    b"moov": (b"mvhd", b"trak", b"mvex", b"iods"),
-    b"trak": (b"tkhd", b"tref", b"edts", b"mdia", b"trgr", b"load", b"tapt", b"clip", b"matt", b"txas", b"imap"),
-    b"mdia": (b"mdhd", b"hdlr", b"minf", b"elng"),
-    b"minf": (b"vmhd", b"smhd", b"hmhd", b"nmhd", b"sthd", b"gmhd", b"dinf", b"stbl", b"hdlr"),
+    b"moov": (b"mvhd", b"trak", b"mvex"),
+    b"trak": (b"tkhd", b"edts", b"mdia"),
+    b"edts": (b"elst",),
+    b"mdia": (b"mdhd", b"hdlr", b"minf"),
+    b"minf": (b"vmhd", b"smhd", b"hmhd", b"nmhd", b"sthd", b"dinf", b"stbl", b"hdlr"),
     b"stbl": _MP4_STBL,
-    b"mvex": (b"mehd", b"trex", b"leva", b"trep"),
+    b"mvex": (b"mehd", b"trex"),
     b"moof": (b"mfhd", b"traf"),
     b"traf": (b"tfhd", b"tfdt", b"trun", b"sbgp", b"sgpd", b"subs", b"saiz", b"saio", b"senc"),
     b"mfra": (b"tfra", b"mfro"),
@@ -1752,6 +1841,7 @@ EBML_SEGMENT = 0x18538067
 EBML_CLUSTER = 0x1F43B675
 EBML_TRACKS = 0x1654AE6B
 EBML_TRACK_ENTRY = 0xAE
+EBML_TRACK_TYPE = 0x83
 EBML_VOID = 0xEC
 EBML_CRC = 0xBF
 EBML_TAGS = 0x1254C367
@@ -1893,6 +1983,48 @@ def _inflate_exact(stream: bytes, expected: int) -> None:
     _need(inflater.eof and total == expected and not inflater.unused_data)
 
 
+def icc_profile_ok(profile: bytes) -> bool:
+    """An ICC profile whose header size is its length, with the `acsp` signature."""
+    return 128 <= len(profile) <= MAX_ICC_BYTES and _be(profile, 0, 4) == len(profile) and profile[36:40] == b"acsp"
+
+
+def _png_chunk_ok(kind: bytes, payload: bytes, color: int, depth: int, kept: set[bytes]) -> None:
+    """A kept chunk's payload has the length (and, where cheap, the values) the specification
+    gives it for this image's color type."""
+    length = len(payload)
+    if kind in PNG_LENGTHS:
+        _need(length == PNG_LENGTHS[kind])
+    if kind == b"PLTE":
+        _need(color in (2, 3, 6) and length % 3 == 0 and 3 <= length <= 3 * 256)
+        _need(color != 3 or length <= 3 * (1 << depth))
+    elif kind == b"tRNS":
+        if color == 3:
+            _need(b"PLTE" in kept and 1 <= length <= 256)
+        else:
+            _need(length == PNG_TRNS.get(color, -1))
+    elif kind == b"sBIT":
+        _need(length == PNG_SBIT[color] and all(1 <= bits <= (8 if color == 3 else depth) for bits in payload))
+    elif kind == b"bKGD":
+        _need(length == PNG_BKGD[color])
+    elif kind == b"sRGB":
+        _need(payload[0] <= 3)
+    elif kind == b"pHYs":
+        _need(payload[8] <= 1)
+    elif kind == b"fcTL":
+        # Dispose op 0 to 2, blend op 0 or 1.
+        _need(payload[24] <= 2 and payload[25] <= 1)
+    elif kind == b"iCCP":
+        # A Latin-1 name of 1 to 79 bytes, compression method 0, then a zlib stream that must
+        # inflate to a whole ICC profile and end where the chunk ends.
+        name_end = payload.find(b"\x00", 0, 80)
+        _need(name_end >= 1 and payload[name_end + 1 : name_end + 2] == b"\x00")
+        _need(all(32 <= c <= 126 or c >= 161 for c in payload[:name_end]))
+        inflater = zlib.decompressobj()
+        profile = inflater.decompress(payload[name_end + 2 :], MAX_ICC_BYTES + 1)
+        _need(inflater.eof and not inflater.unused_data and not inflater.unconsumed_tail)
+        _need(icc_profile_ok(profile))
+
+
 def _png(data: bytes, budget: _Budget) -> bytes:
     _need(data.startswith(PNG_SIGNATURE))
     out = [PNG_SIGNATURE]
@@ -1901,6 +2033,8 @@ def _png(data: bytes, budget: _Budget) -> bytes:
     # (width, height, data parts) of the default image (IDAT) and each later frame (fdAT).
     frames: list[tuple[int, int, list[bytes]]] = []
     image = False
+    kept: set[bytes] = set()
+    color = depth = 0
     while True:
         budget.step()
         length = _be(data, pos, 4)
@@ -1917,7 +2051,11 @@ def _png(data: bytes, budget: _Budget) -> bytes:
             _need(depth in PNG_DEPTHS.get(color, ()) and payload[10] == 0 and payload[11] == 0)
             _need(payload[12] in (0, 1))
             header = (width, height, depth * PNG_CHANNELS[color], payload[12] == 1)
-        elif kind == b"IDAT":
+            kept.add(kind)
+            out.append(data[pos:end])
+            pos = end
+            continue
+        if kind == b"IDAT":
             if not image:
                 image = True
                 frames.insert(0, (header[0], header[1], []))
@@ -1932,6 +2070,10 @@ def _png(data: bytes, budget: _Budget) -> bytes:
             _need(image and len(frames) > 1 and length > 4)
             frames[-1][2].append(payload[4:])
         if kind in PNG_KEEP:
+            _need(kind not in PNG_ONCE or kind not in kept)
+            _need(not (image and kind in PNG_BEFORE_IDAT))
+            _png_chunk_ok(kind, payload, color, depth, kept)
+            kept.add(kind)
             out.append(data[pos:end])
         pos = end
         if kind == b"IEND":
@@ -1982,11 +2124,58 @@ def orientation_segment(value: int) -> bytes:
     return b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload
 
 
+def _jpeg_icc_ok(parts: list[tuple[int, int, int, bytes]]) -> bool:
+    """The ICC parts are numbered 1 to their count, once each, and join to a whole profile."""
+    count = parts[0][2]
+    if sorted(sequence for _, sequence, _, _ in parts) != list(range(1, count + 1)):
+        return False
+    if any(total != count for _, _, total, _ in parts):
+        return False
+    try:
+        return icc_profile_ok(b"".join(chunk for _, _, _, chunk in sorted(parts, key=lambda part: part[1])))
+    except _NotMediaError:
+        return False
+
+
+def _jpeg_segment_ok(marker: int, payload: bytes) -> None:
+    """A standard segment's length matches what its fields say: no bytes after its tables."""
+    length = len(payload)
+    if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xCC):
+        _need(length >= 6 and length == 6 + 3 * payload[5])
+    elif marker == 0xDB:
+        pos = 0
+        while pos < length:
+            pos += 1 + (128 if payload[pos] >> 4 else 64)
+        _need(pos == length and length > 0)
+    elif marker == 0xC4:
+        pos = 0
+        while pos < length:
+            _need(pos + 17 <= length)
+            pos += 17 + sum(payload[pos + 1 : pos + 17])
+        _need(pos == length and length > 0)
+    elif marker == 0xDA:
+        _need(length >= 1 and length == 4 + 2 * payload[0])
+    elif marker in (0xDD, 0xDC):
+        # DRI, DNL: one 16-bit value.
+        _need(length == 2)
+    elif marker == 0xCC:
+        # DAC: two bytes per conditioning table, at most 32 tables.
+        _need(0 < length <= 64 and length % 2 == 0)
+    elif marker == 0xDE:
+        # DHP has the shape of a frame header.
+        _need(length >= 6 and length == 6 + 3 * payload[5])
+    else:
+        # EXP: one byte.
+        _need(marker == 0xDF and length == 1)
+
+
 def _jpeg(data: bytes, budget: _Budget) -> bytes:
     _need(data[:3] == b"\xff\xd8\xff")
     out = [b"\xff\xd8"]
     size = len(data)
-    pos, frame, scan, oriented = 2, False, False, False
+    pos, frame, scan, oriented, jfif, adobe = 2, False, False, False, False, False
+    # (index in out, sequence number, count, data) of each ICC profile part.
+    icc: list[tuple[int, int, int, bytes]] = []
     while True:
         budget.step()
         _need(pos + 2 <= size and data[pos] == 0xFF)
@@ -2007,11 +2196,20 @@ def _jpeg(data: bytes, budget: _Budget) -> bytes:
                 if value is not None:
                     oriented = True
                     out.append(orientation_segment(value))
-            elif any(payload.startswith(tag) for tag in JPEG_KEEP_APPS.get(marker, ())):
+            elif marker == 0xE0 and payload.startswith(JPEG_JFIF) and len(payload) >= 14 and not jfif:
+                # Version, units and density; the thumbnail (if any) is dropped.
+                jfif = True
+                out.append(b"\xff\xe0\x00\x10" + payload[:12] + b"\x00\x00")
+            elif marker == 0xEE and payload.startswith(JPEG_ADOBE) and len(payload) == 12 and not adobe:
+                adobe = True
+                out.append(data[pos:end])
+            elif marker == 0xE2 and payload.startswith(JPEG_ICC) and len(payload) > 14:
+                icc.append((len(out), payload[12], payload[13], payload[14:]))
                 out.append(data[pos:end])
             pos = end
             continue
         _need(marker in JPEG_SEGMENTS)
+        _jpeg_segment_ok(marker, payload)
         if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xCC):
             frame = True
             _need(_be(payload, 1, 2) <= MAX_IMAGE_SIDE)
@@ -2027,6 +2225,9 @@ def _jpeg(data: bytes, budget: _Budget) -> bytes:
             out.append(data[pos : found.start()])
             pos = found.start()
     _need(pos == size and scan)
+    if icc and not _jpeg_icc_ok(icc):
+        for index, _, _, _ in icc:
+            out[index] = b""
     out.append(b"\xff\xd9")
     return b"".join(out)
 
@@ -2074,7 +2275,10 @@ def _gif(data: bytes, budget: _Budget) -> bytes:
             _need(pos + 2 <= len(data))
             label = data[pos + 1]
             end = _gif_blocks(data, pos + 2, budget)
-            if label == 0xF9 or (label == 0xFF and data[pos + 2 : pos + 14] in GIF_KEEP_APPS):
+            body = data[pos + 2 : end]
+            control = label == 0xF9 and len(body) == 6 and body[0] == 4
+            looping = label == 0xFF and body[:12] in GIF_KEEP_APPS and len(body) == 17 and body[12:14] == b"\x03\x01"
+            if control or looping:
                 out.append(data[pos:end])
         else:
             raise _NotMediaError()
@@ -2139,11 +2343,39 @@ def _webp(data: bytes, budget: _Budget) -> bytes:
     return _rebuild_riff(data, b"WEBP", kept)
 
 
+def _wav_fmt_ok(payload: bytes) -> None:
+    """A format chunk of the size its format needs: 16 bytes (PCM), 18 with no extra bytes, or 40
+    for WAVE_FORMAT_EXTENSIBLE with the standard sub-format GUID. Formats that carry codec bytes
+    of their own (ADPCM, for example) are refused."""
+    length = len(payload)
+    if length == 16:
+        _need(_le(payload, 0, 2) != WAV_EXTENSIBLE)
+    elif length == 18:
+        _need(_le(payload, 16, 2) == 0 and _le(payload, 0, 2) != WAV_EXTENSIBLE)
+    else:
+        _need(length == 40 and _le(payload, 0, 2) == WAV_EXTENSIBLE and _le(payload, 16, 2) == 22)
+        _need(payload[26:40] == WAV_GUID_TAIL)
+    _need(1 <= _le(payload, 2, 2) <= 18)
+
+
 def _wav(data: bytes, budget: _Budget) -> bytes:
     chunks = _riff(data, b"WAVE", budget)
     kinds = [kind for kind, _, _ in chunks]
-    _need(b"fmt " in kinds and b"data" in kinds)
-    return _rebuild_riff(data, b"WAVE", [data[s:e] for kind, s, e in chunks if kind in WAV_KEEP])
+    _need(all(kinds.count(kind) <= 1 for kind in WAV_KEEP) and b"fmt " in kinds and b"data" in kinds)
+    _need(kinds.index(b"fmt ") < kinds.index(b"data"))
+    kept = []
+    for kind, start, _ in chunks:
+        if kind not in WAV_KEEP:
+            continue
+        length = _le(data, start + 4, 4)
+        payload = data[start + 8 : start + 8 + length]
+        if kind == b"fmt ":
+            _wav_fmt_ok(payload)
+        elif kind == b"fact":
+            _need(length == 4)
+        # The pad byte after an odd-sized chunk is written as zero.
+        kept.append(data[start : start + 8 + length] + (b"\x00" if length & 1 else b""))
+    return _rebuild_riff(data, b"WAVE", kept)
 
 
 def _ogg_page(data: bytes, pos: int) -> int:
@@ -2333,6 +2565,44 @@ def _mp4_format(data: bytes) -> str | None:
     return "mp4" if major in MP4_VIDEO_BRANDS else None
 
 
+def _mp4_leaf(
+    kind: bytes, data: bytes, *, payload: int, end: int, budget: _Budget, blank: list[tuple[int, int]]
+) -> None:
+    """A walked box's payload has the size its version, flags and entry count give it. Times in
+    header boxes and handler names are queued in `blank` to be zeroed."""
+    length = end - payload
+    version = _be(data, payload, 1) if length else 0
+    flags = _be(data, payload + 1, 3) if length >= 4 else 0
+    if kind in MP4_FIXED:
+        _need(version <= 1 and length == MP4_FIXED[kind][version])
+        if kind in MP4_TIMES:
+            blank.append((payload + 4, payload + (20 if version else 12)))
+    elif kind in MP4_TABLES:
+        header, entry = MP4_TABLES[kind]
+        _need(length == header + entry * _be(data, payload + 4, 4))
+    elif kind == b"elst":
+        _need(version <= 1 and length == 8 + (20 if version else 12) * _be(data, payload + 4, 4))
+    elif kind == b"stsz":
+        size, count = _be(data, payload + 4, 4), _be(data, payload + 8, 4)
+        _need(length == 12 + (0 if size else 4 * count))
+    elif kind == b"stz2":
+        field, count = _be(data, payload + 7, 1), _be(data, payload + 8, 4)
+        _need(field in (4, 8, 16) and length == 12 + (count * field + 7) // 8)
+    elif kind == b"stsd":
+        entries = _boxes(data, payload + 8, end, budget) if length >= 8 else []
+        _need(length >= 8 and len(entries) == _be(data, payload + 4, 4))
+    elif kind == b"hdlr":
+        _need(24 <= length <= 24 + MP4_HANDLER_NAME)
+        blank.append((payload + 24, end))
+    elif kind == b"tfhd":
+        optional = sum(size for bit, size in ((0x01, 8), (0x02, 4), (0x08, 4), (0x10, 4), (0x20, 4)) if flags & bit)
+        _need(length == 8 + optional)
+    elif kind == b"trun":
+        optional = sum(4 for bit in (0x01, 0x04) if flags & bit)
+        per_sample = sum(4 for bit in (0x100, 0x200, 0x400, 0x800) if flags & bit)
+        _need(length == 8 + optional + per_sample * _be(data, payload + 4, 4))
+
+
 def _mp4_walk(
     data: bytes,
     *,
@@ -2341,38 +2611,87 @@ def _mp4_walk(
     end: int,
     budget: _Budget,
     zero: list[tuple[int, int, int]],
-    seen: list[tuple[bytes, bytes, int, int]],
+    blank: list[tuple[int, int]],
+    seen: list[tuple[bytes, bytes, int, int, int]],
+    track: int,
+    tracks: list[int],
 ) -> None:
+    """Walks the boxes in start..end; `seen` gets (parent, type, payload start, end, track number
+    or -1) of each one kept."""
     for kind, box_start, payload, box_end in _boxes(data, start, end, budget):
         if kind in MP4_ZERO:
             zero.append((box_start, payload, box_end))
             continue
         _need(kind in MP4_CHILDREN[parent])
-        seen.append((parent, kind, payload, box_end))
+        here = track
+        if kind == b"trak":
+            here = tracks[0]
+            tracks[0] += 1
+        seen.append((parent, kind, payload, box_end, here))
         if kind in MP4_CHILDREN:
-            _mp4_walk(data, parent=kind, start=payload, end=box_end, budget=budget, zero=zero, seen=seen)
+            _mp4_walk(
+                data,
+                parent=kind,
+                start=payload,
+                end=box_end,
+                budget=budget,
+                zero=zero,
+                blank=blank,
+                seen=seen,
+                track=here,
+                tracks=tracks,
+            )
+        else:
+            _mp4_leaf(kind, data, payload=payload, end=box_end, budget=budget, blank=blank)
+
+
+def _mp4_track_ok(data: bytes, boxes: list[tuple[bytes, bytes, int, int, int]], fragmented: bool) -> bool:
+    """A track with a sample description, sample sizes and chunk offsets, and samples (in its own
+    tables, or in movie fragments)."""
+    kinds = {kind: payload for parent, kind, payload, _, _ in boxes if parent == b"stbl"}
+    if b"stsd" not in kinds or _be(data, kinds[b"stsd"] + 4, 4) == 0:
+        return False
+    sizes = kinds.get(b"stsz", kinds.get(b"stz2"))
+    if sizes is None or (b"stco" not in kinds and b"co64" not in kinds):
+        return False
+    return fragmented or _be(data, sizes + 8, 4) > 0
 
 
 def _mp4(data: bytes, budget: _Budget, *, audio: bool) -> bytes:
-    """ISO BMFF (MP4, MOV, M4A): only known boxes in the walked containers, one `moov` with an
-    `mvhd` and at least one track with a sound or video handler, media data present. With `audio`
-    (M4A) every track handler must be sound; otherwise at least one must be video."""
+    """ISO BMFF (MP4, MOV, M4A): only known boxes in the walked containers, each walked box of the
+    size its fields give, one `moov` with an `mvhd`, at least one track with a sound or video
+    handler and real sample tables, media data present. With `audio` (M4A) every track handler
+    must be sound; otherwise at least one must be video."""
     zero: list[tuple[int, int, int]] = []
-    seen: list[tuple[bytes, bytes, int, int]] = []
+    blank: list[tuple[int, int]] = []
+    seen: list[tuple[bytes, bytes, int, int, int]] = []
     _need(data[4:8] == b"ftyp")
-    _mp4_walk(data, parent=b"", start=0, end=len(data), budget=budget, zero=zero, seen=seen)
-    top = [kind for parent, kind, _, _ in seen if parent == b""]
+    _mp4_walk(
+        data, parent=b"", start=0, end=len(data), budget=budget, zero=zero, blank=blank, seen=seen, track=-1, tracks=[0]
+    )
+    top = [kind for parent, kind, _, _, _ in seen if parent == b""]
     _need(top.count(b"ftyp") == 1 and top.count(b"moov") == 1 and b"mdat" in top)
-    _need(any(parent == b"moov" and kind == b"mvhd" for parent, kind, _, _ in seen))
-    handlers = [data[p + 8 : p + 12] for parent, kind, p, e in seen if parent == b"mdia" and kind == b"hdlr"]
+    _need(any(parent == b"moov" and kind == b"mvhd" for parent, kind, _, _, _ in seen))
+    fragmented = b"moof" in top
+    handlers: dict[int, bytes] = {}
+    by_track: dict[int, list[tuple[bytes, bytes, int, int, int]]] = {}
+    for entry in seen:
+        parent, kind, payload, _, track = entry
+        by_track.setdefault(track, []).append(entry)
+        if parent == b"mdia" and kind == b"hdlr":
+            _need(track not in handlers)
+            handlers[track] = data[payload + 8 : payload + 12]
+    real = {handler for track, handler in handlers.items() if _mp4_track_ok(data, by_track[track], fragmented)}
     if audio:
-        _need(b"soun" in handlers and b"vide" not in handlers)
+        _need(b"soun" in real and b"vide" not in handlers.values())
     else:
-        _need(b"vide" in handlers)
+        _need(b"vide" in real)
     out = bytearray(data)
     for box_start, payload, box_end in zero:
         out[box_start + 4 : box_start + 8] = b"free"
         out[payload:box_end] = bytes(box_end - payload)
+    for blank_start, blank_end in blank:
+        out[blank_start:blank_end] = bytes(blank_end - blank_start)
     return bytes(out)
 
 
@@ -2460,7 +2779,7 @@ def _webm(data: bytes, budget: _Budget) -> bytes:
     if segment_end is None:
         segment_end = len(data)
     _need(segment_end == len(data))
-    tracks = 0
+    video = 0
     while pos < segment_end:
         budget.step()
         start = pos
@@ -2476,7 +2795,14 @@ def _webm(data: bytes, budget: _Budget) -> bytes:
             elif element == EBML_TRACKS:
                 entries = _ebml_children(data, payload, end, budget)
                 _need(all(child in (EBML_TRACK_ENTRY, EBML_VOID, EBML_CRC) for child, _, _, _ in entries))
-                tracks += sum(1 for child, _, _, _ in entries if child == EBML_TRACK_ENTRY)
+                for child, _, entry_payload, entry_end in entries:
+                    if child == EBML_TRACK_ENTRY:
+                        fields = _ebml_children(data, entry_payload, entry_end, budget)
+                        video += sum(
+                            1
+                            for field, _, value, field_end in fields
+                            if field == EBML_TRACK_TYPE and data[value:field_end] == b"\x01"
+                        )
             pos = end
             continue
         # A cluster's children are walked; a live recording writes clusters of unknown size, which
@@ -2493,7 +2819,8 @@ def _webm(data: bytes, budget: _Budget) -> bytes:
             if child == EBML_VOID:
                 blank.append((pos, block_end))
             pos = block_end
-    _need(tracks > 0)
+    # At least one video track (TrackType 1): an audio-only or subtitle-only file is not a video.
+    _need(video > 0)
     out = bytearray(data)
     for blank_start, blank_end in blank:
         out[blank_start:blank_end] = ebml_void(blank_end - blank_start)

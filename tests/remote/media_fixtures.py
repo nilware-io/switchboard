@@ -57,6 +57,11 @@ def jpeg(*extra: bytes, scan: bytes = b"\x12\x34\xff\x00\x56\xff\xd0\x78") -> by
     return b"\xff\xd8" + app0 + b"".join(extra) + dqt + sof + dht + sos + scan + b"\xff\xd9"
 
 
+def icc_profile(size: int = 128) -> bytes:
+    """A minimal ICC profile: its header holds its own size and the `acsp` signature."""
+    return struct.pack(">I", size) + bytes(32) + b"acsp" + bytes(size - 40)
+
+
 def exif_segment() -> bytes:
     return jpeg_segment(0xE1, b"Exif\x00\x00MM\x00\x2a\x00\x00\x00\x08" + GPS)
 
@@ -174,9 +179,20 @@ def hdlr(handler: bytes) -> bytes:
     return box(b"hdlr", bytes(8) + handler + bytes(12) + b"\x00")
 
 
+def stbl(samples: int = 1) -> bytes:
+    """A sample table: one sample description, `samples` samples of 16 bytes in one chunk."""
+    stsd = box(b"stsd", struct.pack(">II", 0, 1) + box(b"avc1", bytes(78)))
+    stts = box(b"stts", struct.pack(">IIII", 0, 1, samples, 1))
+    stsc = box(b"stsc", struct.pack(">IIIII", 0, 1, 1, samples, 1))
+    stsz = box(b"stsz", struct.pack(">III", 0, 16, samples))
+    stco = box(b"stco", struct.pack(">III", 0, 1, 0))
+    return box(b"stbl", stsd + stts + stsc + stsz + stco)
+
+
 def trak(handler: bytes, *, udta: bool = True) -> bytes:
-    """A track: tkhd, mdia (mdhd, hdlr, minf with an empty stbl), and a udta with a name."""
-    minf = box(b"minf", box(b"vmhd" if handler == b"vide" else b"smhd", bytes(12)) + box(b"stbl", b""))
+    """A track: tkhd, mdia (mdhd, hdlr, minf with a sample table), and a udta with a name."""
+    header = box(b"vmhd", bytes(12)) if handler == b"vide" else box(b"smhd", bytes(8))
+    minf = box(b"minf", header + stbl())
     mdia = box(b"mdia", box(b"mdhd", bytes(24)) + hdlr(handler) + minf)
     return box(b"trak", box(b"tkhd", bytes(84)) + mdia + (box(b"udta", box(b"name", GPS)) if udta else b""))
 
@@ -203,7 +219,8 @@ def ebml(element: bytes, data: bytes, *, unknown: bool = False) -> bytes:
 def webm(doctype: bytes = b"webm", *, live: bool = False, extra: bytes = b"") -> bytes:
     header = ebml(b"\x1a\x45\xdf\xa3", ebml(b"\x42\x86", b"\x01") + ebml(b"\x42\x82", doctype))
     info = ebml(b"\x15\x49\xa9\x66", ebml(b"\x2a\xd7\xb1", b"\x0f\x42\x40"))
-    tracks = ebml(b"\x16\x54\xae\x6b", ebml(b"\xae", ebml(b"\xd7", b"\x01") + ebml(b"\x86", b"V_VP8")))
+    entry = ebml(b"\xd7", b"\x01") + ebml(b"\x83", b"\x01") + ebml(b"\x86", b"V_VP8")
+    tracks = ebml(b"\x16\x54\xae\x6b", ebml(b"\xae", entry))
     cluster = ebml(
         b"\x1f\x43\xb6\x75", ebml(b"\xe7", b"\x00") + ebml(b"\xa3", b"\x81\x00\x00\x80" + bytes(16)), unknown=live
     )

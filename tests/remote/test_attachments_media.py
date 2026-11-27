@@ -28,6 +28,7 @@ from tests.remote.media_fixtures import (
     gif,
     gif_comment,
     hdlr,
+    icc_profile,
     jpeg,
     jpeg_segment,
     mp3,
@@ -36,7 +37,9 @@ from tests.remote.media_fixtures import (
     png,
     png_chunk,
     png_sized,
+    riff,
     riff_chunk,
+    stbl,
     trak,
     wav,
     webm,
@@ -325,7 +328,7 @@ def test_jpeg_keeps_only_known_segments() -> None:
     # APP0 that is not JFIF and APP14 that is not Adobe are dropped as well.
     assert d.media_check("x.jpg", jpeg(jpeg_segment(0xE0, html)))[2] == jpeg()
     assert d.media_check("x.jpg", jpeg(jpeg_segment(0xEE, html)))[2] == jpeg()
-    icc = jpeg_segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + bytes(16))
+    icc = jpeg_segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + icc_profile())
     adobe = jpeg_segment(0xEE, b"Adobe\x00\x64\x00\x00\x00\x00\x01")
     assert d.media_check("x.jpg", jpeg(icc, adobe))[2] == jpeg(icc, adobe)
     # Markers outside the standard set are refused.
@@ -371,7 +374,8 @@ def test_webm_needs_a_track_and_blanks_voids_tags_and_chapters() -> None:
     header = ebml(b"\x1a\x45\xdf\xa3", ebml(b"\x42\x82", b"webm"))
     empty_tracks = ebml_short(b"\x16\x54\xae\x6b", b"")
     assert refused("x.webm", header + ebml(b"\x18\x53\x80\x67", empty_tracks)) == "not_media"
-    tracks = ebml_short(b"\x16\x54\xae\x6b", ebml_short(b"\xae", ebml_short(b"\xd7", b"\x01")))
+    entry = ebml_short(b"\xd7", b"\x01") + ebml_short(b"\x83", b"\x01")
+    tracks = ebml_short(b"\x16\x54\xae\x6b", ebml_short(b"\xae", entry))
     void = ebml_short(b"\xec", SECRET)
     tags = ebml_short(b"\x12\x54\xc3\x67", GPS)
     chapters = ebml(b"\x10\x43\xa7\x70", GPS)
@@ -455,3 +459,183 @@ def test_large_valid_files_pass_fast() -> None:
         seconds, code = timed(name, data)
         assert code is None, name
         assert seconds < FAST_SECONDS, (name, seconds)
+
+
+# --- red team, round 2: allowlisted names carrying extra bytes ----------------------------------
+
+
+def png_before_iend(*chunks: bytes) -> bytes:
+    iend = png_chunk(b"IEND", b"")
+    return png()[: -len(iend)] + b"".join(chunks) + iend
+
+
+@pytest.mark.parametrize("kind", [k for k in d.PNG_KEEP if k not in (b"IHDR", b"IDAT", b"IEND")])
+def test_png_a_zip_in_any_kept_chunk_is_refused(kind: bytes) -> None:
+    # Round 1's polyglot with the private chunk renamed to an allowlisted one, last before IEND
+    # (the ZIP comment covers the CRC and IEND) or before the image data.
+    late = png_before_iend(png_chunk(kind, zip_of_secret(cover=16)))
+    assert zip_secret(late) == SECRET
+    assert refused("x.png", late) == "not_media"
+    assert refused("x.png", png(png_chunk(kind, zip_of_secret()))) == "not_media"
+
+
+def test_png_kept_chunks_need_their_lengths_and_places() -> None:
+    good = (
+        png_chunk(b"gAMA", struct.pack(">I", 45455)),
+        png_chunk(b"cHRM", struct.pack(">8I", 31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000)),
+        png_chunk(b"sRGB", b"\x00"),
+        png_chunk(b"sBIT", b"\x08\x08\x08"),
+        png_chunk(b"bKGD", bytes(6)),
+        png_chunk(b"tRNS", bytes(6)),
+        png_chunk(b"pHYs", struct.pack(">IIB", 2835, 2835, 1)),
+        png_chunk(b"iCCP", b"display\x00\x00" + zlib.compress(icc_profile())),
+    )
+    data = png(*good)
+    assert d.media_check("x.png", data)[2] == data
+    # Twice, after the image data, or not for this color type.
+    assert refused("x.png", png(good[0], good[0])) == "not_media"
+    assert refused("x.png", png_before_iend(good[0])) == "not_media"
+    assert refused("x.png", png(png_chunk(b"bKGD", bytes(2)))) == "not_media"
+    assert refused("x.png", png(png_chunk(b"tRNS", bytes(2)))) == "not_media"
+    assert refused("x.png", png(png_chunk(b"sRGB", b"\x09"))) == "not_media"
+    rgba = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    with_alpha = b"\x89PNG\r\n\x1a\n" + rgba + png_chunk(b"tRNS", bytes(6))
+    assert refused("x.png", with_alpha + png()[33:]) == "not_media"
+    gray = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+    assert refused("x.png", b"\x89PNG\r\n\x1a\n" + gray + png_chunk(b"PLTE", bytes(3)) + png()[33:]) == "not_media"
+    # An ICC profile with bytes after its zlib stream, or a stream that is not a profile.
+    icc = zlib.compress(icc_profile())
+    assert refused("x.png", png(png_chunk(b"iCCP", b"p\x00\x00" + icc + SECRET))) == "not_media"
+    assert refused("x.png", png(png_chunk(b"iCCP", b"p\x00\x00" + zlib.compress(SECRET)))) == "not_media"
+
+
+def test_wav_keeps_only_format_fact_and_data_at_their_sizes() -> None:
+    fmt = struct.pack("<HHIIHH", 1, 1, 8000, 16000, 2, 16)
+    data = riff_chunk(b"data", bytes(160))
+    for kind in (b"smpl", b"cue ", b"LIST", b"zzzz"):
+        sneaky = riff(b"WAVE", riff_chunk(b"fmt ", fmt), data, riff_chunk(kind, zip_of_secret()))
+        assert zip_secret(sneaky) == SECRET
+        _, _, clean = d.media_check("x.wav", sneaky)
+        assert clean == wav()
+        assert zip_secret(clean) is None
+    assert refused("x.wav", riff(b"WAVE", riff_chunk(b"fmt ", fmt + SECRET), data)) == "not_media"
+    assert refused("x.wav", riff(b"WAVE", riff_chunk(b"fmt ", fmt + b"\x00\x00" + SECRET), data)) == "not_media"
+    short = riff(b"WAVE", riff_chunk(b"fmt ", fmt + b"\x00\x00"), data)
+    assert d.media_check("x.wav", short)[2] == short
+    guid = struct.pack("<H", 1) + d.WAV_GUID_TAIL
+    extensible = struct.pack("<HHIIHHHHI", 0xFFFE, 2, 8000, 32000, 4, 16, 22, 16, 3) + guid
+    good = riff(b"WAVE", riff_chunk(b"fmt ", extensible), riff_chunk(b"fact", bytes(4)), data)
+    assert d.media_check("x.wav", good)[2] == good
+    bad_guid = extensible[:-14] + SECRET[:14]
+    assert refused("x.wav", riff(b"WAVE", riff_chunk(b"fmt ", bad_guid), data)) == "not_media"
+    long_fact = riff(b"WAVE", riff_chunk(b"fmt ", fmt), riff_chunk(b"fact", SECRET), data)
+    assert refused("x.wav", long_fact) == "not_media"
+    twice = riff(b"WAVE", riff_chunk(b"fmt ", fmt), data, riff_chunk(b"data", bytes(4)))
+    assert refused("x.wav", twice) == "not_media"
+    # The pad byte after an odd-sized chunk is zeroed.
+    odd = bytearray(riff(b"WAVE", riff_chunk(b"fmt ", fmt), riff_chunk(b"data", bytes(161))))
+    odd[-1] = 0x5A
+    assert d.media_check("x.wav", bytes(odd))[2][-1] == 0
+
+
+def mp4_with(
+    *, mvhd: bytes = bytes(100), tkhd: bytes = bytes(84), name: bytes = b"\x00", stbl_box: bytes = b""
+) -> bytes:
+    minf = box(b"minf", box(b"vmhd", bytes(12)) + (stbl_box or stbl()))
+    mdia = box(b"mdia", box(b"mdhd", bytes(24)) + box(b"hdlr", bytes(8) + b"vide" + bytes(12) + name) + minf)
+    moov = box(b"moov", box(b"mvhd", mvhd) + box(b"trak", box(b"tkhd", tkhd) + mdia))
+    return box(b"ftyp", b"isom\x00\x00\x02\x00isommp41") + moov + box(b"mdat", bytes(64))
+
+
+def test_mp4_leaf_boxes_need_their_sizes() -> None:
+    assert d.media_check("x.mp4", mp4_with())[0] == "video"
+    assert refused("x.mp4", mp4_with(mvhd=bytes(100) + SECRET)) == "not_media"
+    assert refused("x.mp4", mp4_with(tkhd=bytes(84) + SECRET)) == "not_media"
+    assert refused("x.mp4", mp4_with(mvhd=b"\x02" + bytes(99))) == "not_media"
+    # A handler name holding a ZIP, with moov after mdat so the ZIP ends the file.
+    ftyp = box(b"ftyp", b"isom\x00\x00\x02\x00isommp41")
+    late = mp4_with(name=zip_of_secret())
+    moov = late[len(ftyp) : -72]
+    late = ftyp + box(b"mdat", bytes(64)) + moov
+    assert zip_secret(late) == SECRET
+    _, _, clean = d.media_check("x.mp4", late)
+    assert zip_secret(clean) is None
+    assert SECRET not in clean
+    assert refused("x.mp4", mp4_with(name=bytes(d.MP4_HANDLER_NAME + 1))) == "not_media"
+    # A short name is kept in size but zeroed.
+    _, _, clean = d.media_check("x.mp4", mp4_with(name=GPS))
+    assert GPS not in clean
+    stts = box(b"stts", struct.pack(">II", 0, 0) + SECRET)
+    sample_table = stbl()
+    assert refused(
+        "x.mp4", mp4_with(stbl_box=sample_table.replace(box(b"stts", struct.pack(">IIII", 0, 1, 1, 1)), stts))
+    ) == ("not_media")
+
+
+def test_mp4_times_and_unneeded_boxes_are_zeroed() -> None:
+    dated = bytearray(mp4_with())
+    mvhd = dated.index(b"mvhd") + 4
+    dated[mvhd + 4 : mvhd + 12] = b"\x12\x34\x56\x78\x9a\xbc\xde\xf0"
+    _, _, clean = d.media_check("x.mp4", bytes(dated))
+    assert clean[mvhd + 4 : mvhd + 12] == bytes(8)
+    moov = box(b"moov", box(b"mvhd", bytes(100)) + box(b"iods", SECRET) + trak(b"vide", udta=False))
+    _, _, clean = d.media_check("x.mp4", box(b"ftyp", b"isom\x00\x00\x02\x00isommp41") + moov + box(b"mdat", bytes(64)))
+    assert SECRET not in clean
+
+
+def test_mp4_video_track_needs_real_sample_tables() -> None:
+    assert refused("x.mp4", mp4_with(stbl_box=box(b"stbl", b""))) == "not_media"
+    assert refused("x.mp4", mp4_with(stbl_box=stbl(samples=0))) == "not_media"
+    no_offsets = stbl().replace(box(b"stco", struct.pack(">III", 0, 1, 0)), b"")
+    assert refused("x.mp4", mp4_with(stbl_box=box(b"stbl", no_offsets[8:]))) == "not_media"
+
+
+def test_jpeg_kept_app_segments_carry_nothing_extra() -> None:
+    app0 = jpeg_segment(0xE0, b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00")
+    thumb = jpeg_segment(0xE0, b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x02\x02" + bytes(12) + SECRET)
+    assert d.media_check("x.jpg", jpeg().replace(app0, thumb))[2] == jpeg()
+    assert d.media_check("x.jpg", jpeg(jpeg_segment(0xE0, b"JFXX\x00\x10" + GPS)))[2] == jpeg()
+    assert d.media_check("x.jpg", jpeg(jpeg_segment(0xEE, b"Adobe<script>" + SECRET)))[2] == jpeg()
+    assert d.media_check("x.jpg", jpeg(jpeg_segment(0xE2, b"ICC_PROFILE\x00\x01\x01<script>" + SECRET)))[2] == jpeg()
+    # A profile in two parts is kept; a missing or extra part drops them all.
+    profile = icc_profile(300)
+    parts = [
+        jpeg_segment(0xE2, b"ICC_PROFILE\x00" + bytes([i + 1, 2]) + profile[i * 150 : (i + 1) * 150]) for i in range(2)
+    ]
+    assert d.media_check("x.jpg", jpeg(*parts))[2] == jpeg(*parts)
+    assert d.media_check("x.jpg", jpeg(parts[0]))[2] == jpeg()
+    assert d.media_check("x.jpg", jpeg(*parts, parts[1]))[2] == jpeg()
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        jpeg_segment(0xDB, b"\x00" + bytes(range(1, 65)) + SECRET),
+        jpeg_segment(0xC4, b"\x00\x01" + bytes(15) + b"\x00" + SECRET),
+        jpeg_segment(0xDD, b"\x00\x10" + SECRET),
+    ],
+)
+def test_jpeg_standard_segments_carry_nothing_extra(segment: bytes) -> None:
+    assert refused("x.jpg", jpeg(segment)) == "not_media"
+
+
+def test_gif_kept_extensions_carry_nothing_extra() -> None:
+    def blocks(payload: bytes) -> bytes:
+        return (
+            b"".join(bytes([len(payload[i : i + 255])]) + payload[i : i + 255] for i in range(0, len(payload), 255))
+            + b"\x00"
+        )
+
+    assert d.media_check("x.gif", gif(b"\x21\xf9" + blocks(bytes(4) + SECRET)))[2] == gif()
+    assert d.media_check("x.gif", gif(b"\x21\xff\x0bNETSCAPE2.0" + blocks(SECRET)))[2] == gif()
+    gce = b"\x21\xf9\x04\x00\x0a\x00\x00\x00"
+    loop = b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00"
+    assert d.media_check("x.gif", gif(loop, gce))[2] == gif(loop, gce)
+
+
+def test_webm_needs_a_video_track() -> None:
+    audio_only = webm().replace(
+        b"\x83\x01\x00\x00\x00\x00\x00\x00\x01\x01", b"\x83\x01\x00\x00\x00\x00\x00\x00\x01\x02"
+    )
+    assert audio_only != webm()
+    assert refused("x.webm", audio_only) == "not_media"
