@@ -58,7 +58,7 @@ FLAP_WINDOW_MS = 60_000
 FLAP_LIMIT = 3
 """More replacements of one machine than this within FLAP_WINDOW_MS log a warning."""
 HOUR_MS = 3_600_000
-READ_ONLY_VERBS = ("version", "list", "capture", "usage")
+READ_ONLY_VERBS = ("version", "list", "capture", "usage", "health")
 """Retried once on the new connection when the one they went out on was replaced."""
 SOCKET_DIR_MODE = 0o2750
 CONTROL_SOCKET_NAME = "agents-control.sock"
