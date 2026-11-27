@@ -498,6 +498,8 @@ class Confirmation:
     draft: str | None = None
     """For CLEAR: `dispatcher.draft_hash` of the draft the read-back quoted. The dispatcher clears
     only that draft."""
+    project: str | None = None
+    """The project folder of the pane's Claude Code session, for the timesheet's voice activity."""
 
 
 LookupProblem = Literal["unknown", "expired", "mismatch", "early"]
@@ -553,6 +555,7 @@ class ConfirmationStore:
         menu: str | None = None,
         size: tuple[int, int] | None = None,
         draft: str | None = None,
+        project: str | None = None,
     ) -> tuple[Confirmation, list[Confirmation]]:
         """The new confirmation and the ones of the same client it dropped (oldest first)."""
         self._expire()
@@ -590,6 +593,7 @@ class ConfirmationStore:
             menu=menu,
             size=size,
             draft=draft,
+            project=project,
         )
         self._items[new_id] = item
         return item, dropped

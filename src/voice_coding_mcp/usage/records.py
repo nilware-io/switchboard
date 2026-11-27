@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ..clock import parse_iso
-from ..remote.dispatcher import UUID_RE, usage_documents
+from ..remote.dispatcher import ENTRYPOINT_RE, USAGE_FILE_ID_RE, usage_documents
 
 MAX_TOKENS = 10**12
 MAX_TIME_MS = 10**14
@@ -48,6 +48,12 @@ class Record:
     cache_read: int = 0
     cost_usd: float | None = None
     """A cost already known (the summariser's `result` event), used instead of the price table."""
+    other_origin: bool = False
+    """A `u` line the owner did not type (a task notification, a compact summary), dispatcher 0.10.0."""
+    sidechain: bool = False
+    """An `a` line of a subagent inside a session's own transcript."""
+    project: str | None = None
+    """The work project of this line's `cwd` when it differs from the transcript's (0.10.0)."""
 
 
 @dataclass
@@ -59,6 +65,15 @@ class Transcript:
     skipped: bool = False
     """Larger than `usage.maxTranscriptMegabytes`: not read."""
     records: list[Record] = field(default_factory=list)
+    entrypoint: str | None = None
+    """How the session was started (`cli`, `sdk-cli` for `claude -p`, ...), dispatcher 0.10.0."""
+    work_project: str = ""
+    """The repository the latest `cwd` lies in, when it differs from `project` (0.10.0)."""
+
+    @property
+    def is_agent_file(self) -> bool:
+        """A subagent or workflow agent transcript (`<session id>:<agent id>`)."""
+        return ":" in self.id
 
 
 @dataclass
@@ -86,11 +101,20 @@ def record_from(data: object) -> Record:
         raise UsageStreamError("record is not an object")
     kind = data.get("k")
     t = _int(data.get("t"), MAX_TIME_MS)
+    project = _text(data.get("p"))
     if kind == "u":
-        return Record(t=t, kind="u")
+        origin = data.get("o")
+        if origin not in (None, "n"):
+            raise UsageStreamError("bad origin")
+        return Record(t=t, kind="u", other_origin=origin == "n", project=project)
     if kind != "a":
         raise UsageStreamError("bad record kind")
+    side = data.get("sc")
+    if side not in (None, 0, 1, True, False):
+        raise UsageStreamError("bad sidechain flag")
     return Record(
+        sidechain=bool(side),
+        project=project,
         t=t,
         kind="a",
         model=_text(data.get("m")),
@@ -105,7 +129,7 @@ def record_from(data: object) -> Record:
 
 
 def _file_id(value: object) -> str:
-    if not isinstance(value, str) or not UUID_RE.fullmatch(value):
+    if not isinstance(value, str) or not USAGE_FILE_ID_RE.fullmatch(value):
         raise UsageStreamError("bad file id")
     return value.lower()
 
@@ -155,6 +179,11 @@ def parse_documents(documents: Iterable[object]) -> UsageBatch:
             expected = 0
         else:
             current.project = _project(document.get("project", ""))
+            current.work_project = _project(document.get("wp", ""))
+            entrypoint = document.get("ep")
+            if entrypoint is not None and (not isinstance(entrypoint, str) or not ENTRYPOINT_RE.fullmatch(entrypoint)):
+                raise UsageStreamError("bad entrypoint")
+            current.entrypoint = entrypoint
             expected = _int(document.get("records"))
         batch.files.append(current)
     if not done:

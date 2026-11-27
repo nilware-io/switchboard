@@ -128,7 +128,7 @@ def test_version_lists_the_new_verbs(world: RemoteWorld) -> None:
     out = call(world, "version")
     assert "keys" in out["verbs"]
     assert "resize" in out["verbs"]
-    assert d.VERSION == "0.10.0"
+    assert d.VERSION == "0.11.0"
 
 
 # --- request validation ------------------------------------------------------------------------

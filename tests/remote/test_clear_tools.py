@@ -321,7 +321,7 @@ async def test_an_older_dispatcher_is_named_when_preparing(make: Make, monkeypat
         ("not_allowed", "Not cleared: switchboard-remote on dev does not allow sending."),
         (
             "bad_request",
-            "Not cleared: switchboard-remote on dev refused the request. If it is older than 0.10.0, update it there.",
+            "Not cleared: switchboard-remote on dev refused the request. If it is older than 0.11.0, update it there.",
         ),
     ],
 )

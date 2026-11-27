@@ -19,7 +19,9 @@ from ..json_file import ensure_dir
 from ..remote.dispatcher import MAX_USAGE_KNOWN_BYTES
 from .records import Record, Transcript, UsageBatch, UsageStreamError, record_from
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+"""2: dispatcher 0.10.0 fields (agent transcripts, entrypoint, work projects, origins); a version 1
+cache is read as empty, so the first refresh reads every transcript again."""
 RETENTION_DAYS = 400
 MAX_CACHE_BYTES = 512 * 1024 * 1024
 HUB = "local"
@@ -42,30 +44,45 @@ def cache_path(state_dir: str, machine: str) -> str:
     return os.path.join(usage_dir(state_dir), f"{machine}.json")
 
 
+def _trim(row: list[object]) -> list[object]:
+    """Trailing default values (None, 0, False) left out of a cached row."""
+    while row and (row[-1] is None or row[-1] is False or row[-1] == 0) and len(row) > 2:
+        row.pop()
+    return row
+
+
 def _record_row(record: Record) -> list[object]:
     if record.kind == "u":
-        return [record.t, "u"]
-    return [
-        record.t,
-        "a",
-        record.model,
-        record.msg_id,
-        record.req_id,
-        record.input,
-        record.output,
-        record.cache_write_5m,
-        record.cache_write_1h,
-        record.cache_read,
-    ]
+        return _trim([record.t, "u", "n" if record.other_origin else None, record.project])
+    return _trim(
+        [
+            record.t,
+            "a",
+            record.model,
+            record.msg_id,
+            record.req_id,
+            record.input,
+            record.output,
+            record.cache_write_5m,
+            record.cache_write_1h,
+            record.cache_read,
+            1 if record.sidechain else 0,
+            record.project,
+        ]
+    )
 
 
-_ROW_KEYS = ("t", "k", "m", "id", "rq", "in", "out", "cw5", "cw1", "cr")
+_ROW_KEYS = ("t", "k", "m", "id", "rq", "in", "out", "cw5", "cw1", "cr", "sc", "p")
+_PROMPT_ROW_KEYS = ("t", "k", "o", "p")
 
 
 def _record_of(row: object) -> Record:
-    if not isinstance(row, list) or len(row) > len(_ROW_KEYS):
+    if not isinstance(row, list) or len(row) < 2:
         raise UsageStreamError("bad cached record")
-    return record_from(dict(zip(_ROW_KEYS, row, strict=False)))
+    keys = _PROMPT_ROW_KEYS if row[1] == "u" else _ROW_KEYS
+    if len(row) > len(keys):
+        raise UsageStreamError("bad cached record")
+    return record_from({k: v for k, v in zip(keys, row, strict=False) if v is not None})
 
 
 def load_cache(state_dir: str, machine: str) -> MachineCache:
@@ -89,6 +106,9 @@ def load_cache(state_dir: str, machine: str) -> MachineCache:
             size, mtime, project = item.get("size"), item.get("mtime"), item.get("project", "")
             if not isinstance(size, int) or not isinstance(mtime, int) or not isinstance(project, str):
                 raise UsageStreamError("bad cached file")
+            entrypoint, work = item.get("ep"), item.get("wp", "")
+            if (entrypoint is not None and not isinstance(entrypoint, str)) or not isinstance(work, str):
+                raise UsageStreamError("bad cached file")
             transcript = Transcript(
                 id=str(item.get("id")),
                 size=size,
@@ -96,6 +116,8 @@ def load_cache(state_dir: str, machine: str) -> MachineCache:
                 project=project,
                 skipped=item.get("skipped") is True,
                 records=[_record_of(row) for row in item.get("records", [])],
+                entrypoint=entrypoint,
+                work_project=work,
             )
             files[transcript.id] = transcript
     except (UsageStreamError, TypeError):
@@ -121,6 +143,8 @@ def save_cache(state_dir: str, cache: MachineCache) -> None:
                 "project": t.project,
                 "skipped": t.skipped,
                 "records": [_record_row(r) for r in t.records],
+                **({"ep": t.entrypoint} if t.entrypoint else {}),
+                **({"wp": t.work_project} if t.work_project else {}),
             }
             for t in cache.files.values()
         ],

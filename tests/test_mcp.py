@@ -125,7 +125,7 @@ async def ctx(real_tmp: Path, request: pytest.FixtureRequest) -> AsyncIterator[C
 # --- tool list ------------------------------------------------------------------------------------
 
 
-async def test_has_the_twenty_one_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
+async def test_has_the_twenty_four_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
     tools = (await ctx.client.list_tools()).tools
     by_name = {t.name: t for t in tools}
     assert sorted(by_name) == [
@@ -149,6 +149,9 @@ async def test_has_the_twenty_one_tools_with_the_design_annotations_and_server_i
         "run_task",
         "run_tasks_parallel",
         "send_message_to_session",
+        "timesheet_approve",
+        "timesheet_approve_confirm",
+        "timesheet_summary",
         "usage_report",
     ]
 
@@ -169,15 +172,27 @@ async def test_has_the_twenty_one_tools_with_the_design_annotations_and_server_i
         "remote_resize",
         "remote_clear_input",
         "usage_report",
+        "timesheet_summary",
+        "timesheet_approve",
         "incidents",
     ]:
         assert annotations(name) == {"readOnlyHint": True}
+    assert annotations("timesheet_approve_confirm") == {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
     assert annotations("incident_note") == {
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False,
     }
+    approve = by_name["timesheet_approve"].input_schema
+    assert sorted(approve["properties"]) == ["period"], "the context parameter is not in the schema"
+    approve_confirm = by_name["timesheet_approve_confirm"].input_schema
+    assert approve_confirm.get("required") == ["confirmation_id"]
     assert annotations("remote_send_confirm") == {
         "readOnlyHint": False,
         "destructiveHint": False,
@@ -239,6 +254,7 @@ async def test_has_the_twenty_one_tools_with_the_design_annotations_and_server_i
         "call remote_send with the owner's words unchanged",
         "never in the same turn as remote_send",
         "Set risky_ok only when the owner explicitly confirmed",
+        "call timesheet_approve_confirm with that number only after the owner said yes in a later turn",
         "call incidents",
         "call incident_note",
     ]:
@@ -878,3 +894,17 @@ async def test_reports_the_latest_answer_of_a_task_continued_in_the_app(ctx: Ctx
     # The answer of another session is ignored.
     write_json(ctx.manager.session_answer_path(1), {"session_id": "x", "last_assistant_message": "cizí"})
     assert "cizí" not in await ctx.text("get_task_result", {"task_id": 1})
+
+
+# --- voice activity for the timesheet -------------------------------------------------------------
+
+
+async def test_tool_calls_are_recorded_as_voice_activity_without_text(ctx: Ctx) -> None:
+    await ctx.call("run_task", {"project": "alpha", "prompt": "secret words of the owner", "title": "Secret title"})
+    await ctx.call("list_projects")
+    path = Path(ctx.projects).parent / "state" / "timesheets" / "voice.jsonl"
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [(line["tool"], line["p"]) for line in lines] == [("run_task", "alpha-app"), ("list_projects", None)]
+    assert all(line["e"] >= line["t"] for line in lines)
+    assert "secret" not in path.read_text(encoding="utf-8").lower()

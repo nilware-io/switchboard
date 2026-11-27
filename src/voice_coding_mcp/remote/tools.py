@@ -28,6 +28,7 @@ from ..notify import TextSender
 from ..projects import MatchOk
 from ..sessions import claude_home_dir
 from ..tasks.manager import StartFailed, TaskManager, format_for_voice
+from ..timesheet.activity import attribute
 from ..usage.compute import PeriodError, parse_period
 from .agents import AgentHub
 from .attachments import (
@@ -606,6 +607,7 @@ class RemoteTools:
         if not isinstance(resolved, Resolved):
             return ToolAnswer(format_target_problem(name, resolved), True)
         pane = resolved.pane
+        attribute(pane.claude.cwd_name if pane.claude is not None else None)
         label = pane_label(name, pane, resolved.name_window)
         count = min(lines if lines is not None else self._remote.capture_lines, 500)
         captured = await self.inventory.capture(name, pane.pane_id, count, budget_seconds=deadline.left())
@@ -765,6 +767,7 @@ class RemoteTools:
         if not isinstance(resolved, Resolved):
             return refuse(format_target_problem(name, resolved), "target")
         pane = resolved.pane
+        attribute(pane.claude.cwd_name if pane.claude is not None else None)
         place = send_place(name, pane, resolved.name_window)
         claude = pane.claude
         if claude is None and not config.send_to_any_pane:
@@ -823,6 +826,7 @@ class RemoteTools:
             shell=claude is None,
         )
         item, dropped = self.confirmations.add(
+            project=pane.claude.cwd_name if pane.claude is not None else None,
             client=caller.fingerprint,
             client_name=caller.name,
             machine=name,
@@ -914,6 +918,7 @@ class RemoteTools:
         if not isinstance(resolved, Resolved):
             return refuse(format_target_problem(name, resolved), "target")
         pane = resolved.pane
+        attribute(pane.claude.cwd_name if pane.claude is not None else None)
         place = send_place(name, pane, resolved.name_window)
         claude = pane.claude
         if claude is None and not config.send_to_any_pane:
@@ -1054,6 +1059,7 @@ class RemoteTools:
             shell=claude is None,
         )
         item, dropped = self.confirmations.add(
+            project=pane.claude.cwd_name if pane.claude is not None else None,
             client=caller.fingerprint,
             client_name=caller.name,
             machine=name,
@@ -1134,6 +1140,7 @@ class RemoteTools:
         if not isinstance(resolved, Resolved):
             return refuse(format_target_problem(name, resolved), "target")
         pane = resolved.pane
+        attribute(pane.claude.cwd_name if pane.claude is not None else None)
         if pane.claude is None and not config.send_to_any_pane:
             return refuse(
                 f"{send_place(name, pane, resolved.name_window)} is not running Claude Code, so I will not resize it.",
@@ -1144,6 +1151,7 @@ class RemoteTools:
                 f"switchboard-remote on {name} is too old to resize windows. Update it there.", "old_dispatcher"
             )
         item, dropped = self.confirmations.add(
+            project=pane.claude.cwd_name if pane.claude is not None else None,
             client=caller.fingerprint,
             client_name=caller.name,
             machine=name,
@@ -1279,6 +1287,7 @@ class RemoteTools:
             permission_answer=False,
             kind=CLEAR,
             draft=hashed,
+            project=claude.cwd_name,
         )
         self._logger.info(
             "tool call",
@@ -1305,6 +1314,7 @@ class RemoteTools:
             self._logger.info("tool call", {"tool": "remote_send_confirm", "confirmation": key, "refused": found})
             return ToolAnswer(EARLY if found == "early" else EXPIRED, True)
         item = found
+        attribute(item.project)
         if item.risky and not risky_ok:
             self._logger.info(
                 "tool call", {"tool": "remote_send_confirm", "confirmation": key, "refused": "risky_not_confirmed"}
