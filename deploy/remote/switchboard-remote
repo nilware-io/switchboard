@@ -69,7 +69,7 @@ import threading
 import traceback
 import unicodedata
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import BinaryIO
 
 VERSION = "0.7.0"
@@ -1628,6 +1628,7 @@ MEDIA_FORMATS = {
     "mp4": ("video", "video/mp4"),
     "mov": ("video", "video/quicktime"),
     "webm": ("video", "video/webm"),
+    "mkv": ("video", "video/x-matroska"),
 }
 """Format: (kind, MIME type). Nothing else is media here: no SVG, HTML, PDF, text or archives."""
 MEDIA_EXTENSIONS = {
@@ -1647,6 +1648,7 @@ MEDIA_EXTENSIONS = {
     "m4v": "mp4",
     "mov": "mov",
     "webm": "webm",
+    "mkv": "mkv",
 }
 """Lower-case extension: the format its magic bytes must show."""
 ATTACHMENT_ERRORS = ("not_media", "too_large", "not_found", "changed", "bad_outbox")
@@ -1837,30 +1839,123 @@ EBML_HEADER = 0x1A45DFA3
 EBML_DOCTYPE = 0x4282
 EBML_HEADER_CHILDREN = (0x4286, 0x42F7, 0x42F2, 0x42F3, EBML_DOCTYPE, 0x4287, 0x4285)
 EBML_SEGMENT = 0x18538067
+EBML_SEEKHEAD = 0x114D9B74
+EBML_INFO = 0x1549A966
 EBML_CLUSTER = 0x1F43B675
 EBML_TRACKS = 0x1654AE6B
+EBML_CUES = 0x1C53BB6B
 EBML_TRACK_ENTRY = 0xAE
 EBML_TRACK_TYPE = 0x83
+EBML_CODEC_ID = 0x86
 EBML_VOID = 0xEC
 EBML_CRC = 0xBF
 EBML_TAGS = 0x1254C367
 EBML_CHAPTERS = 0x1043A770
+EBML_ATTACHMENTS = 0x1941A469
 EBML_LEVEL1 = (
-    0x114D9B74,
-    0x1549A966,
+    EBML_SEEKHEAD,
+    EBML_INFO,
     EBML_TRACKS,
     EBML_CLUSTER,
-    0x1C53BB6B,
+    EBML_CUES,
     EBML_CHAPTERS,
     EBML_TAGS,
     EBML_VOID,
     EBML_CRC,
 )
 """SeekHead, Info, Tracks, Cluster, Cues, Chapters, Tags, Void, CRC-32. Attachments (embedded
-files) are refused."""
+files) and every other top-level element are refused."""
 EBML_BLANK = (EBML_VOID, EBML_TAGS, EBML_CHAPTERS)
 """Replaced by a zeroed Void of the same size: padding, tags and chapter titles."""
+MATROSKA_DOCTYPES = {"webm": b"webm", "mkv": b"matroska"}
+"""The EBML DocType each extension needs: a `.webm` must say `webm`, a `.mkv` `matroska`."""
+WEBM_CODECS = frozenset((b"V_VP8", b"V_VP9", b"V_AV1", b"A_VORBIS", b"A_OPUS"))
+"""The codecs the WebM specification allows."""
+MATROSKA_CODECS = WEBM_CODECS | frozenset(
+    (
+        b"V_MPEG4/ISO/AVC",
+        b"V_MPEGH/ISO/HEVC",
+        b"A_AAC",
+        b"A_FLAC",
+        b"A_ALAC",
+        b"A_MPEG/L3",
+        b"A_AC3",
+        b"A_EAC3",
+        b"A_PCM/INT/LIT",
+        b"A_PCM/FLOAT/IEEE",
+    )
+)
+"""Matroska codec ids of real video and audio that recorders write: OBS (H.264 from x264, NVENC,
+QuickSync or AMF; HEVC and AV1; AAC, Opus, FLAC, ALAC or PCM audio), ffmpeg and phones. No
+subtitle, image or private (`V_MS/VFW/FOURCC`, `A_MS/ACM`) codecs: their tracks carry arbitrary
+bytes or text."""
+EBML_MAX_CODEC_PRIVATE = 64 * 1024
+"""Bytes of `CodecPrivate` per track (decoder setup: an H.264 `avcC` is under 100 bytes, Vorbis
+headers a few KB)."""
+EBML_LANGUAGE_RE = re.compile(rb"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8}){0,2}")
+"""A kept `Language` or `LanguageBCP47` value (at most 21 bytes); any other value is blanked."""
+_U = "uint"
+_F = "float"
+_B = "blank"
+_EBML_MASTERING = dict.fromkeys(range(0x55D1, 0x55DB), _F)
+_EBML_COLOUR: dict[int, object] = {**dict.fromkeys(range(0x55B1, 0x55BE), _U), 0x55D0: _EBML_MASTERING}
+_EBML_VIDEO: dict[int, object] = {
+    **dict.fromkeys(
+        (0x9A, 0x9D, 0x53B8, 0x53C0, 0xB0, 0xBA, 0x54AA, 0x54BB, 0x54CC, 0x54DD, 0x54B0, 0x54BA, 0x54B2, 0x54B3), _U
+    ),
+    0x55B0: _EBML_COLOUR,
+}
+"""Interlacing, stereo and alpha modes, pixel, crop and display sizes, aspect ratio, colour (with
+mastering metadata): numbers only. Projection (private bytes) is refused."""
+_EBML_AUDIO: dict[int, object] = {0xB5: _F, 0x78B5: _F, 0x9F: _U, 0x6264: _U, 0x52F1: _U}
+"""Sampling frequencies, channels, bit depth, emphasis. Channel positions (bytes) are refused."""
+_EBML_TRACK_ENTRY: dict[int, object] = {
+    **dict.fromkeys(
+        (0xD7, 0x73C5, EBML_TRACK_TYPE, 0xB9, 0x88, 0x55AA, 0x55AB, 0x55AC, 0x55AD, 0x55AE, 0x55AF, 0x9C),
+        _U,
+    ),
+    **dict.fromkeys((0x6DE7, 0x6DF8, 0x23E383, 0x234E7A, 0x55EE, 0x56AA, 0x56BB, 0xAA), _U),
+    0x23314F: _F,
+    EBML_CODEC_ID: "codec",
+    0x63A2: "private",
+    0x22B59C: "language",
+    0x22B59D: "language",
+    0x536E: _B,
+    0x258688: _B,
+    0xE0: _EBML_VIDEO,
+    0xE1: _EBML_AUDIO,
+}
+"""Track number, UID, type, flags, lacing, caches, default durations, timestamp scale, maximum block
+addition id, codec id, codec private data, codec delay, seek pre-roll, decode-all, language, video
+and audio settings. The track `Name` and `CodecName` (text) are blanked; content encodings
+(compression, encryption), attachment links, track operations, translations and block addition
+mappings are refused."""
+_EBML_INFO: dict[int, object] = {
+    0x2AD7B1: _U,
+    0x4489: _F,
+    **dict.fromkeys((0x73A4, 0x7384, 0x3CB923, 0x3C83AB, 0x3EB923, 0x3E83BB, 0x4444, 0x6924, 0x4461), _B),
+    **dict.fromkeys((0x7BA9, 0x4D80, 0x5741), _B),
+}
+"""Only the timestamp scale and the duration are kept. The title, muxing and writing application,
+date, segment file names and UIDs and chapter translations are blanked (text and identifiers)."""
+_EBML_SEEK: dict[int, object] = {0x53AB: "id", 0x53AC: _U}
+_EBML_CUE_REFERENCE: dict[int, object] = {0x96: _U}
+_EBML_CUE_POSITIONS: dict[int, object] = {
+    **dict.fromkeys((0xF7, 0xF1, 0xF0, 0xB2, 0x5378, 0xEA), _U),
+    0xDB: _EBML_CUE_REFERENCE,
+}
+_EBML_SCHEMA: dict[int, dict[int, object]] = {
+    EBML_SEEKHEAD: {0x4DBB: _EBML_SEEK},
+    EBML_INFO: _EBML_INFO,
+    EBML_TRACKS: {EBML_TRACK_ENTRY: _EBML_TRACK_ENTRY},
+    EBML_CUES: {0xBB: {0xB3: _U, 0xB7: _EBML_CUE_POSITIONS}},
+}
+"""The walked top-level elements: each child must be listed, masters are walked the same way, and
+every leaf has the length its type allows (`uint` at most 8 bytes, `float` 0, 4 or 8, a seek id 1 to
+4). Void and CRC-32 may appear in any of them."""
 EBML_CLUSTER_CHILDREN = (0xE7, 0xA7, 0xAB, 0xA3, 0xA0, 0xAF, 0x5854, EBML_VOID, EBML_CRC)
+"""Timestamp, Position, PrevSize, SimpleBlock, BlockGroup, EncryptedBlock, SilentTracks."""
+_EBML_CLUSTER_NUMBERS = (0xE7, 0xA7, 0xAB)
 MAX_MEDIA_ELEMENTS = 200_000
 """Chunks, boxes, elements, pages, frames or blocks one file may have: the walks are pure Python,
 so a file of millions of tiny elements would hold up the hub for seconds."""
@@ -1886,10 +1981,12 @@ class _NotMediaError(Exception):
 
 
 class _Budget:
-    """Counts the elements one media check visits (MAX_MEDIA_ELEMENTS)."""
+    """Counts the elements one media check visits: MAX_MEDIA_ELEMENTS, plus one per KiB of the
+    file (a long, low-bitrate video has more blocks than a short one; each element is at least
+    a few bytes, so the walk stays linear in the file size)."""
 
-    def __init__(self) -> None:
-        self.left = MAX_MEDIA_ELEMENTS
+    def __init__(self, size: int = 0) -> None:
+        self.left = MAX_MEDIA_ELEMENTS + size // 1024
 
     def step(self) -> None:
         self.left -= 1
@@ -2648,7 +2745,7 @@ def _mp4_track_ok(data: bytes, boxes: list[tuple[bytes, bytes, int, int, int]], 
     return fragmented or _be(data, sizes + 8, 4) > 0
 
 
-def _mp4(data: bytes, budget: _Budget, *, audio: bool) -> bytes:
+def _mp4(data: bytes, budget: _Budget, *, audio: bool) -> bytes | bytearray:
     """ISO BMFF (MP4, MOV, M4A): only known boxes in the walked containers, each walked box of the
     size its fields give, one `moov` with an `mvhd`, at least one track with a sound or video
     handler and real sample tables, media data present. With `audio` (M4A) every track handler
@@ -2683,14 +2780,14 @@ def _mp4(data: bytes, budget: _Budget, *, audio: bool) -> bytes:
         out[payload:box_end] = bytes(box_end - payload)
     for blank_start, blank_end in blank:
         out[blank_start:blank_end] = bytes(blank_end - blank_start)
-    return bytes(out)
+    return out
 
 
-def _m4a(data: bytes, budget: _Budget) -> bytes:
+def _m4a(data: bytes, budget: _Budget) -> bytes | bytearray:
     return _mp4(data, budget, audio=True)
 
 
-def _mp4_video(data: bytes, budget: _Budget) -> bytes:
+def _mp4_video(data: bytes, budget: _Budget) -> bytes | bytearray:
     return _mp4(data, budget, audio=False)
 
 
@@ -2756,44 +2853,122 @@ def ebml_void(size: int) -> bytes:
     )
 
 
-def _webm(data: bytes, budget: _Budget) -> bytes:
-    _need(_webm_doctype(data) == b"webm")
+class _EbmlWalk:
+    """What one Matroska walk found: the byte ranges to blank and every CRC-32 element (its value's
+    start, the start and end of the data it covers)."""
+
+    def __init__(self) -> None:
+        self.blank: list[tuple[int, int]] = []
+        self.crcs: list[tuple[int, int, int]] = []
+
+
+def _ebml_master(
+    data: bytes,
+    start: int,
+    end: int,
+    schema: dict[int, object],
+    *,
+    budget: _Budget,
+    walk: _EbmlWalk,
+    fields: dict[int, bytes] | None = None,
+) -> None:
+    """Walks one known-size master element's children by `schema` (see `_EBML_SCHEMA`); leaf values
+    the caller wants back (track type, codec id) go into `fields`."""
+    for child, child_start, payload, child_end in _ebml_children(data, start, end, budget):
+        size = child_end - payload
+        if child == EBML_VOID:
+            walk.blank.append((child_start, child_end))
+            continue
+        if child == EBML_CRC:
+            _need(size == 4)
+            walk.crcs.append((payload, child_end, end))
+            continue
+        rule = schema.get(child)
+        _need(rule is not None)
+        if isinstance(rule, dict):
+            _ebml_master(data, payload, child_end, rule, budget=budget, walk=walk)
+        elif rule == _U:
+            _need(size <= 8)
+        elif rule == _F:
+            _need(size in (0, 4, 8))
+        elif rule == "id":
+            _need(1 <= size <= 4)
+        elif rule == "private":
+            _need(size <= EBML_MAX_CODEC_PRIVATE)
+        elif rule == "language":
+            if not EBML_LANGUAGE_RE.fullmatch(data[payload:child_end].rstrip(b"\x00")):
+                walk.blank.append((child_start, child_end))
+        elif rule == "codec":
+            _need(size <= 32)
+        else:
+            walk.blank.append((child_start, child_end))
+        if fields is not None and child in (EBML_TRACK_TYPE, EBML_CODEC_ID):
+            _need(child not in fields)
+            fields[child] = data[payload:child_end].rstrip(b"\x00")
+
+
+def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
+    """WebM and Matroska: the EBML header with the DocType the extension needs, one Segment to the
+    end of the file, only the allowlisted top-level elements, every walked element of its specified
+    length (`_EBML_SCHEMA`), every cluster's children, only video and audio tracks with allowlisted
+    codecs, at least one video track. Text (titles, names, applications, dates), tags, chapters and
+    padding become zeroed Void elements of the same size; CRC-32 elements over a blanked range are
+    recomputed."""
+    _need(_webm_doctype(data) == MATROSKA_DOCTYPES[expected])
+    codecs = WEBM_CODECS if expected == "webm" else MATROSKA_CODECS
     _, header_start, header_end = _ebml(data, 0, len(data))
     assert header_end is not None
-    blank: list[tuple[int, int]] = []
+    walk = _EbmlWalk()
     for child, child_start, _, child_end in _ebml_children(data, header_start, header_end, budget):
         _need(child in EBML_HEADER_CHILDREN or child in (EBML_VOID, EBML_CRC))
         if child == EBML_VOID:
-            blank.append((child_start, child_end))
+            walk.blank.append((child_start, child_end))
     element, pos, segment_end = _ebml(data, header_end, len(data))
     _need(element == EBML_SEGMENT)
     if segment_end is None:
         segment_end = len(data)
     _need(segment_end == len(data))
     video = 0
+    once: set[int] = set()
     while pos < segment_end:
         budget.step()
         start = pos
         element, payload, end = _ebml(data, pos, segment_end)
         _need(element in EBML_LEVEL1)
+        if element in (EBML_INFO, EBML_TRACKS):
+            _need(element not in once)
+            once.add(element)
         if element != EBML_CLUSTER:
             _need(end is not None)
             assert end is not None
             if element in EBML_BLANK:
-                blank.append((start, end))
+                walk.blank.append((start, end))
             elif element == EBML_CRC:
                 _need(end - payload == 4)
+                walk.crcs.append((payload, end, segment_end))
             elif element == EBML_TRACKS:
-                entries = _ebml_children(data, payload, end, budget)
-                _need(all(child in (EBML_TRACK_ENTRY, EBML_VOID, EBML_CRC) for child, _, _, _ in entries))
-                for child, _, entry_payload, entry_end in entries:
-                    if child == EBML_TRACK_ENTRY:
-                        fields = _ebml_children(data, entry_payload, entry_end, budget)
-                        video += sum(
-                            1
-                            for field, _, value, field_end in fields
-                            if field == EBML_TRACK_TYPE and data[value:field_end] == b"\x01"
-                        )
+                for child, child_start, entry_payload, entry_end in _ebml_children(data, payload, end, budget):
+                    if child == EBML_VOID:
+                        walk.blank.append((child_start, entry_end))
+                        continue
+                    if child == EBML_CRC:
+                        _need(entry_end - entry_payload == 4)
+                        walk.crcs.append((entry_payload, entry_end, end))
+                        continue
+                    _need(child == EBML_TRACK_ENTRY)
+                    fields: dict[int, bytes] = {}
+                    _ebml_master(
+                        data, entry_payload, entry_end, _EBML_TRACK_ENTRY, budget=budget, walk=walk, fields=fields
+                    )
+                    # Only video (1) and audio (2) tracks, with a codec of their kind: subtitle,
+                    # button, complex and metadata tracks carry text or arbitrary bytes.
+                    track_type, codec = fields.get(EBML_TRACK_TYPE), fields.get(EBML_CODEC_ID)
+                    _need(track_type in (b"\x01", b"\x02") and codec in codecs)
+                    assert codec is not None
+                    _need(codec.startswith(b"V_" if track_type == b"\x01" else b"A_"))
+                    video += track_type == b"\x01"
+            else:
+                _ebml_master(data, payload, end, _EBML_SCHEMA[element], budget=budget, walk=walk)
             pos = end
             continue
         # A cluster's children are walked; a live recording writes clusters of unknown size, which
@@ -2802,23 +2977,43 @@ def _webm(data: bytes, budget: _Budget) -> bytes:
         stop = segment_end if end is None else end
         while pos < stop:
             budget.step()
-            child, _, block_end = _ebml(data, pos, stop)
+            child, child_payload, block_end = _ebml(data, pos, stop)
             if end is None and child in EBML_LEVEL1:
                 break
             _need(child in EBML_CLUSTER_CHILDREN and block_end is not None)
             assert block_end is not None
             if child == EBML_VOID:
-                blank.append((pos, block_end))
+                walk.blank.append((pos, block_end))
+            elif child == EBML_CRC:
+                _need(block_end - child_payload == 4)
+                walk.crcs.append((child_payload, block_end, stop))
+            elif child in _EBML_CLUSTER_NUMBERS:
+                _need(block_end - child_payload <= 8)
             pos = block_end
-    # At least one video track (TrackType 1): an audio-only or subtitle-only file is not a video.
+    # At least one video track (TrackType 1): an audio-only file is not a video.
     _need(video > 0)
+    if not walk.blank:
+        return data
     out = bytearray(data)
-    for blank_start, blank_end in blank:
+    for blank_start, blank_end in walk.blank:
         out[blank_start:blank_end] = ebml_void(blank_end - blank_start)
-    return bytes(out)
+    view = memoryview(out)
+    for value, covered_start, covered_end in walk.crcs:
+        if any(a < covered_end and b > covered_start for a, b in walk.blank):
+            out[value : value + 4] = zlib.crc32(view[covered_start:covered_end]).to_bytes(4, "little")
+    view.release()
+    return out
 
 
-_MEDIA_VALIDATORS = {
+def _webm(data: bytes, budget: _Budget) -> bytes | bytearray:
+    return _matroska(data, budget, "webm")
+
+
+def _mkv(data: bytes, budget: _Budget) -> bytes | bytearray:
+    return _matroska(data, budget, "mkv")
+
+
+_MEDIA_VALIDATORS: dict[str, Callable[[bytes, _Budget], bytes | bytearray]] = {
     "png": _png,
     "jpeg": _jpeg,
     "gif": _gif,
@@ -2831,6 +3026,7 @@ _MEDIA_VALIDATORS = {
     "mp4": _mp4_video,
     "mov": _mp4_video,
     "webm": _webm,
+    "mkv": _mkv,
 }
 
 
@@ -2854,7 +3050,8 @@ def sniff_media(head: bytes) -> str | None:
     if head[4:8] == b"ftyp":
         return _mp4_format(head)
     if head[:4] == b"\x1a\x45\xdf\xa3":
-        return "webm" if _webm_doctype(head) == b"webm" else None
+        doctype = _webm_doctype(head)
+        return next((name for name, value in MATROSKA_DOCTYPES.items() if value == doctype), None)
     return None
 
 
@@ -2872,19 +3069,24 @@ def expected_format(name: str) -> str | None:
     return MEDIA_EXTENSIONS.get(name.rsplit(".", 1)[1].lower())
 
 
-def media_check(name: str, data: bytes) -> tuple[str, str, bytes]:
+def media_check(name: str, data: bytes | bytearray) -> tuple[str, str, bytes | bytearray]:
     """(kind, MIME type, the bytes to send) of a whole media file, or RefusedError `not_media`
     (wrong extension, magic bytes that disagree with it, not a whole file of that format, anything
     after the container's end, too many elements) or `too_large`. Metadata and unknown chunks are
-    dropped (allowlists) where that is cheap and safe."""
+    dropped (allowlists) where that is cheap and safe. The cleaned copy is `data` itself when
+    nothing changed, else one new buffer (a bytearray for the large formats, so a 250 MB video
+    needs at most twice its size in memory)."""
     expected = expected_format(name)
-    if expected is None or not data or not sniff_agrees(data[:SNIFF_BYTES], expected):
+    if expected is None or not data or not sniff_agrees(bytes(data[:SNIFF_BYTES]), expected):
         raise RefusedError("not_media")
     kind, mime = MEDIA_FORMATS[expected]
     if len(data) > ATTACHMENT_CAPS[kind]:
         raise RefusedError("too_large")
+    if isinstance(data, bytearray):
+        # A cleaned copy checked again (the walks hash slices, so they need bytes).
+        data = bytes(data)
     try:
-        cleaned = _MEDIA_VALIDATORS[expected](data, _Budget())
+        cleaned = _MEDIA_VALIDATORS[expected](data, _Budget(len(data)))
     except (_NotMediaError, IndexError, ValueError, zlib.error):
         raise RefusedError("not_media") from None
     return kind, mime, cleaned
@@ -3011,7 +3213,10 @@ def verb_attachment(
     if data is None:
         raise RefusedError("changed")
     kind, mime, cleaned = media_check(name, data)
-    chunks = [cleaned[i : i + ATTACHMENT_CHUNK_BYTES] for i in range(0, len(cleaned), ATTACHMENT_CHUNK_BYTES)]
+    # The file as read is not needed any more: with the cleaned copy that bounds this side to about
+    # twice the file's size (250 MB video: about 500 MB at the peak, then 250 MB while it streams).
+    del data
+    count = -(-len(cleaned) // ATTACHMENT_CHUNK_BYTES)
     header: dict[str, object] = {
         "stream": "attachment",
         "name": name,
@@ -3020,11 +3225,13 @@ def verb_attachment(
         "size": len(cleaned),
         "mtime": int(info.st_mtime * 1000),
         "sha256": hashlib.sha256(cleaned).hexdigest(),
-        "chunks": len(chunks),
+        "chunks": count,
     }
 
     def documents() -> Iterator[dict[str, object]]:
-        for index, chunk in enumerate(chunks):
+        view = memoryview(cleaned)
+        for index in range(count):
+            chunk = view[index * ATTACHMENT_CHUNK_BYTES : (index + 1) * ATTACHMENT_CHUNK_BYTES]
             yield {"chunk": index, "data": base64.b64encode(chunk).decode("ascii")}
         yield {"done": True}
 

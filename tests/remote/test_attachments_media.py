@@ -3,15 +3,20 @@ and a walk of the whole container, with metadata stripped where that is cheap an
 
 from __future__ import annotations
 
+import shutil
 import struct
+import subprocess
 import time
 import zlib
+from pathlib import Path
 
 import pytest
 
 from tests.remote.media_fixtures import (
     GPS,
     HTML,
+    MKV_TITLE,
+    MKV_TRACK_NAME,
     NOT_MEDIA,
     SECRET,
     SVG,
@@ -22,6 +27,7 @@ from tests.remote.media_fixtures import (
     crc_bitwise,
     ebml,
     ebml_short,
+    el,
     exif_segment,
     flac,
     flac_block,
@@ -31,6 +37,9 @@ from tests.remote.media_fixtures import (
     icc_profile,
     jpeg,
     jpeg_segment,
+    mkv,
+    mkv_audio_entry,
+    mkv_video_entry,
     mp3,
     mp4,
     ogg,
@@ -51,7 +60,7 @@ from tests.remote.media_fixtures import (
 from voice_coding_mcp.remote import dispatcher as d
 
 
-def refused(name: str, data: bytes) -> str:
+def refused(name: str, data: bytes | bytearray) -> str:
     with pytest.raises(d.RefusedError) as caught:
         d.media_check(name, data)
     return caught.value.code
@@ -198,8 +207,12 @@ def test_size_caps_per_kind() -> None:
     big = png(png_chunk(b"zzZz", bytes(d.ATTACHMENT_CAPS["image"])))
     assert refused("shot.png", big) == "too_large"
     assert d.media_check("shot.png", png(png_chunk(b"zzZz", bytes(d.ATTACHMENT_CAPS["image"] - 200))))
-    video = mp4(mdat=bytes(d.ATTACHMENT_CAPS["video"]))
+    # 250,000,001 bytes: refused on the length alone, before any walk (and before any copy).
+    video = bytearray(d.ATTACHMENT_CAPS["video"] + 1)
+    video[:64] = mp4()[:64]
     assert refused("clip.mp4", video) == "too_large"
+    video[: len(mkv())] = mkv()
+    assert refused("movie.mkv", video) == "too_large"
     assert refused("take.wav", wav() + bytes(d.ATTACHMENT_CAPS["audio"])) == "too_large"
     # An image as base64 stays within the 5 MB the Claude API accepts per image.
     assert 4 * -(-d.ATTACHMENT_CAPS["image"] // 3) <= 5_000_000
@@ -373,7 +386,7 @@ def test_webm_needs_a_track_and_blanks_voids_tags_and_chapters() -> None:
     header = ebml(b"\x1a\x45\xdf\xa3", ebml(b"\x42\x82", b"webm"))
     empty_tracks = ebml_short(b"\x16\x54\xae\x6b", b"")
     assert refused("x.webm", header + ebml(b"\x18\x53\x80\x67", empty_tracks)) == "not_media"
-    entry = ebml_short(b"\xd7", b"\x01") + ebml_short(b"\x83", b"\x01")
+    entry = ebml_short(b"\xd7", b"\x01") + ebml_short(b"\x83", b"\x01") + ebml_short(b"\x86", b"V_VP9")
     tracks = ebml_short(b"\x16\x54\xae\x6b", ebml_short(b"\xae", entry))
     void = ebml_short(b"\xec", SECRET)
     tags = ebml_short(b"\x12\x54\xc3\x67", GPS)
@@ -417,13 +430,17 @@ def timed(name: str, data: bytes) -> tuple[float, str | None]:
     return time.monotonic() - started, code
 
 
+VIDEO_SAMPLE = 16 * 1024 * 1024
+"""Video size of the tiny-element cases: the element budget, not the 250 MB cap, bounds them."""
+
+
 def test_millions_of_tiny_elements_are_refused_fast() -> None:
     doctype = ebml(b"\x1a\x45\xdf\xa3", ebml(b"\x42\x82", b"webm"))
     tracks = ebml_short(b"\x16\x54\xae\x6b", ebml_short(b"\xae", b""))
-    voids = b"\xec\x80" * ((d.ATTACHMENT_CAPS["video"] - 100) // 2)
+    voids = b"\xec\x80" * ((VIDEO_SAMPLE - 100) // 2)
     cases = {
         "x.webm": doctype + b"\x18\x53\x80\x67\x01\xff\xff\xff\xff\xff\xff\xff" + tracks + voids,
-        "x.mp4": FTYP + MOOV + MDAT + box(b"free", b"") * ((d.ATTACHMENT_CAPS["video"] - 1000) // 8),
+        "x.mp4": FTYP + MOOV + MDAT + box(b"free", b"") * ((VIDEO_SAMPLE - 1000) // 8),
         "x.wav": wav(*([riff_chunk(b"abcd", b"")] * ((d.ATTACHMENT_CAPS["audio"] - 1000) // 8))),
         "x.gif": gif()[:-1][:-6] + b"\x02" + b"\x01\x00" * 1_800_000 + b"\x00\x3b",
         "x.mp3": (b"\xff\xf3\x10\xc4" + bytes(22)) * ((d.ATTACHMENT_CAPS["audio"] - 1000) // 26),
@@ -654,3 +671,159 @@ def test_only_simple_webp_is_accepted() -> None:
     assert refused("pic.webp", webp(riff_chunk(b"ICCP", zip_bytes))) == "not_media"
     _, _, clean = d.media_check("pic.webp", webp())
     assert clean == webp()
+
+
+# --- Matroska (.mkv, OBS's default) ------------------------------------------------------------
+
+
+def test_an_obs_mkv_passes_with_its_text_blanked() -> None:
+    data = mkv()
+    kind, mime, clean = d.media_check("movie.mkv", data)
+    assert (kind, mime) == ("video", "video/x-matroska")
+    assert len(clean) == len(data)
+    for text in (MKV_TITLE, MKV_TRACK_NAME, b"Lavf60.16.100", b"OBS Studio", b"ENCODER", b"secret"):
+        assert text not in clean, text
+    # What playback needs stays: codecs, their private data, the language, sizes, the blocks.
+    for kept in (b"V_MPEG4/ISO/AVC", b"A_AAC", b"\x67\x64\x00\x1f", b"und", b"eng", b"\x0f\x42\x40"):
+        assert kept in clean, kept
+    assert d.media_check("movie.mkv", clean)[2] == clean
+    live = mkv(live=True)
+    assert MKV_TITLE not in d.media_check("live.mkv", live)[2]
+
+
+def test_extension_and_doctype_must_agree() -> None:
+    assert refused("movie.webm", mkv()) == "not_media"
+    assert refused("movie.mkv", webm()) == "not_media"
+    assert refused("movie.mkv", mkv(b"matroskb")) == "not_media"
+    # A WebM DocType allows only the WebM codecs.
+    assert refused("movie.webm", mkv(b"webm")) == "not_media"
+    vp9 = mkv(b"webm", entries=mkv_video_entry(codec=b"V_VP9") + mkv_audio_entry(codec=b"A_OPUS"))
+    assert d.media_check("movie.webm", vp9)[0] == "video"
+
+
+SUBTITLE = el(0xAE, el(0xD7, b"\x03") + el(0x83, b"\x11") + el(0x86, b"S_TEXT/UTF8") + el(0x63A2, b"hello secret"))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # An Attachments element: whole files inside the video.
+        mkv(extra=el(0x1941A469, el(0x61A7, el(0x466E, b"secret.env") + el(0x465C, SECRET)))),
+        # Subtitle, button, complex and metadata tracks.
+        mkv(entries=mkv_video_entry() + SUBTITLE),
+        mkv(entries=mkv_video_entry() + mkv_video_entry(codec=b"B_VOBBTN", track_type=0x12)),
+        mkv(entries=mkv_video_entry() + mkv_video_entry(codec=b"V_MPEG4/ISO/AVC", track_type=0x03)),
+        mkv(entries=mkv_video_entry() + mkv_video_entry(codec=b"M_DATA", track_type=0x21)),
+        # Codecs outside the allowlist, or of the other kind.
+        mkv(entries=mkv_video_entry(codec=b"V_MS/VFW/FOURCC")),
+        mkv(entries=mkv_video_entry() + mkv_audio_entry(codec=b"A_MS/ACM")),
+        mkv(entries=mkv_video_entry(codec=b"A_AAC")),
+        mkv(entries=mkv_video_entry() + mkv_audio_entry(codec=b"V_VP9")),
+        # No codec id, two track types.
+        mkv(entries=el(0xAE, el(0xD7, b"\x01") + el(0x83, b"\x01"))),
+        mkv(entries=mkv_video_entry(el(0x83, b"\x01"))),
+        # Audio only is not a video.
+        mkv(entries=mkv_audio_entry()),
+        # Unknown elements in a walked master.
+        mkv(info=el(0x7E8A, SECRET)),
+        mkv(entries=mkv_video_entry(el(0x6D80, el(0x6240, SECRET)))),
+        mkv(entries=mkv_video_entry(el(0xE0, el(0x7670, el(0x7672, SECRET))))),
+        mkv(entries=mkv_video_entry(el(0x7446, b"\x01"))),
+        # Lengths: numbers longer than 8 bytes, floats of 5, a seek id of 5, private data over 64 KiB.
+        mkv(info=el(0x2AD7B1, SECRET[:9])),
+        mkv(info=el(0x4489, SECRET[:5])),
+        mkv(extra=el(0x114D9B74, el(0x4DBB, el(0x53AB, b"\x15\x49\xa9\x66\x00")))),
+        mkv(entries=mkv_video_entry(el(0x63A2, bytes(64 * 1024 + 1)))),
+        mkv(cluster=el(0xE7, SECRET[:9])),
+        mkv(extra=el(0x1C53BB6B, el(0xBB, el(0xB3, SECRET[:9])))),
+        # Unknown top-level and cluster elements.
+        mkv(extra=el(0x1B538667, SECRET)),
+        mkv(cluster=el(0xE7, b"\x00") + el(0xEE, SECRET)),
+        # Data after the Segment, and a Segment longer than the file.
+        mkv() + HTML,
+        mkv() + ZIP,
+        mkv()[:-1],
+    ],
+)
+def test_mkv_refusals(data: bytes) -> None:
+    assert refused("movie.mkv", data) == "not_media"
+
+
+def test_mkv_size_fields_past_the_end_are_refused() -> None:
+    data = bytearray(mkv())
+    # The Tracks element claims more bytes than its Segment holds.
+    tracks = data.index(b"\x16\x54\xae\x6b")
+    data[tracks + 4 : tracks + 12] = b"\x01" + (len(data)).to_bytes(7, "big")
+    assert refused("movie.mkv", bytes(data)) == "not_media"
+
+
+def test_mkv_tags_chapters_and_long_languages_are_blanked() -> None:
+    chapters = el(0x1043A770, el(0x45B9, el(0xB6, el(0x80, el(0x85, b"Secret chapter")))))
+    long_language = el(0x22B59C, b"en" + SECRET)
+    bcp47 = el(0x22B59D, b"en-US")
+    data = mkv(extra=chapters, entries=mkv_video_entry(long_language, bcp47) + mkv_audio_entry())
+    clean = d.media_check("movie.mkv", data)[2]
+    assert b"Secret chapter" not in clean
+    assert SECRET not in clean
+    assert b"en-US" in clean
+    assert len(clean) == len(data)
+
+
+def test_mkv_crc32_is_recomputed_over_blanked_text() -> None:
+    data = mkv(crc=b"\x00\x00\x00\x00")
+    clean = d.media_check("movie.mkv", data)[2]
+    info = bytes(clean).index(b"\x15\x49\xa9\x66\x01")
+    size = int.from_bytes(clean[info + 5 : info + 12], "big")
+    crc_value = info + 12 + 9
+    covered = clean[crc_value + 4 : info + 12 + size]
+    assert clean[crc_value : crc_value + 4] == zlib.crc32(covered).to_bytes(4, "little")
+    assert MKV_TITLE not in clean
+    assert refused("movie.mkv", mkv(crc=b"\x00" * 5)) == "not_media"
+    # One Info and one Tracks element.
+    assert refused("movie.mkv", mkv(extra=el(0x1549A966, el(0x2AD7B1, b"\x0f\x42\x40")))) == "not_media"
+    assert refused("movie.mkv", mkv(extra=el(0x1654AE6B, mkv_video_entry()))) == "not_media"
+
+
+def test_the_element_budget_grows_with_the_file() -> None:
+    assert d._Budget().left == d.MAX_MEDIA_ELEMENTS
+    assert d._Budget(250_000_000).left == d.MAX_MEDIA_ELEMENTS + 250_000_000 // 1024
+
+
+FFMPEG = shutil.which("ffmpeg")
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="ffmpeg is not installed")
+@pytest.mark.parametrize(
+    ("name", "codecs"),
+    [
+        ("obs.mkv", ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]),
+        ("flac.mkv", ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "flac"]),
+        ("clip.webm", ["-c:v", "libvpx-vp9", "-c:a", "libopus"]),
+    ],
+)
+def test_a_real_recording_passes_and_still_plays(tmp_path: Path, name: str, codecs: list[str]) -> None:
+    """A real recording made by ffmpeg (the muxer OBS uses for MKV): accepted, its title and the
+    muxing application gone, and the cleaned copy still decodes from start to end."""
+    assert FFMPEG is not None
+    source = tmp_path / name
+    lavfi = ["-f", "lavfi", "-i", "testsrc=size=160x120:rate=30", "-f", "lavfi", "-i", "sine=sample_rate=48000"]
+    command = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", *lavfi, "-t", "1", *codecs]
+    command += ["-metadata", "title=Secret title", "-metadata:s:v:0", "title=Secret camera", str(source)]
+    made = subprocess.run(command, capture_output=True, check=False, timeout=60)
+    if made.returncode != 0:
+        pytest.skip(f"this ffmpeg cannot write {name}")
+    data = source.read_bytes()
+    assert b"Secret title" in data
+    _, _, clean = d.media_check(name, data)
+    assert b"Secret" not in clean
+    assert b"Lavf" not in clean
+    cleaned = tmp_path / f"clean-{name}"
+    cleaned.write_bytes(clean)
+    decoded = subprocess.run(
+        [FFMPEG, "-nostdin", "-v", "error", "-xerror", "-i", str(cleaned), "-f", "null", "-"],
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert decoded.returncode == 0, decoded.stderr
+    assert decoded.stderr == b""

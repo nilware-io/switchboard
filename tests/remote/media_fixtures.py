@@ -234,6 +234,95 @@ def webm(doctype: bytes = b"webm", *, live: bool = False, extra: bytes = b"") ->
     return header + ebml(b"\x18\x53\x80\x67", info + tracks + extra + cluster, unknown=live)
 
 
+def el(element: int, data: bytes) -> bytes:
+    """An EBML element by its numeric id, with an 8-byte size."""
+    return ebml(element.to_bytes((element.bit_length() + 7) // 8, "big"), data)
+
+
+MKV_TITLE = b"Secret meeting with the bank"
+MKV_TRACK_NAME = b"Front camera of the flat"
+
+
+def mkv_video_entry(*extra: bytes, codec: bytes = b"V_MPEG4/ISO/AVC", track_type: int = 1) -> bytes:
+    """An H.264 video track entry as OBS (through its ffmpeg muxer) writes it."""
+    avcc = b"\x01\x64\x00\x1f\xff\xe1\x00\x04\x67\x64\x00\x1f\x01\x00\x04\x68\xeb\xe3\xcb"
+    video = el(0xB0, b"\x07\x80") + el(0xBA, b"\x04\x38") + el(0x55B0, el(0x55B1, b"\x01") + el(0x55BB, b"\x01"))
+    return el(
+        0xAE,
+        el(0xD7, b"\x01")
+        + el(0x73C5, bytes(range(1, 9)))
+        + el(0x9C, b"\x00")
+        + el(0x22B59C, b"und")
+        + el(0x86, codec)
+        + el(0x63A2, avcc)
+        + el(0x83, bytes([track_type]))
+        + el(0x23E383, (16_666_667).to_bytes(4, "big"))
+        + el(0x536E, MKV_TRACK_NAME)
+        + el(0xE0, video)
+        + b"".join(extra),
+    )
+
+
+def mkv_audio_entry(*extra: bytes, codec: bytes = b"A_AAC") -> bytes:
+    audio = el(0xB5, struct.pack(">d", 48000.0)) + el(0x9F, b"\x02") + el(0x6264, b"\x10")
+    return el(
+        0xAE,
+        el(0xD7, b"\x02")
+        + el(0x73C5, bytes(range(9, 17)))
+        + el(0x86, codec)
+        + el(0x63A2, b"\x11\x90")
+        + el(0x83, b"\x02")
+        + el(0x22B59C, b"eng")
+        + el(0xE1, audio)
+        + b"".join(extra),
+    )
+
+
+def mkv(
+    doctype: bytes = b"matroska",
+    *,
+    info: bytes = b"",
+    entries: bytes | None = None,
+    extra: bytes = b"",
+    live: bool = False,
+    cluster: bytes | None = None,
+    crc: bytes | None = None,
+) -> bytes:
+    """A short recording shaped like OBS's MKV output (H.264 and AAC, ffmpeg's muxer): SeekHead,
+    Info with muxing and writing application and a title, two tracks, tags, a cluster and cues."""
+    header = el(
+        0x1A45DFA3,
+        el(0x4286, b"\x01")
+        + el(0x42F7, b"\x01")
+        + el(0x42F2, b"\x04")
+        + el(0x42F3, b"\x08")
+        + el(0x4282, doctype)
+        + el(0x4287, b"\x04")
+        + el(0x4285, b"\x02"),
+    )
+    seek = el(0x114D9B74, el(0x4DBB, el(0x53AB, b"\x15\x49\xa9\x66") + el(0x53AC, b"\x40")))
+    segment_info = el(
+        0x1549A966,
+        (b"" if crc is None else el(0xBF, crc))
+        + el(0x2AD7B1, b"\x0f\x42\x40")
+        + el(0x4D80, b"Lavf60.16.100")
+        + el(0x5741, b"OBS Studio 30.2.3")
+        + el(0x7BA9, MKV_TITLE)
+        + el(0x4461, bytes(8))
+        + el(0x4489, struct.pack(">d", 2000.0))
+        + info,
+    )
+    tracks = el(0x1654AE6B, mkv_video_entry() + mkv_audio_entry() if entries is None else entries)
+    tags = el(0x1254C367, el(0x7373, el(0x67C8, el(0x45A3, b"ENCODER") + el(0x4487, b"Lavf60 secret"))))
+    blocks = el(0xE7, b"\x00") + el(0xA3, b"\x81\x00\x00\x80" + bytes(32)) + el(0xA3, b"\x82\x00\x00\x80" + bytes(8))
+    body = ebml(b"\x1f\x43\xb6\x75", blocks if cluster is None else cluster, unknown=live)
+    cues = el(0x1C53BB6B, el(0xBB, el(0xB3, b"\x00") + el(0xB7, el(0xF7, b"\x01") + el(0xF1, b"\x01\x00"))))
+    segment = seek + segment_info + tracks + tags + extra + body
+    if not live:
+        segment += cues
+    return header + ebml(b"\x18\x53\x80\x67", segment, unknown=live)
+
+
 VALID: dict[str, tuple[str, str, bytes]] = {
     "shot.png": ("image", "image/png", png()),
     "photo.jpg": ("image", "image/jpeg", jpeg()),
@@ -250,6 +339,9 @@ VALID: dict[str, tuple[str, str, bytes]] = {
     "clip.mov": ("video", "video/quicktime", mp4(b"qt  ")),
     "clip.webm": ("video", "video/webm", webm()),
     "live.webm": ("video", "video/webm", webm(live=True)),
+    "movie.mkv": ("video", "video/x-matroska", mkv()),
+    "live.mkv": ("video", "video/x-matroska", mkv(live=True)),
+    "vp9.mkv": ("video", "video/x-matroska", webm(b"matroska")),
 }
 """File name: (kind, MIME type, bytes) of every allowed format."""
 
@@ -270,8 +362,9 @@ NOT_MEDIA: dict[str, bytes] = {
     "bundle.mp4": ZIP,
     "tool.elf": b"\x7fELF\x02\x01\x01" + bytes(57),
     "tool.webm": b"\x7fELF\x02\x01\x01" + bytes(57),
-    "movie.mkv": webm(b"matroska"),
     "movie.webm": webm(b"matroska"),
+    "obs.webm": mkv(b"webm"),
+    "clip.mkv": webm(),
     "video.ogg": ogg(b"\x80theora" + bytes(34)),
     "film.mp4": mp4(b"3gp4"),
     "empty.png": b"",
@@ -298,10 +391,10 @@ def zip_of_secret(*, cover: int = 0) -> bytes:
     return bytes(data)
 
 
-def zip_secret(data: bytes) -> bytes | None:
+def zip_secret(data: bytes | bytearray) -> bytes | None:
     """`.env` from a ZIP anywhere in `data` (as a ZIP reader finds it from the end), else None."""
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        with zipfile.ZipFile(io.BytesIO(bytes(data))) as archive:
             return archive.read(".env")
     except (zipfile.BadZipFile, KeyError, OSError, ValueError):
         return None

@@ -66,7 +66,8 @@ class Media:
     name: str
     kind: str
     mime: str
-    data: bytes
+    data: bytes | bytearray
+    """The hub's own cleaned copy (`media_check`)."""
 
 
 def size_words(size: int) -> str:

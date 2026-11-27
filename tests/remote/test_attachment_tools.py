@@ -332,7 +332,7 @@ async def test_one_fetch_at_a_time(tmp_path: Path) -> None:
 
 async def test_the_hub_check_runs_off_the_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A slow check (a crafted file) must not stop the event loop: other coroutines keep running.
-    def slow_check(name: str, data: bytes) -> tuple[str, str, bytes]:
+    def slow_check(name: str, data: bytes) -> tuple[str, str, bytes | bytearray]:
         time.sleep(0.5)
         return d.media_check(name, data)
 
