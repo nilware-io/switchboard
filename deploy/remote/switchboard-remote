@@ -1917,8 +1917,29 @@ bytes or text."""
 EBML_MAX_CODEC_PRIVATE = 64 * 1024
 """Bytes of `CodecPrivate` per track (decoder setup: an H.264 `avcC` is under 100 bytes, Vorbis
 headers a few KB)."""
+EBML_RESYNC_IDS = (
+    b"\x1a\x45\xdf\xa3",
+    b"\x18\x53\x80\x67",
+    b"\x11\x4d\x9b\x74",
+    b"\x15\x49\xa9\x66",
+    b"\x16\x54\xae\x6b",
+    b"\x1f\x43\xb6\x75",
+    b"\x1c\x53\xbb\x6b",
+    b"\x19\x41\xa4\x69",
+    b"\x10\x43\xa7\x70",
+    b"\x12\x54\xc3\x67",
+)
+"""The EBML header, Segment and level-1 ids (SeekHead, Info, Tracks, Cluster, Cues, Attachments,
+Chapters, Tags). When an element fails to parse while a demuxer reads the header, libavformat
+resyncs: it scans forward byte by byte for one of these ids and parses what it finds as a top-level
+element, so an Attachments element hidden in opaque bytes (CodecPrivate) would be read. None may
+appear in a CodecPrivate value, nor anywhere before the first Cluster of the cleaned copy other
+than at the start of a walked top-level element."""
 EBML_LANGUAGE_RE = re.compile(rb"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8}){0,2}")
-"""A kept `Language` or `LanguageBCP47` value (at most 21 bytes); any other value is blanked."""
+EBML_MAX_LANGUAGE = 32
+"""A kept `Language` or `LanguageBCP47` element: at most 32 bytes, holding a tag of at most 21
+characters (`EBML_LANGUAGE_RE`) and NUL padding; any other value is blanked (a Void has no length
+limit in a demuxer, a 16 MiB string makes libavformat fail and resync)."""
 _U = "uint"
 _F = "float"
 _B = "blank"
@@ -2922,6 +2943,7 @@ class _EbmlWalk:
         self.blank: list[tuple[int, int]] = []
         self.crcs: list[tuple[int, int, int]] = []
         self.positions: list[tuple[int, int, int, int]] = []
+        self.ids: set[int] = set()
 
 
 def _ebml_master(
@@ -2960,10 +2982,14 @@ def _ebml_master(
             _need(size in (0, 4, 8))
         elif rule == "id":
             _need(1 <= size <= 4)
+            walk.ids.add(payload)
         elif rule == "private":
             _need(size <= EBML_MAX_CODEC_PRIVATE)
+            value = data[payload:child_end]
+            _need(not any(resync_id in value for resync_id in EBML_RESYNC_IDS))
         elif rule == "language":
-            if not EBML_LANGUAGE_RE.fullmatch(data[payload:child_end].rstrip(b"\x00")):
+            value = data[payload:child_end]
+            if size > EBML_MAX_LANGUAGE or not EBML_LANGUAGE_RE.fullmatch(value.rstrip(b"\x00")):
                 walk.blank.append((child_start, child_end))
         elif rule == "codec":
             _need(size <= 32)
@@ -3144,7 +3170,11 @@ def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
     # At least one video track (TrackType 1): an audio-only file is not a video.
     _need(video > 0)
     _ebml_pointers(walk, level1, clusters, blocks)
+    header_end_at = segment + clusters[0][0] if clusters[0] else segment_end
+    # A SeekID names a top-level element by its id; the pointer check holds it to walked elements.
+    starts = {segment + offset for offset in level1[0]} | walk.ids
     if not walk.blank:
+        _ebml_no_resync_target(data, segment, header_end_at, starts)
         return data
     out = bytearray(data)
     for blank_start, blank_end in walk.blank:
@@ -3155,7 +3185,20 @@ def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
         if any(a < covered_end and b > covered_start for a, b in walk.blank):
             out[value : value + 4] = zlib.crc32(view[covered_start:covered_end]).to_bytes(4, "little")
     view.release()
+    _ebml_no_resync_target(out, segment, header_end_at, starts)
     return out
+
+
+def _ebml_no_resync_target(data: bytes | bytearray, start: int, end: int, starts: set[int]) -> None:
+    """No top-level id between the Segment's payload and the first Cluster other than at the start
+    of a walked top-level element or as a SeekID value (`EBML_RESYNC_IDS`): whatever a demuxer's
+    error resync finds there is one of the elements the walk checked. Checked on the cleaned copy,
+    after CRCs are recomputed."""
+    for resync_id in EBML_RESYNC_IDS:
+        found = data.find(resync_id, start, end)
+        while found >= 0:
+            _need(found in starts)
+            found = data.find(resync_id, found + 1, end)
 
 
 def _webm(data: bytes, budget: _Budget) -> bytes | bytearray:

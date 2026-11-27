@@ -870,6 +870,98 @@ def test_the_hidden_attachment_is_what_ffprobe_would_have_read(tmp_path: Path) -
     assert "evil.html" in probed.stdout
 
 
+# --- Matroska parser resync (red-team review, round 3) -------------------------------------------
+
+AVCC = b"\x01\x64\x00\x1f\xff\xe1\x00\x04\x67\x64\x00\x1f\x01\x00\x04\x68\xeb\xe3\xcb"
+RESYNC_PAD = 0x1000001
+"""NUL padding that takes a Language element past libavformat's 16 MiB string limit."""
+
+
+def resync_mkv(private: bytes, language: bytes) -> bytes:
+    """Tracks: an H.264 track with `private` as CodecPrivate, an AAC track, and a second H.264 track
+    whose Language is `language`. A Language over 16 MiB makes libavformat fail while it parses
+    Tracks; it then resyncs, scanning byte by byte for a top-level id, and lands in CodecPrivate."""
+
+    def video(private: bytes, language: bytes) -> bytes:
+        settings = el(0xB0, b"\x07\x80") + el(0xBA, b"\x04\x38")
+        return el(
+            0xAE,
+            el(0xD7, b"\x01")
+            + el(0x73C5, bytes(range(1, 9)))
+            + el(0x86, b"V_MPEG4/ISO/AVC")
+            + el(0x83, b"\x01")
+            + el(0x63A2, private)
+            + el(0xE0, settings)
+            + el(0x22B59C, language),
+        )
+
+    tracks = el(0x1654AE6B, video(private, b"und") + mkv_audio_entry() + video(AVCC, language))
+    cluster = el(0x1F43B675, el(0xE7, b"\x00") + el(0xA3, b"\x81\x00\x00\x80" + bytes(16)))
+    return MKV_HEADER + el(0x18538067, MKV_INFO + tracks + cluster)
+
+
+def ffprobe_attachments(path: Path) -> list[str]:
+    assert FFPROBE is not None
+    probed = subprocess.run(
+        [FFPROBE, "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    return [line for line in probed.stdout.split() if line == "attachment"]
+
+
+def test_an_attachments_element_in_codec_private_is_refused() -> None:
+    padded = b"en" + bytes(RESYNC_PAD)
+    assert refused("movie.mkv", resync_mkv(AVCC + HIDDEN_ATTACHMENT, padded)) == "not_media"
+    # Without the trigger as well: CodecPrivate is opaque and reachable through any later resync.
+    assert refused("movie.mkv", resync_mkv(AVCC + HIDDEN_ATTACHMENT, b"en")) == "not_media"
+    # Every top-level id, also the EBML header and the Segment, anywhere in the value.
+    for resync_id in d.EBML_RESYNC_IDS:
+        assert refused("movie.mkv", resync_mkv(AVCC + b"\x00" + resync_id + b"\x80", b"en")) == "not_media"
+    assert d.media_check("movie.mkv", resync_mkv(AVCC, b"en"))[0] == "video"
+
+
+def test_an_oversized_language_is_blanked_not_kept() -> None:
+    """The trigger: a Language over 16 MiB (a valid tag and NULs) is blanked into a Void, which a
+    demuxer skips without a length limit, so nothing kept before the first Cluster fails to parse."""
+    clean = bytes(d.media_check("movie.mkv", resync_mkv(AVCC, b"en" + bytes(RESYNC_PAD)))[2])
+    # The two short languages (und, eng) stay; the padded one is gone.
+    assert clean.count(b"\x22\xb5\x9c") == 2
+    # The bound: 32 bytes are kept, 33 are blanked.
+    kept = bytes(d.media_check("movie.mkv", resync_mkv(AVCC, b"en" + bytes(30)))[2])
+    assert el(0x22B59C, b"en" + bytes(30)) in kept
+    blanked = bytes(d.media_check("movie.mkv", resync_mkv(AVCC, b"en" + bytes(31)))[2])
+    assert el(0x22B59C, b"en" + bytes(31)) not in blanked
+
+
+def test_a_top_level_id_before_the_first_cluster_is_refused() -> None:
+    """Defense in depth: any opaque run before the first Cluster (here a TrackUID) that holds a
+    top-level id is refused, wherever the walk lets bytes through unchanged."""
+    for resync_id in (b"\x19\x41\xa4\x69", b"\x12\x54\xc3\x67", b"\x16\x54\xae\x6b"):
+        uid = el(0x73C5, resync_id + b"\x00\x00\x00\x01")
+        entry = el(0xAE, el(0xD7, b"\x03") + uid + el(0x86, b"A_OPUS") + el(0x83, b"\x02"))
+        data = mkv(entries=mkv_video_entry() + entry)
+        assert refused("movie.mkv", data) == "not_media"
+        # The same track with another UID passes: only the id in the opaque bytes is refused.
+        other = el(0x73C5, b"\x01" + resync_id[1:] + b"\x00\x00\x00\x01")
+        entry = el(0xAE, el(0xD7, b"\x03") + other + el(0x86, b"A_OPUS") + el(0x83, b"\x02"))
+        assert d.media_check("movie.mkv", mkv(entries=mkv_video_entry() + entry))[0] == "video"
+
+
+@pytest.mark.skipif(FFPROBE is None, reason="ffprobe is not installed")
+def test_the_resync_attack_is_real_and_the_cleaned_copy_has_no_attachment(tmp_path: Path) -> None:
+    """ffprobe on the attack file (as the walk accepted it before this check) shows the hidden file
+    as an attachment stream; the cleaned copy of the trigger alone has none."""
+    attack = tmp_path / "attack.mkv"
+    attack.write_bytes(resync_mkv(AVCC + HIDDEN_ATTACHMENT, b"en" + bytes(RESYNC_PAD)))
+    assert ffprobe_attachments(attack) == ["attachment"]
+    clean = tmp_path / "clean.mkv"
+    clean.write_bytes(d.media_check("movie.mkv", resync_mkv(AVCC, b"en" + bytes(RESYNC_PAD)))[2])
+    assert ffprobe_attachments(clean) == []
+
+
 def test_seek_entries_must_name_the_element_at_their_offset() -> None:
     data = mkv()
     seek = bytes(data).index(b"\x53\xac\x01")
