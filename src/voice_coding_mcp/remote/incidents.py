@@ -50,7 +50,18 @@ HUB = "hub"
 """The machine name of incidents of the hub itself (never a configured machine: `local` is reserved
 and `hub` is checked in `check_remote`)."""
 Component = Literal[
-    "agent_link", "dispatcher", "tmux", "transport", "relay", "summariser", "tool", "hub", "machine_health", "other"
+    "agent_link",
+    "dispatcher",
+    "tmux",
+    "transport",
+    "relay",
+    "summariser",
+    "tool",
+    "hub",
+    "machine_health",
+    "other",
+    "session",
+    "notify",
 ]
 COMPONENTS: tuple[str, ...] = (
     "agent_link",
@@ -63,9 +74,16 @@ COMPONENTS: tuple[str, ...] = (
     "hub",
     "machine_health",
     "other",
+    "session",
+    "notify",
 )
-Source = Literal["auto", "owner", "cli"]
-SOURCES: tuple[str, ...] = ("auto", "owner", "cli")
+Source = Literal["auto", "owner", "cli", "session"]
+SOURCES: tuple[str, ...] = ("auto", "owner", "cli", "session")
+"""`session`: an event a machine's session hooks reported (`remote/events.py`), its texts the
+session's own words, cleaned and redacted."""
+ENTRIES = ("incident", "event")
+"""An `event` line records something that happened (a session finished, asked, opened a pull
+request) and is not an incident: the incidents tool and the CLI's default list leave it out."""
 CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,47}")
 ID_RE = re.compile(r"[0-9a-f]{8}")
 MAX_WHAT = 200
@@ -139,6 +157,8 @@ class Incident:
     effect: str = ""
     recovery: str = ""
     count: int = 1
+    entry: str = "incident"
+    """`incident` or `event` (ENTRIES); written only for events, so older lines read as incidents."""
     # In memory only:
     last_ms: int = 0
     """When the failure was last seen."""
@@ -172,6 +192,8 @@ class Incident:
             "count": self.count,
             "source": self.source,
         }
+        if self.entry != "incident":
+            out["entry"] = self.entry
         return out
 
     @classmethod
@@ -190,6 +212,9 @@ class Incident:
         if not (isinstance(machine, str) and (machine == HUB or MACHINE_NAME_RE.fullmatch(machine))):
             return None
         if component not in COMPONENTS or source not in SOURCES:
+            return None
+        entry = data.get("entry", "incident")
+        if entry not in ENTRIES:
             return None
         if not (isinstance(code, str) and CODE_RE.fullmatch(code)):
             return None
@@ -219,8 +244,13 @@ class Incident:
             start_ms=start,
             end_ms=end,
             count=count if isinstance(count, int) and not isinstance(count, bool) and count >= 1 else 1,
+            entry=str(entry),
             last_ms=end if end is not None else start,
         )
+
+    @property
+    def is_event(self) -> bool:
+        return self.entry == "event"
 
 
 def new_id() -> str:
@@ -371,6 +401,24 @@ def owner_incident(
         start_ms=start_ms,
         end_ms=end_ms,
         last_ms=end_ms if end_ms is not None else start_ms,
+    )
+
+
+def event_entry(*, machine: str, code: str, what: str, why: str, at_ms: int) -> Incident:
+    """A session event for the log (`entry: event`, closed at once): `what` is the hub's own words,
+    `why` may quote the session's words (cleaned and redacted here)."""
+    return Incident(
+        id=new_id(),
+        machine=machine,
+        component="session",
+        code=code,
+        what=clean_text(what, MAX_WHAT),
+        why=clean_text(why, MAX_WHY),
+        source="session",
+        start_ms=at_ms,
+        end_ms=at_ms,
+        last_ms=at_ms,
+        entry="event",
     )
 
 

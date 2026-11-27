@@ -27,7 +27,15 @@ from pydantic.alias_generators import to_camel
 from .json_file import loads_json
 from .projects import is_inside
 from .remote.audit import audit_size_warning
-from .remote.config import IncidentsConfig, RemoteConfig, WatchConfig, check_remote, remote_warnings
+from .remote.config import (
+    DiscordConfig,
+    EventsConfig,
+    IncidentsConfig,
+    RemoteConfig,
+    WatchConfig,
+    check_remote,
+    remote_warnings,
+)
 from .urls import is_loopback_ip, parse_url
 from .usage.config import UsageConfig
 
@@ -254,6 +262,8 @@ class _ConfigFile(_Section):
     watch: WatchConfig = Field(default_factory=WatchConfig)
     usage: UsageConfig = Field(default_factory=UsageConfig)
     incidents: IncidentsConfig = Field(default_factory=IncidentsConfig)
+    events: EventsConfig = Field(default_factory=EventsConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
 
 
 @dataclass(frozen=True)
@@ -287,6 +297,10 @@ class Config:
     """Switchboard usage accounting: idle gap, hourly rate, prices (docs/SWITCHBOARD.md)."""
     incidents: IncidentsConfig = field(default_factory=IncidentsConfig)
     """The Switchboard incident log and machine health polls (docs/SWITCHBOARD.md)."""
+    events: EventsConfig = field(default_factory=EventsConfig)
+    """Session events from the machines' hooks (docs/SWITCHBOARD.md, "Session hooks")."""
+    discord: DiscordConfig = field(default_factory=DiscordConfig)
+    """Posts to the owner's Discord webhook (docs/SWITCHBOARD.md, "Discord notifications")."""
 
 
 # --- checks ----------------------------------------------------------------------------------
@@ -372,8 +386,8 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
     remote_problems = check_remote(
         parsed.remote, allow_non_loopback=parsed.listen.allow_non_loopback, state_dir=parsed.state_dir
     )
-    if parsed.watch.interval_seconds > 0 and parsed.notify.url is None:
-        remote_problems.append("watch.intervalSeconds: the watcher needs notify.url")
+    if parsed.watch.interval_seconds > 0 and parsed.notify.url is None and not parsed.discord.enabled:
+        remote_problems.append("watch.intervalSeconds: the watcher needs notify.url or discord.enabled")
     if parsed.incidents.notify and parsed.notify.url is None:
         remote_problems.append("incidents.notify: needs notify.url")
     if remote_problems:
@@ -402,6 +416,8 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
         watch=parsed.watch,
         usage=parsed.usage,
         incidents=parsed.incidents,
+        events=parsed.events,
+        discord=parsed.discord,
     )
 
 

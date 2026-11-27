@@ -43,6 +43,7 @@ from .idle_close import IdleCloser
 from .log import Logger, fingerprint, strip_query
 from .mcp import McpServerOptions, build_remote_control, create_mcp_server
 from .notify import TextSender
+from .remote.discord import DiscordNotifier, combine
 from .remote.tools import RemoteTools, RemoteToolsOptions
 from .remote.watcher import Watcher, WatcherOptions
 from .tasks.manager import TaskManager
@@ -78,6 +79,10 @@ class CreateAppOptions:
     watcher stays off."""
     remote_tools: RemoteTools | None = None
     """Default: built from the config."""
+    discord: DiscordNotifier | None = None
+    """Posts to the owner's Discord channel (closed with the app's lifespan)."""
+    discord_problem: str | None = None
+    """Why Discord is off although `discord.enabled` is on (an incident at start)."""
 
 
 def _json_rpc_error(status: int, code: int, message: str, headers: dict[str, str] | None = None) -> Response:
@@ -308,19 +313,31 @@ def create_app(options: CreateAppOptions) -> Starlette:
         logger=options.logger.child({"component": "idle-close"}),
     )
     remote_tools = options.remote_tools or RemoteTools(
-        RemoteToolsOptions(config=config, manager=options.manager, logger=options.logger)
+        RemoteToolsOptions(
+            config=config,
+            manager=options.manager,
+            logger=options.logger,
+            notify=options.send_text,
+            discord=options.discord,
+            discord_problem=options.discord_problem,
+        )
+    )
+    discord = options.discord
+    # One notify path: the watcher's pushes go to notify.url and, when configured, to Discord.
+    watch_send = combine(
+        options.send_text, discord.send_watch if discord is not None and discord.wants("watch") else None
     )
     watcher = (
         Watcher(
             WatcherOptions(
                 watch=config.watch,
                 check=remote_tools.collect_pending,
-                send=options.send_text,
+                send=watch_send,
                 state_dir=config.state_dir,
                 logger=options.logger.child({"component": "watch"}),
             )
         )
-        if config.watch.interval_seconds > 0 and options.send_text is not None
+        if config.watch.interval_seconds > 0 and watch_send is not None
         else None
     )
     server = create_mcp_server(
@@ -355,6 +372,8 @@ def create_app(options: CreateAppOptions) -> Starlette:
                 await idle_close.stop()
                 await remote_tools.stop()
                 await remote.aclose()
+                if discord is not None:
+                    await discord.aclose()
 
     return Starlette(
         lifespan=lifespan,
