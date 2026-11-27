@@ -492,6 +492,8 @@ class Confirmation:
     (None: no menu was on the screen). The dispatcher presses the keys only on that screen."""
     size: tuple[int, int] | None = None
     """For RESIZE: (columns, rows)."""
+    project: str | None = None
+    """The project folder of the pane's Claude Code session, for the timesheet's voice activity."""
 
 
 LookupProblem = Literal["unknown", "expired", "mismatch", "early"]
@@ -546,6 +548,7 @@ class ConfirmationStore:
         keys: Sequence[str] = (),
         menu: str | None = None,
         size: tuple[int, int] | None = None,
+        project: str | None = None,
     ) -> tuple[Confirmation, list[Confirmation]]:
         """The new confirmation and the ones of the same client it dropped (oldest first)."""
         self._expire()
@@ -582,6 +585,7 @@ class ConfirmationStore:
             keys=tuple(keys),
             menu=menu,
             size=size,
+            project=project,
         )
         self._items[new_id] = item
         return item, dropped
