@@ -300,7 +300,6 @@ def mkv(
         + el(0x4287, b"\x04")
         + el(0x4285, b"\x02"),
     )
-    seek = el(0x114D9B74, el(0x4DBB, el(0x53AB, b"\x15\x49\xa9\x66") + el(0x53AC, b"\x40")))
     segment_info = el(
         0x1549A966,
         (b"" if crc is None else el(0xBF, crc))
@@ -314,13 +313,39 @@ def mkv(
     )
     tracks = el(0x1654AE6B, mkv_video_entry() + mkv_audio_entry() if entries is None else entries)
     tags = el(0x1254C367, el(0x7373, el(0x67C8, el(0x45A3, b"ENCODER") + el(0x4487, b"Lavf60 secret"))))
-    blocks = el(0xE7, b"\x00") + el(0xA3, b"\x81\x00\x00\x80" + bytes(32)) + el(0xA3, b"\x82\x00\x00\x80" + bytes(8))
+    timestamp = el(0xE7, b"\x00")
+    blocks = timestamp + el(0xA3, b"\x81\x00\x00\x80" + bytes(32)) + el(0xA3, b"\x82\x00\x00\x80" + bytes(8))
     body = ebml(b"\x1f\x43\xb6\x75", blocks if cluster is None else cluster, unknown=live)
-    cues = el(0x1C53BB6B, el(0xBB, el(0xB3, b"\x00") + el(0xB7, el(0xF7, b"\x01") + el(0xF1, b"\x01\x00"))))
+    # Every pointer is real, as ffmpeg writes them: the SeekHead names Info, Tracks, Tags and Cues
+    # at their offsets in the segment, the cue its cluster and the first block in it.
+    targets = [(0x1549A966, segment_info), (0x1654AE6B, tracks), (0x1254C367, tags)]
+    seek = seekhead([(element, 0) for element, _ in targets] + ([] if live else [(0x1C53BB6B, 0)]))
+    offsets = [len(seek)]
+    for _, part in targets:
+        offsets.append(offsets[-1] + len(part))
+    cluster_at = offsets[-1] + len(extra)
+    cues_at = cluster_at + len(body)
+    entries_at = [(element, offset) for (element, _), offset in zip(targets, offsets, strict=False)]
+    seek = seekhead(entries_at + ([] if live else [(0x1C53BB6B, cues_at)]))
+    relative = b"" if cluster is not None else el(0xF0, len(timestamp).to_bytes(8, "big"))
+    cue = el(0xB7, el(0xF7, b"\x01") + el(0xF1, cluster_at.to_bytes(8, "big")) + relative)
+    cues = el(0x1C53BB6B, el(0xBB, el(0xB3, b"\x00") + cue))
     segment = seek + segment_info + tracks + tags + extra + body
     if not live:
         segment += cues
     return header + ebml(b"\x18\x53\x80\x67", segment, unknown=live)
+
+
+def seekhead(entries: list[tuple[int, int]]) -> bytes:
+    """A SeekHead of (element id, segment-relative position) entries, positions as 8-byte numbers
+    (so the size does not depend on them)."""
+    return el(
+        0x114D9B74,
+        b"".join(
+            el(0x4DBB, el(0x53AB, element.to_bytes(4, "big")) + el(0x53AC, position.to_bytes(8, "big")))
+            for element, position in entries
+        ),
+    )
 
 
 VALID: dict[str, tuple[str, str, bytes]] = {

@@ -49,7 +49,9 @@ a fixed environment, and the text of a send reaches tmux only on the stdin of `l
 
 from __future__ import annotations
 
+import array
 import base64
+import bisect
 import calendar
 import datetime
 import fnmatch
@@ -1840,6 +1842,10 @@ is refused. Boxes not listed as containers (sample descriptions, data references
 EBML_HEADER = 0x1A45DFA3
 EBML_DOCTYPE = 0x4282
 EBML_HEADER_CHILDREN = (0x4286, 0x42F7, 0x42F2, 0x42F3, EBML_DOCTYPE, 0x4287, 0x4285)
+"""EBMLVersion, EBMLReadVersion, EBMLMaxIDLength, EBMLMaxSizeLength, DocType, DocTypeVersion,
+DocTypeReadVersion: each at most once (a parser that keeps the last DocType must see the same one),
+the numbers at most 8 bytes."""
+EBML_MAX_DOCTYPE = 16
 EBML_SEGMENT = 0x18538067
 EBML_SEEKHEAD = 0x114D9B74
 EBML_INFO = 0x1549A966
@@ -1854,6 +1860,17 @@ EBML_CRC = 0xBF
 EBML_TAGS = 0x1254C367
 EBML_CHAPTERS = 0x1043A770
 EBML_ATTACHMENTS = 0x1941A469
+EBML_SEEK = 0x4DBB
+EBML_SEEK_ID = 0x53AB
+EBML_SEEK_POSITION = 0x53AC
+EBML_CUE_TRACK_POSITIONS = 0xB7
+EBML_CUE_CLUSTER_POSITION = 0xF1
+EBML_CUE_RELATIVE_POSITION = 0xF0
+EBML_CUE_CODEC_STATE = 0xEA
+EBML_SIMPLE_BLOCK = 0xA3
+EBML_BLOCK_GROUP = 0xA0
+EBML_BLOCK = 0xA1
+EBML_SILENT_TRACKS = 0x5854
 EBML_LEVEL1 = (
     EBML_SEEKHEAD,
     EBML_INFO,
@@ -1869,6 +1886,12 @@ EBML_LEVEL1 = (
 files) and every other top-level element are refused."""
 EBML_BLANK = (EBML_VOID, EBML_TAGS, EBML_CHAPTERS)
 """Replaced by a zeroed Void of the same size: padding, tags and chapter titles."""
+EBML_SEEK_TARGETS = (EBML_SEEKHEAD, EBML_INFO, EBML_TRACKS, EBML_CLUSTER, EBML_CUES, EBML_TAGS, EBML_CHAPTERS)
+"""What a SeekHead entry may point at. Players follow these pointers and parse whatever top-level
+element they find at the offset, so each one must name the id and the offset of an element the
+walk itself visited: otherwise a Seek entry could point into a block's frame data, where a hidden
+Attachments, Tags, Chapters or second Tracks element would be read. Entries for Tags and Chapters
+(blanked) are blanked too."""
 MATROSKA_DOCTYPES = {"webm": b"webm", "mkv": b"matroska"}
 """The EBML DocType each extension needs: a `.webm` must say `webm`, a `.mkv` `matroska`."""
 WEBM_CODECS = frozenset((b"V_VP8", b"V_VP9", b"V_AV1", b"A_VORBIS", b"A_OPUS"))
@@ -1940,23 +1963,53 @@ _EBML_INFO: dict[int, object] = {
 }
 """Only the timestamp scale and the duration are kept. The title, muxing and writing application,
 date, segment file names and UIDs and chapter translations are blanked (text and identifiers)."""
-_EBML_SEEK: dict[int, object] = {0x53AB: "id", 0x53AC: _U}
+_EBML_SEEK: dict[int, object] = {EBML_SEEK_ID: "id", EBML_SEEK_POSITION: _U}
 _EBML_CUE_REFERENCE: dict[int, object] = {0x96: _U}
 _EBML_CUE_POSITIONS: dict[int, object] = {
-    **dict.fromkeys((0xF7, 0xF1, 0xF0, 0xB2, 0x5378, 0xEA), _U),
+    **dict.fromkeys(
+        (0xF7, EBML_CUE_CLUSTER_POSITION, EBML_CUE_RELATIVE_POSITION, 0xB2, 0x5378, EBML_CUE_CODEC_STATE), _U
+    ),
     0xDB: _EBML_CUE_REFERENCE,
 }
+EBML_POSITIONS = (
+    EBML_SEEK_ID,
+    EBML_SEEK_POSITION,
+    EBML_CUE_CLUSTER_POSITION,
+    EBML_CUE_RELATIVE_POSITION,
+    EBML_CUE_CODEC_STATE,
+)
+"""Values that point at other elements: collected by the walk and checked against what it visited.
+A CueClusterPosition must be the offset of a walked Cluster, a CueRelativePosition that of a block
+in it, and a CueCodecState must be 0 (codec states live in BlockGroups, which may not carry one)."""
+_EBML_BLOCK_GROUP: dict[int, object] = {
+    EBML_BLOCK: "data",
+    **dict.fromkeys((0x9B, 0xFA, 0xFB, 0x75A2), _U),
+}
+"""Block, BlockDuration, ReferencePriority, ReferenceBlock, DiscardPadding. Block additions (any
+bytes), codec states, slices and the virtual elements are refused, so frame data is the only
+unchecked content of a cluster."""
+_EBML_SILENT_TRACKS: dict[int, object] = {0x58D7: _U}
 _EBML_SCHEMA: dict[int, dict[int, object]] = {
-    EBML_SEEKHEAD: {0x4DBB: _EBML_SEEK},
+    EBML_SEEKHEAD: {EBML_SEEK: _EBML_SEEK},
     EBML_INFO: _EBML_INFO,
     EBML_TRACKS: {EBML_TRACK_ENTRY: _EBML_TRACK_ENTRY},
-    EBML_CUES: {0xBB: {0xB3: _U, 0xB7: _EBML_CUE_POSITIONS}},
+    EBML_CUES: {0xBB: {0xB3: _U, EBML_CUE_TRACK_POSITIONS: _EBML_CUE_POSITIONS}},
 }
 """The walked top-level elements: each child must be listed, masters are walked the same way, and
 every leaf has the length its type allows (`uint` at most 8 bytes, `float` 0, 4 or 8, a seek id 1 to
 4). Void and CRC-32 may appear in any of them."""
-EBML_CLUSTER_CHILDREN = (0xE7, 0xA7, 0xAB, 0xA3, 0xA0, 0xAF, 0x5854, EBML_VOID, EBML_CRC)
-"""Timestamp, Position, PrevSize, SimpleBlock, BlockGroup, EncryptedBlock, SilentTracks."""
+EBML_CLUSTER_CHILDREN = (
+    0xE7,
+    0xA7,
+    0xAB,
+    EBML_SIMPLE_BLOCK,
+    EBML_BLOCK_GROUP,
+    EBML_SILENT_TRACKS,
+    EBML_VOID,
+    EBML_CRC,
+)
+"""Timestamp, Position, PrevSize, SimpleBlock, BlockGroup (walked), SilentTracks (walked). The
+deprecated EncryptedBlock is refused."""
 _EBML_CLUSTER_NUMBERS = (0xE7, 0xA7, 0xAB)
 MAX_MEDIA_ELEMENTS = 200_000
 """Chunks, boxes, elements, pages, frames or blocks one file may have: the walks are pure Python,
@@ -2828,21 +2881,26 @@ def _ebml_children(data: bytes, start: int, end: int, budget: _Budget) -> list[t
 
 
 def _webm_doctype(data: bytes) -> bytes | None:
+    """The EBML header's DocType; None without a header, with no DocType, with two of them or with
+    one longer than EBML_MAX_DOCTYPE."""
     try:
         element, payload, end = _ebml(data, 0, len(data))
         if element != EBML_HEADER or end is None:
             return None
         pos = payload
+        found = None
         while pos < end:
             child, start, child_end = _ebml(data, pos, end)
             _need(child_end is not None)
             assert child_end is not None
             if child == EBML_DOCTYPE:
-                return data[start:child_end]
+                if found is not None or child_end - start > EBML_MAX_DOCTYPE:
+                    return None
+                found = data[start:child_end]
             pos = child_end
     except _NotMediaError:
         return None
-    return None
+    return found
 
 
 def ebml_void(size: int) -> bytes:
@@ -2856,12 +2914,14 @@ def ebml_void(size: int) -> bytes:
 
 
 class _EbmlWalk:
-    """What one Matroska walk found: the byte ranges to blank and every CRC-32 element (its value's
-    start, the start and end of the data it covers)."""
+    """What one Matroska walk found: the byte ranges to blank, every CRC-32 element (its value's
+    start, the start and end of the data it covers) and every pointer value (`EBML_POSITIONS`: the
+    enclosing element's start and end, the pointer's id and value)."""
 
     def __init__(self) -> None:
         self.blank: list[tuple[int, int]] = []
         self.crcs: list[tuple[int, int, int]] = []
+        self.positions: list[tuple[int, int, int, int]] = []
 
 
 def _ebml_master(
@@ -2873,9 +2933,11 @@ def _ebml_master(
     budget: _Budget,
     walk: _EbmlWalk,
     fields: dict[int, bytes] | None = None,
+    owner: tuple[int, int] = (0, 0),
 ) -> None:
     """Walks one known-size master element's children by `schema` (see `_EBML_SCHEMA`); leaf values
-    the caller wants back (track type, codec id) go into `fields`."""
+    the caller wants back (track type, codec id) go into `fields`, pointers into `walk.positions`
+    with `owner`, the start and end of the element holding them."""
     for child, child_start, payload, child_end in _ebml_children(data, start, end, budget):
         size = child_end - payload
         if child == EBML_VOID:
@@ -2888,7 +2950,10 @@ def _ebml_master(
         rule = schema.get(child)
         _need(rule is not None)
         if isinstance(rule, dict):
-            _ebml_master(data, payload, child_end, rule, budget=budget, walk=walk)
+            if child in (EBML_SEEK, EBML_CUE_TRACK_POSITIONS):
+                # Every Seek and CueTrackPositions is checked, also one without any pointer.
+                walk.positions.append((child_start, child_end, child, 0))
+            _ebml_master(data, payload, child_end, rule, budget=budget, walk=walk, owner=(child_start, child_end))
         elif rule == _U:
             _need(size <= 8)
         elif rule == _F:
@@ -2902,34 +2967,113 @@ def _ebml_master(
                 walk.blank.append((child_start, child_end))
         elif rule == "codec":
             _need(size <= 32)
-        else:
+        elif rule != "data":
             walk.blank.append((child_start, child_end))
-        if fields is not None and child in (EBML_TRACK_TYPE, EBML_CODEC_ID):
+        if child in EBML_POSITIONS:
+            walk.positions.append((*owner, child, int.from_bytes(data[payload:child_end], "big")))
+        if fields is not None and child in (EBML_TRACK_TYPE, EBML_CODEC_ID, EBML_BLOCK):
             _need(child not in fields)
-            fields[child] = data[payload:child_end].rstrip(b"\x00")
+            fields[child] = b"" if child == EBML_BLOCK else data[payload:child_end]
+
+
+def _ebml_track(
+    data: bytes, span: tuple[int, int], codecs: frozenset[bytes], *, budget: _Budget, walk: _EbmlWalk
+) -> bool:
+    """Walks one TrackEntry; whether it is a video track (else it is audio). Only video (1) and
+    audio (2) tracks, with a codec of their kind: subtitle, button, complex and metadata tracks
+    carry text or arbitrary bytes. TrackType is a number (01 00 is 256, not video)."""
+    fields: dict[int, bytes] = {}
+    _ebml_master(data, *span, _EBML_TRACK_ENTRY, budget=budget, walk=walk, fields=fields)
+    track_type = int.from_bytes(fields.get(EBML_TRACK_TYPE, b""), "big")
+    codec = fields.get(EBML_CODEC_ID, b"").rstrip(b"\x00")
+    _need(track_type in (1, 2) and codec in codecs)
+    _need(codec.startswith(b"V_" if track_type == 1 else b"A_"))
+    return track_type == 1
+
+
+def _ebml_pointers(
+    walk: _EbmlWalk,
+    level1: tuple[array.array[int], list[int]],
+    clusters: tuple[array.array[int], array.array[int], array.array[int]],
+    blocks: array.array[int],
+) -> None:
+    """Every SeekHead entry names the offset and id of a walked top-level element (an entry for
+    Tags or Chapters is blanked with them); every cue names a walked Cluster and, with a relative
+    position, a walked block in it; no cue names a codec state. `level1` and `clusters` are
+    segment-relative offsets (`clusters` with the absolute start and end of each one's data),
+    `blocks` absolute offsets, all ascending."""
+    offsets, ids = level1
+    cluster_offsets, cluster_payloads, cluster_ends = clusters
+    grouped: dict[tuple[int, int], dict[int, int]] = {}
+    for owner_start, owner_end, child, value in walk.positions:
+        group = grouped.setdefault((owner_start, owner_end), {})
+        # One of each: a parser that keeps the first and one that keeps the last must agree.
+        _need(child not in group)
+        group[child] = value
+
+    def at(sorted_values: array.array[int], value: int) -> int | None:
+        index = bisect.bisect_left(sorted_values, value)
+        return index if index < len(sorted_values) and sorted_values[index] == value else None
+
+    for (owner_start, owner_end), values in grouped.items():
+        if EBML_SEEK in values:
+            target, position = values.get(EBML_SEEK_ID), values.get(EBML_SEEK_POSITION)
+            _need(target in EBML_SEEK_TARGETS and position is not None)
+            assert position is not None
+            index = at(offsets, position)
+            _need(index is not None and ids[index] == target)
+            if target in (EBML_TAGS, EBML_CHAPTERS):
+                walk.blank.append((owner_start, owner_end))
+            continue
+        _need(values.get(EBML_CUE_CODEC_STATE, 0) == 0)
+        cluster = values.get(EBML_CUE_CLUSTER_POSITION)
+        _need(cluster is not None)
+        assert cluster is not None
+        index = at(cluster_offsets, cluster)
+        _need(index is not None)
+        assert index is not None
+        relative = values.get(EBML_CUE_RELATIVE_POSITION)
+        if relative is not None:
+            # Relative to the cluster's data: a block that starts inside that cluster.
+            block = cluster_payloads[index] + relative
+            _need(block < cluster_ends[index] and at(blocks, block) is not None)
 
 
 def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
-    """WebM and Matroska: the EBML header with the DocType the extension needs, one Segment to the
-    end of the file, only the allowlisted top-level elements, every walked element of its specified
-    length (`_EBML_SCHEMA`), every cluster's children, only video and audio tracks with allowlisted
-    codecs, at least one video track. Text (titles, names, applications, dates), tags, chapters and
-    padding become zeroed Void elements of the same size; CRC-32 elements over a blanked range are
-    recomputed."""
+    """WebM and Matroska: the EBML header with the DocType the extension needs (each header element
+    once), one Segment to the end of the file, only the allowlisted top-level elements, every walked
+    element of its specified length (`_EBML_SCHEMA`), every cluster's children and block groups,
+    only video and audio tracks with allowlisted codecs, at least one video track, and every
+    SeekHead and Cues pointer at an element the walk visited (`_ebml_pointers`). Text (titles,
+    names, applications, dates), tags, chapters and padding become zeroed Void elements of the same
+    size; CRC-32 elements over a blanked range are recomputed, innermost first."""
     _need(_webm_doctype(data) == MATROSKA_DOCTYPES[expected])
     codecs = WEBM_CODECS if expected == "webm" else MATROSKA_CODECS
     _, header_start, header_end = _ebml(data, 0, len(data))
     assert header_end is not None
     walk = _EbmlWalk()
-    for child, child_start, _, child_end in _ebml_children(data, header_start, header_end, budget):
+    seen: set[int] = set()
+    for child, child_start, child_payload, child_end in _ebml_children(data, header_start, header_end, budget):
         _need(child in EBML_HEADER_CHILDREN or child in (EBML_VOID, EBML_CRC))
         if child == EBML_VOID:
             walk.blank.append((child_start, child_end))
+        elif child != EBML_CRC:
+            _need(child not in seen)
+            seen.add(child)
+            _need(child_end - child_payload <= (EBML_MAX_DOCTYPE if child == EBML_DOCTYPE else 8))
     element, pos, segment_end = _ebml(data, header_end, len(data))
     _need(element == EBML_SEGMENT)
     if segment_end is None:
         segment_end = len(data)
     _need(segment_end == len(data))
+    segment = pos
+    level1: tuple[array.array[int], list[int]] = (array.array("Q"), [])
+    clusters: tuple[array.array[int], array.array[int], array.array[int]] = (
+        array.array("Q"),
+        array.array("Q"),
+        array.array("Q"),
+    )
+    blocks: array.array[int] = array.array("Q")
     video = 0
     once: set[int] = set()
     while pos < segment_end:
@@ -2937,6 +3081,8 @@ def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
         start = pos
         element, payload, end = _ebml(data, pos, segment_end)
         _need(element in EBML_LEVEL1)
+        level1[0].append(start - segment)
+        level1[1].append(element)
         if element in (EBML_INFO, EBML_TRACKS):
             _need(element not in once)
             once.add(element)
@@ -2958,17 +3104,7 @@ def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
                         walk.crcs.append((entry_payload, entry_end, end))
                         continue
                     _need(child == EBML_TRACK_ENTRY)
-                    fields: dict[int, bytes] = {}
-                    _ebml_master(
-                        data, entry_payload, entry_end, _EBML_TRACK_ENTRY, budget=budget, walk=walk, fields=fields
-                    )
-                    # Only video (1) and audio (2) tracks, with a codec of their kind: subtitle,
-                    # button, complex and metadata tracks carry text or arbitrary bytes.
-                    track_type, codec = fields.get(EBML_TRACK_TYPE), fields.get(EBML_CODEC_ID)
-                    _need(track_type in (b"\x01", b"\x02") and codec in codecs)
-                    assert codec is not None
-                    _need(codec.startswith(b"V_" if track_type == b"\x01" else b"A_"))
-                    video += track_type == b"\x01"
+                    video += _ebml_track(data, (entry_payload, entry_end), codecs, budget=budget, walk=walk)
             else:
                 _ebml_master(data, payload, end, _EBML_SCHEMA[element], budget=budget, walk=walk)
             pos = end
@@ -2991,16 +3127,31 @@ def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
                 walk.crcs.append((child_payload, block_end, stop))
             elif child in _EBML_CLUSTER_NUMBERS:
                 _need(block_end - child_payload <= 8)
+            elif child == EBML_SILENT_TRACKS:
+                _ebml_master(data, child_payload, block_end, _EBML_SILENT_TRACKS, budget=budget, walk=walk)
+            else:
+                if child == EBML_BLOCK_GROUP:
+                    group: dict[int, bytes] = {}
+                    _ebml_master(
+                        data, child_payload, block_end, _EBML_BLOCK_GROUP, budget=budget, walk=walk, fields=group
+                    )
+                    _need(EBML_BLOCK in group)
+                blocks.append(pos)
             pos = block_end
+        clusters[0].append(start - segment)
+        clusters[1].append(payload)
+        clusters[2].append(pos)
     # At least one video track (TrackType 1): an audio-only file is not a video.
     _need(video > 0)
+    _ebml_pointers(walk, level1, clusters, blocks)
     if not walk.blank:
         return data
     out = bytearray(data)
     for blank_start, blank_end in walk.blank:
         out[blank_start:blank_end] = ebml_void(blank_end - blank_start)
     view = memoryview(out)
-    for value, covered_start, covered_end in walk.crcs:
+    # Innermost first: a CRC over a master that holds another CRC covers that one's new value.
+    for value, covered_start, covered_end in sorted(walk.crcs, key=lambda crc: crc[2] - crc[1]):
         if any(a < covered_end and b > covered_start for a, b in walk.blank):
             out[value : value + 4] = zlib.crc32(view[covered_start:covered_end]).to_bytes(4, "little")
     view.release()

@@ -48,6 +48,7 @@ from tests.remote.media_fixtures import (
     png_sized,
     riff,
     riff_chunk,
+    seekhead,
     stbl,
     trak,
     wav,
@@ -784,12 +785,253 @@ def test_mkv_crc32_is_recomputed_over_blanked_text() -> None:
     assert refused("movie.mkv", mkv(extra=el(0x1654AE6B, mkv_video_entry()))) == "not_media"
 
 
-def test_the_element_budget_grows_with_the_file() -> None:
-    assert d._Budget().left == d.MAX_MEDIA_ELEMENTS
-    assert d._Budget(250_000_000).left == d.MAX_MEDIA_ELEMENTS + 250_000_000 // 1024
+# --- Matroska pointers (red-team review): a Seek entry or cue may name only walked elements ------
+
+MKV_HEADER = el(
+    0x1A45DFA3,
+    el(0x4286, b"\x01")
+    + el(0x42F7, b"\x01")
+    + el(0x42F2, b"\x04")
+    + el(0x42F3, b"\x08")
+    + el(0x4282, b"matroska")
+    + el(0x4287, b"\x04")
+    + el(0x4285, b"\x02"),
+)
+MKV_INFO = el(0x1549A966, el(0x2AD7B1, b"\x0f\x42\x40") + el(0x4489, struct.pack(">d", 2000.0)))
+HIDDEN_ATTACHMENT = el(
+    0x1941A469,
+    el(
+        0x61A7,
+        el(0x466E, b"evil.html")
+        + el(0x4660, b"text/html")
+        + el(0x465C, b"<html><script>alert(1)</script>secret exfil</html>")
+        + el(0x46AE, b"\x01"),
+    ),
+)
+HIDDEN_TAGS = el(0x1254C367, el(0x7373, el(0x67C8, el(0x45A3, b"TITLE") + el(0x4487, b"SMUGGLED TEXT IN TAGS"))))
+HIDDEN_CHAPTERS = el(
+    0x1043A770,
+    el(0x45B9, el(0xB6, el(0x73C4, b"\x01") + el(0x91, b"\x00") + el(0x80, el(0x85, b"CHAPTER SMUGGLED")))),
+)
+HIDDEN_TRACKS = el(
+    0x1654AE6B,
+    mkv_video_entry()
+    + el(0xAE, el(0xD7, b"\x03") + el(0x73C5, b"\x03") + el(0x83, b"\x11") + el(0x86, b"S_TEXT/UTF8")),
+)
+
+
+def hidden_in_a_block(hidden: bytes, hidden_id: int, *, tracks_after: bool = False) -> bytes:
+    """An MKV whose only SimpleBlock's frame data is a whole top-level element, with a Seek entry
+    pointing at it (players parse whatever they find at a Seek position)."""
+    tracks = el(0x1654AE6B, mkv_video_entry() + mkv_audio_entry())
+    lead = len(seekhead([(hidden_id, 0)])) + len(MKV_INFO) + (0 if tracks_after else len(tracks))
+    timestamp = el(0xE7, b"\x00")
+    # Cluster header (4 + 8), the timestamp, the SimpleBlock header (1 + 8) and its 4 block bytes.
+    position = lead + 12 + len(timestamp) + 9 + 4
+    cluster = el(0x1F43B675, timestamp + el(0xA3, b"\x81\x00\x00\x80" + hidden))
+    body = seekhead([(hidden_id, position)]) + MKV_INFO
+    body += cluster + tracks if tracks_after else tracks + cluster
+    return MKV_HEADER + el(0x18538067, body)
 
 
 FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
+
+
+@pytest.mark.parametrize(
+    ("hidden", "hidden_id", "tracks_after"),
+    [
+        (HIDDEN_ATTACHMENT, 0x1941A469, False),
+        (HIDDEN_TAGS, 0x1254C367, False),
+        (HIDDEN_CHAPTERS, 0x1043A770, False),
+        (HIDDEN_TRACKS, 0x1654AE6B, True),
+    ],
+)
+def test_a_seek_entry_into_frame_data_is_refused(hidden: bytes, hidden_id: int, tracks_after: bool) -> None:
+    data = hidden_in_a_block(hidden, hidden_id, tracks_after=tracks_after)
+    assert refused("movie.mkv", data) == "not_media"
+    # The same file with the Seek entry pointing at a real element passes: only the pointer is wrong.
+    real = bytearray(data)
+    position = real.index(b"\x53\xac\x01") + 10
+    real[position : position + 8] = len(seekhead([(0, 0)])).to_bytes(8, "big")
+    real[position - 14 : position - 10] = b"\x15\x49\xa9\x66"
+    d.media_check("movie.mkv", bytes(real))
+
+
+@pytest.mark.skipif(FFPROBE is None, reason="ffprobe is not installed")
+def test_the_hidden_attachment_is_what_ffprobe_would_have_read(tmp_path: Path) -> None:
+    """The attack is real: ffprobe follows the Seek entry into the frame data and finds the file."""
+    assert FFPROBE is not None
+    path = tmp_path / "att.mkv"
+    path.write_bytes(hidden_in_a_block(HIDDEN_ATTACHMENT, 0x1941A469))
+    probed = subprocess.run(
+        [FFPROBE, "-v", "error", "-show_streams", str(path)], capture_output=True, text=True, check=False, timeout=60
+    )
+    assert "evil.html" in probed.stdout
+
+
+def test_seek_entries_must_name_the_element_at_their_offset() -> None:
+    data = mkv()
+    seek = bytes(data).index(b"\x53\xac\x01")
+    # Info's entry, one byte off; then Info's offset named as Tracks; then an id outside the list.
+    for patch in (
+        (seek + 10 + 7, bytes([data[seek + 10 + 7] + 1])),
+        (seek - 4, b"\x16\x54\xae\x6b"),
+        (seek - 4, b"\x19\x41\xa4\x69"),
+        (seek - 4, b"\x00\x00\x00\xec"),
+    ):
+        broken = bytearray(data)
+        broken[patch[0] : patch[0] + len(patch[1])] = patch[1]
+        assert refused("movie.mkv", bytes(broken)) == "not_media"
+    # Two positions (a parser keeping the first and one keeping the last would disagree), or none.
+    info_at = len(seekhead([(0, 0)] * 4)).to_bytes(8, "big")
+    entry = el(0x53AB, b"\x15\x49\xa9\x66") + el(0x53AC, info_at)
+    assert d.media_check("movie.mkv", mkv(extra=el(0x114D9B74, el(0x4DBB, entry))))[0] == "video"
+    twice = el(0x114D9B74, el(0x4DBB, entry + el(0x53AC, info_at)))
+    assert refused("movie.mkv", mkv(extra=twice)) == "not_media"
+    assert refused("movie.mkv", mkv(extra=el(0x114D9B74, el(0x4DBB, el(0x53AB, b"\x15\x49\xa9\x66"))))) == ("not_media")
+
+
+def test_the_seek_entry_of_blanked_tags_is_blanked_too() -> None:
+    clean = bytes(d.media_check("movie.mkv", mkv())[2])
+    assert b"\x53\xab\x01\x00\x00\x00\x00\x00\x00\x04\x12\x54\xc3\x67" not in clean
+    assert b"\x53\xab\x01\x00\x00\x00\x00\x00\x00\x04\x15\x49\xa9\x66" in clean
+    assert d.media_check("movie.mkv", clean)[2] == clean
+
+
+def test_cues_must_name_a_walked_cluster_and_block() -> None:
+    data = mkv()
+    cue = bytes(data).index(b"\xf1\x01")
+    relative = bytes(data).index(b"\xf0\x01")
+    for at, delta in ((cue + 9 + 7, 1), (relative + 9 + 7, 1), (relative + 9 + 7, 0x40)):
+        broken = bytearray(data)
+        broken[at] = (broken[at] + delta) & 0xFF
+        assert refused("movie.mkv", bytes(broken)) == "not_media"
+    # A codec state (a pointer to anything) is refused; 0 means none.
+    relative_element = bytes(data[relative : relative + 17])
+    for value, accepted in ((1, False), (0, True)):
+        state = data.replace(relative_element, el(0xEA, value.to_bytes(8, "big")), 1)
+        assert state != data
+        if accepted:
+            assert d.media_check("movie.mkv", state)[0] == "video"
+        else:
+            assert refused("movie.mkv", state) == "not_media"
+    # A cue without a cluster position.
+    no_cluster = el(0x1C53BB6B, el(0xBB, el(0xB3, b"\x00") + el(0xB7, el(0xF7, b"\x01"))))
+    assert refused("movie.mkv", mkv(extra=no_cluster)) == "not_media"
+
+
+def test_block_groups_are_walked() -> None:
+    def group(*children: bytes) -> bytes:
+        return mkv(cluster=el(0xE7, b"\x00") + el(0xA0, b"".join(children)))
+
+    block = el(0xA1, b"\x81\x00\x00\x80" + bytes(8))
+    accepted = group(block, el(0x9B, b"\x10"), el(0xFB, b"\xff\xf0"), el(0x75A2, b"\x01"))
+    assert d.media_check("movie.mkv", accepted)[0] == "video"
+    for bad in (
+        group(block, el(0x75A1, el(0xA6, el(0xEE, b"\x01") + el(0xA5, SECRET)))),  # BlockAdditions
+        group(block, el(0xA4, SECRET)),  # CodecState
+        group(block, el(0x8E, SECRET)),  # Slices
+        group(el(0x9B, b"\x10")),  # no Block
+        group(block, block),  # two
+        mkv(cluster=el(0xE7, b"\x00") + el(0xAF, SECRET)),  # EncryptedBlock
+        mkv(cluster=el(0xE7, b"\x00") + el(0x5854, el(0x58D7, SECRET[:9]))),  # SilentTrackNumber too long
+    ):
+        assert refused("movie.mkv", bad) == "not_media"
+    assert d.media_check("movie.mkv", mkv(cluster=el(0xE7, b"\x00") + el(0x5854, el(0x58D7, b"\x02"))))
+
+
+def test_track_type_is_a_number() -> None:
+    # 01 00 is 256, not 1 (video): a check that strips NUL bytes would read it as video.
+    odd = el(0xAE, el(0xD7, b"\x03") + el(0x73C5, b"\x03") + el(0x83, b"\x01\x00") + el(0x86, b"V_VP8"))
+    assert refused("movie.mkv", mkv(entries=mkv_video_entry() + odd)) == "not_media"
+    # A number with leading zero bytes is still that number; a codec id may end in NUL bytes.
+    padded = el(0xAE, el(0xD7, b"\x01") + el(0x73C5, b"\x01") + el(0x83, b"\x00\x01") + el(0x86, b"V_VP8"))
+    assert d.media_check("movie.mkv", mkv(entries=padded + mkv_audio_entry()))[0] == "video"
+    nul = mkv_video_entry(codec=b"V_MPEG4/ISO/AVC\x00")
+    assert d.media_check("movie.mkv", mkv(entries=nul + mkv_audio_entry()))[0] == "video"
+
+
+def with_header(data: bytes, old: bytes, new: bytes) -> bytes:
+    """`data` with the EBML header child `old` replaced by `new` (the header size fixed up)."""
+    patched = data.replace(old, new, 1)
+    size = int.from_bytes(patched[5:12], "big") + len(new) - len(old)
+    return patched[:5] + size.to_bytes(7, "big") + patched[12:]
+
+
+def test_ebml_header_children_appear_once_with_bounded_lengths() -> None:
+    data = mkv()
+    doctype = el(0x4282, b"matroska")
+    # Two DocTypes (a parser that keeps the last one sees webm), in either order.
+    assert refused("movie.mkv", with_header(data, doctype, doctype + el(0x4282, b"webm"))) == "not_media"
+    assert refused("movie.webm", with_header(data, doctype, el(0x4282, b"webm") + doctype)) == "not_media"
+    assert d.sniff_media(with_header(data, doctype, doctype + el(0x4282, b"webm"))) is None
+    # A version twice, a number of 9 bytes, a DocType of 17.
+    version = el(0x4286, b"\x01")
+    assert refused("movie.mkv", with_header(data, version, version + version)) == "not_media"
+    assert refused("movie.mkv", with_header(data, version, el(0x4286, b"\x01" + SECRET[:8]))) == "not_media"
+    assert refused("movie.mkv", with_header(data, version, el(0x4286, b"\x01" * 7000))) == "not_media"
+    assert refused("movie.mkv", with_header(data, doctype, el(0x4282, b"matroska" + bytes(9)))) == "not_media"
+
+
+def test_nested_crcs_are_recomputed_innermost_first() -> None:
+    entry = mkv_video_entry()
+    inner = el(0xAE, el(0xBF, bytes(4)) + entry[9:])
+    tracks_payload = el(0xBF, bytes(4)) + inner + mkv_audio_entry()
+    data = mkv(entries=tracks_payload)
+    clean = bytes(d.media_check("movie.mkv", data)[2])
+    assert MKV_TRACK_NAME not in clean
+    tracks = clean.index(b"\x16\x54\xae\x6b\x01")
+    payload = tracks + 12
+    end = payload + int.from_bytes(clean[tracks + 5 : tracks + 12], "big")
+    outer = payload + 9
+    assert clean[outer : outer + 4] == zlib.crc32(clean[outer + 4 : end]).to_bytes(4, "little")
+    entry_at = outer + 4
+    entry_payload = entry_at + 9
+    entry_end = entry_payload + int.from_bytes(clean[entry_at + 2 : entry_at + 9], "big")
+    value = entry_payload + 9
+    assert clean[value : value + 4] == zlib.crc32(clean[value + 4 : entry_end]).to_bytes(4, "little")
+
+
+@pytest.mark.skipif(FFMPEG is None or FFPROBE is None, reason="ffmpeg is not installed")
+def test_a_long_real_recording_keeps_working_seek_pointers(tmp_path: Path) -> None:
+    """Many clusters and cues with relative positions (ffmpeg writes both), Opus in BlockGroups
+    with DiscardPadding: accepted, and the cleaned copy shows no chapters, tags or extra streams."""
+    assert FFMPEG is not None
+    assert FFPROBE is not None
+    source = tmp_path / "long.mkv"
+    lavfi = ["-f", "lavfi", "-i", "testsrc=size=64x48:rate=10", "-f", "lavfi", "-i", "sine=sample_rate=48000"]
+    command = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", *lavfi, "-t", "12"]
+    command += ["-c:v", "libx264", "-g", "10", "-c:a", "libopus", "-cluster_time_limit", "500", str(source)]
+    if subprocess.run(command, capture_output=True, check=False, timeout=60).returncode != 0:
+        pytest.skip("this ffmpeg cannot write H.264 and Opus")
+    _, _, clean = d.media_check("long.mkv", source.read_bytes())
+    cleaned = tmp_path / "clean.mkv"
+    cleaned.write_bytes(clean)
+    probed = subprocess.run(
+        [FFPROBE, "-v", "error", "-show_streams", "-show_chapters", "-show_format", str(cleaned)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert probed.returncode == 0, probed.stderr
+    assert probed.stdout.count("[STREAM]") == 2
+    assert "[CHAPTER]" not in probed.stdout
+    assert "TAG:" not in probed.stdout.replace("TAG:language=", "")
+    # Seeking to the middle uses the cues.
+    seek = subprocess.run(
+        [FFMPEG, "-nostdin", "-v", "error", "-xerror", "-ss", "6", "-i", str(cleaned), "-f", "null", "-"],
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert seek.returncode == 0, seek.stderr
+
+
+def test_the_element_budget_grows_with_the_file() -> None:
+    assert d._Budget().left == d.MAX_MEDIA_ELEMENTS
+    assert d._Budget(250_000_000).left == d.MAX_MEDIA_ELEMENTS + 250_000_000 // 1024
 
 
 @pytest.mark.skipif(FFMPEG is None, reason="ffmpeg is not installed")
