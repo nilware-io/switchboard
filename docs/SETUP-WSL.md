@@ -303,6 +303,57 @@ The hub runs as you. Simpler, no sshd and no keys, but a task that gets manipula
 
 In this mode upstream's session tools also work: `list_sessions` lists your recent Claude Code sessions (also the ones in tmux), `ask_session_readonly` asks a read-only copy, and `send_message_to_session` relays a message through the session's messaging socket, which on Linux lies under `/run/user/<uid>/cc-socks/` (the path is taken from Claude Code's own registry). `remoteControl.handoffToDesktop` is macOS only.
 
+## Release key and signed updates
+
+Machines with dispatcher 0.13.0 and `--allow-self-update` take updates from the hub, but only releases signed with your release key, which stays on this computer ([SWITCHBOARD.md](SWITCHBOARD.md#self-update)). It needs OpenSSH 8.1 or newer here and on the machines (`ssh -V`).
+
+1. Create the key once, as yourself, with a passphrase (`ssh-keygen` asks for it; choose a long one and keep it out of the hub and of any script):
+
+   ```sh
+   ssh-keygen -t ed25519 -a 100 -C switchboard-release -f ~/.ssh/switchboard_release
+   ssh-keygen -lf ~/.ssh/switchboard_release.pub      # the fingerprint the read-backs will name
+   cat ~/.ssh/switchboard_release.pub                 # the public line for the machines
+   ```
+
+   Use it for nothing else (not as a login key, not in an agent you forward). Back up the private key encrypted; without it you can still update machines by hand, and pin a new key.
+
+2. Pin it on each machine: `~/.config/switchboard-remote/release_signers` with the line `switchboard-release namespaces="switchboard-release" ssh-ed25519 AAAA...` ([SETUP-AGENTS.md](SETUP-AGENTS.md#updating-to-0130-signed-self-update) has the commands and the one-time install of 0.13.0). For the hub's own signed updates the hub has its own copy in `/etc/voice-coding-mcp/release_signers` with `namespaces="switchboard-release,git"` ([DEPLOY.md](DEPLOY.md#signed-updates-of-the-hub)).
+
+3. Build and sign a release. Take the programs from your own verified copy (step 3), at the commit you checked; the commands run from a checkout of this repository that you trust as yourself (your development checkout, for example; they only read files and run `ssh-keygen`):
+
+   ```sh
+   git -C ~/src/switchboard rev-parse HEAD                       # the commit you checked
+   mkdir -p ~/switchboard-releases
+   uv run voice-coding-mcp release build --source ~/src/switchboard/deploy/remote --out ~/switchboard-releases
+   cat ~/switchboard-releases/switchboard-remote-0.13.1/manifest.json
+   sha256sum ~/src/switchboard/deploy/remote/switchboard-{remote,connect,hook}   # the same hashes as in the manifest
+   uv run voice-coding-mcp release sign --key ~/.ssh/switchboard_release ~/switchboard-releases/switchboard-remote-0.13.1
+   ```
+
+   `release sign` lets `ssh-keygen` ask for the passphrase on your terminal and writes `switchboard-remote-0.13.1.bundle` next to the directory. You can check the signature without Switchboard's code too: `ssh-keygen -Y verify -f <your signers file> -I switchboard-release -n switchboard-release -s manifest.json.sig < manifest.json` in that directory. `release verify --signers <file> <bundle>` runs the machines' whole check.
+
+4. Publish it on the hub. A bundle is not secret (it holds the programs and a signature), so copy it where the hub user can read it, then publish as the hub user:
+
+   ```sh
+   install -m 644 ~/switchboard-releases/switchboard-remote-0.13.1.bundle /tmp/
+   sudo -H -u switchboard /home/switchboard/switchboard/.venv/bin/voice-coding-mcp release publish /tmp/switchboard-remote-0.13.1.bundle --config /home/switchboard/.config/voice-coding-mcp/config.json
+   ```
+
+   For a server hub: `scp` it there and run `sudo voice-coding-mcp release publish <file>` (the file readable by the service user).
+
+5. Update a machine by voice: "update laptop". The read-back names both versions and the key's fingerprint; compare it with step 1, then say yes. Or on the hub: `voice-coding-mcp remote-update laptop` (shows the plan) and `remote-update laptop --yes`. `list_remote_sessions` says when a machine's dispatcher is older than the published release. Machine `dev` (`transport: "local"`) runs the hub's own copy and updates with the hub; when `dev` is reached over ssh (step 5), its `~/.local/bin/switchboard-remote` updates like any machine.
+
+6. The hub itself: tag the release commit with the same key and push the tag:
+
+   ```sh
+   git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/switchboard_release tag -s v0.13.1 -m "Switchboard 0.13.1" <commit>
+   git push origin v0.13.1
+   ```
+
+   A server hub then runs `deploy/hub-update v0.13.1` ([DEPLOY.md](DEPLOY.md#signed-updates-of-the-hub)). On this WSL layout the hub's checkout belongs to the hub user, so run it as that user with a root-owned signers file and restart the unit yourself: `sudo install -d -m 755 /etc/switchboard && sudo install -m 644 <signers file> /etc/switchboard/release_signers`, then `sudo -H -u switchboard /usr/bin/python3 -I /home/switchboard/switchboard/deploy/hub-update --repo /home/switchboard/switchboard --signers /etc/switchboard/release_signers --no-restart v0.13.1` and `sudo systemctl restart switchboard`. Here it protects against a tampered origin, not against a compromised hub user (that user owns the checkout); your own copy stays the source of what runs as you or as root.
+
+If the key or its passphrase leaks: replace the line in every `release_signers` (machines and hub), create a new key, and remove the published bundles from `stateDir/releases` on the hub.
+
 ## If something is compromised
 
 If you suspect that someone else used the connector, that a task or a session was manipulated, or that your Claude account was accessed:

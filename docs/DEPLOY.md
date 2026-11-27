@@ -238,6 +238,26 @@ Stopping the service (SIGTERM) ends queued and running tasks as failed ("server 
 
 Ubuntu installs security updates automatically (unattended-upgrades). Reboot when `/var/run/reboot-required` exists.
 
+### Signed updates of the hub
+
+Instead of `git pull`, the hub can move only to release tags signed with the owner's release key ([SWITCHBOARD.md](SWITCHBOARD.md#self-update); the key itself: [SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates)). Once, as root, pin the key's public line with the `git` namespace (the owner copies it from their computer and compares the fingerprint):
+
+```sh
+sudo install -d -o root -g root -m 755 /etc/voice-coding-mcp
+printf 'switchboard-release namespaces="switchboard-release,git" %s\n' 'ssh-ed25519 AAAA...' | sudo tee /etc/voice-coding-mcp/release_signers >/dev/null
+sudo chmod 644 /etc/voice-coding-mcp/release_signers
+awk '{print $3" "$4}' /etc/voice-coding-mcp/release_signers | ssh-keygen -lf -     # the owner's fingerprint
+```
+
+Each update, after the owner pushed a signed tag:
+
+```sh
+sudo /usr/bin/python3 -I /opt/voice-coding-mcp/deploy/hub-update --dry-run v0.13.1   # fetch and verify only
+sudo /usr/bin/python3 -I /opt/voice-coding-mcp/deploy/hub-update v0.13.1             # check out, uv sync, restart
+```
+
+It needs git 2.34 or newer and OpenSSH 8.1 or newer, refuses a checkout with local changes, an unsigned or lightweight tag, a tag signed by another key, a tag object whose own name is another tag, and any tag not newer than the one it installed last; then it checks out the signed commit by hash, runs `uv sync --frozen --no-dev --no-editable --compile-bytecode` (it passes `UV_*` variables on, so `sudo UV_PYTHON=/usr/bin/python3.12 UV_PYTHON_DOWNLOADS=never /usr/bin/python3 -I ... hub-update v0.13.1` works as in the minimal variant above) and restarts `voice-coding-mcp`. When `deploy/setup.sh` changed in that release (the unit, the Caddyfile), run it afterwards as before. The first run accepts any signed tag; from then on `.git/switchboard-hub-update.json` holds the installed tag. Options: [REFERENCE.md](REFERENCE.md#deployhub-update). Publishing the machines' release bundles on the hub (`release publish`) is separate: [SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates).
+
 ### Backups
 
 - `/var/lib/voice-coding-mcp`: OAuth state (hashes only), tasks, sessions per project. Writes are atomic, so a copy while running is consistent per file:
