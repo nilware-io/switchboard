@@ -494,6 +494,82 @@ def format_clear_readback(
     return " ".join(parts)
 
 
+def format_update_readback(item: Confirmation, *, dropped: Sequence[Confirmation]) -> str:
+    """What `remote_update` returns: the machine, the two versions, the key that signed the
+    release, that this changes code there, the yes phrase, then the confirmation id for the model."""
+    offer = item.offer
+    assert offer is not None
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
+    parts.append(
+        f"Ready to update switchboard-remote on {item.machine} from {offer.from_version} to "
+        f"{offer.to_version}, signed by the release key {offer.fingerprint}."
+    )
+    parts.append(
+        f"Careful, this replaces the programs that run on {item.machine}. {item.machine} checks the "
+        "signature with its own pinned key before it installs anything."
+    )
+    parts.append("Say yes, update it.")
+    parts.append(f"(confirmation {item.id}, do not read this number aloud)")
+    return " ".join(parts)
+
+
+UPDATE_REFUSALS: dict[str, str] = {
+    "not_allowed": "{machine} does not allow self-update: its switchboard-remote runs without --allow-self-update.",
+    "not_installed": "switchboard-remote on {machine} is not installed under its own name, so it cannot replace itself.",
+    "install_unsafe": "the files of switchboard-remote on {machine} are writable by others or are symlinks, so it refused to replace them.",
+    "too_large": "the release is larger than {machine} accepts.",
+    "bad_bundle": "{machine} could not read the release bundle.",
+    "unknown_target": "the release names a file {machine} does not install.",
+    "bad_signature": "the signature did not check out against the release key pinned on {machine}.",
+    "wrong_namespace": "the signature was made for something else, not for a Switchboard release.",
+    "no_openssh": "{machine} has no ssh-keygen to check the signature.",
+    "old_openssh": "the OpenSSH on {machine} is older than 8.1 and cannot check release signatures.",
+    "no_signers": "{machine} has no pinned release key (its release_signers file is missing or empty).",
+    "signers_unsafe": "the release_signers file on {machine} is writable by others or is a symlink, so it is not trusted.",
+    "bad_manifest": "the signed manifest of the release is not valid.",
+    "file_mismatch": "a file of the release does not match its signed checksum.",
+    "not_newer": "{machine} already had this version or a newer one installed, and it never goes back to an older release.",
+    "min_version": "the release needs a newer switchboard-remote on {machine} first.",
+    "bad_state": "the update record on {machine} cannot be read.",
+    "self_test_failed": "the new switchboard-remote did not start on {machine}; nothing was replaced.",
+    "install_failed": "writing the new files failed on {machine}; the old ones were kept.",
+    "locked": "another update was still running on {machine}.",
+    "bad_request": "switchboard-remote on {machine} is too old to update itself.",
+    "changed": "the published release changed since I read it to you. Ask me again.",
+    "slow": "{machine} answered too slowly. Try again in a moment.",
+    "not_connected": "{machine} is not connected right now.",
+    "busy": "switchboard-remote on {machine} was busy. Try again in a moment.",
+    "local": "{machine} runs the hub's own copy of switchboard-remote, which updates with the hub.",
+}
+
+
+def update_refusal(machine: str, code: str) -> str:
+    """Why an update was not installed, as a clause."""
+    text = UPDATE_REFUSALS.get(code)
+    return text.format(machine=machine) if text else f"{machine} could not be reached."
+
+
+def format_update_outcome(item: Confirmation, outcome: str, detail: str | None, *, agent: bool) -> str:
+    """The spoken result of a confirmed update."""
+    offer = item.offer
+    assert offer is not None
+    machine = item.machine
+    if outcome == "sent":
+        then = (
+            "Its connector starts the new version now, so it is back in a few seconds."
+            if agent
+            else "The next call to it runs the new version."
+        )
+        return f"Updated switchboard-remote on {machine} to {offer.to_version}. {then}"
+    if outcome == "unknown":
+        return (
+            f"I do not know whether {machine} installed the update: it stopped answering. Ask me for the "
+            f"sessions on {machine} in a moment; its version shows there."
+        )
+    code = outcome.removeprefix("not_sent:")
+    return "Not updated: " + update_refusal(machine, code)
+
+
 _NOT_SENT: dict[str, str] = {
     "not_connected": "Not sent: {machine} is not connected right now.",
     "busy": "Not sent: switchboard-remote on {machine} was busy. Try again in a moment.",

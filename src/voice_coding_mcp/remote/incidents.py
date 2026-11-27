@@ -62,6 +62,7 @@ Component = Literal[
     "other",
     "session",
     "notify",
+    "update",
 ]
 COMPONENTS: tuple[str, ...] = (
     "agent_link",
@@ -76,6 +77,7 @@ COMPONENTS: tuple[str, ...] = (
     "other",
     "session",
     "notify",
+    "update",
 )
 Source = Literal["auto", "owner", "cli", "session"]
 SOURCES: tuple[str, ...] = ("auto", "owner", "cli", "session")
@@ -422,6 +424,26 @@ def event_entry(*, machine: str, code: str, what: str, why: str, at_ms: int) -> 
     )
 
 
+def update_event(*, machine: str, code: str, what: str, why: str, at_ms: int) -> Incident:
+    """One self-update attempt for the log (`entry: event`, component `update`, closed at once):
+    `update_installed`, `update_refused` (the machine or the hub said no; `why` names the fixed
+    refusal code) or `update_unknown` (the machine stopped answering). Only the hub's own words,
+    versions, the signer's fingerprint and fixed codes."""
+    return Incident(
+        id=new_id(),
+        machine=machine,
+        component="update",
+        code=code,
+        what=clean_text(what, MAX_WHAT),
+        why=clean_text(why, MAX_WHY),
+        source="auto",
+        start_ms=at_ms,
+        end_ms=at_ms,
+        last_ms=at_ms,
+        entry="event",
+    )
+
+
 Key = tuple[str, str, str]
 
 
@@ -649,6 +671,7 @@ _EFFECT_OF_VERB = {
     "usage": "its usage could not be read",
     "health": "its health could not be checked",
     "version": "it could not be checked",
+    "update": "an update could not be installed",
 }
 
 _TRANSPORT_WHY = {

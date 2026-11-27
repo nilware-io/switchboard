@@ -25,14 +25,14 @@ from typing import Any
 from ..clock import now_ms, to_iso
 from ..json_file import ensure_dir
 from .redact import redact
-from .send import CLEAR, KEYS, RESIZE, Confirmation
+from .send import CLEAR, KEYS, RESIZE, UPDATE, Confirmation, UpdateOffer
 
 AUDIT_FILE = "audit.jsonl"
 KEY_FILE = "audit.key"
 KEY_BYTES = 32
 WARN_BYTES = 10 * 1024 * 1024
 MAX_LINE_BYTES = 64 * 1024
-EVENTS = {KEYS: "remote_send_keys", RESIZE: "remote_resize", CLEAR: "remote_clear_input"}
+EVENTS = {KEYS: "remote_send_keys", RESIZE: "remote_resize", CLEAR: "remote_clear_input", UPDATE: "remote_update"}
 
 
 def audit_path(state_dir: str) -> str:
@@ -106,16 +106,35 @@ class AuditLog:
             "textChars": len(item.text),
             "outcome": outcome,
         }
-        if item.kind == CLEAR:
-            # Nothing of the owner's draft goes into the audit file, not even its length.
+        if item.kind in (CLEAR, UPDATE):
+            # Nothing of the owner's draft goes into the audit file, not even its length; an update
+            # has no text.
             del line["textHmac"], line["textChars"]
+        if item.kind == UPDATE and item.offer is not None:
+            del line["session"], line["paneId"], line["permissionAnswer"]
+            line["release"] = update_fields(item.offer)
         if item.kind == KEYS:
             line["keys"] = list(item.keys)
             line["menuBound"] = item.menu is not None
         if item.kind == RESIZE and item.size is not None:
             line["size"] = {"columns": item.size[0], "rows": item.size[1]}
-        if self.log_prompts and item.kind != CLEAR:
+        if self.log_prompts and item.kind not in (CLEAR, UPDATE):
             line["text"] = redact(item.text)
+        self._append(line)
+        return line
+
+    def record_update(self, *, machine: str, offer: UpdateOffer, outcome: str, client: str) -> dict[str, Any]:
+        """Appends the line of an update started outside a voice confirmation (`remote-update` on
+        the hub's command line, `client` `cli`)."""
+        line: dict[str, Any] = {
+            "time": to_iso(self.now()),
+            "event": "remote_update",
+            "client": client,
+            "clientName": None,
+            "machine": machine,
+            "release": update_fields(offer),
+            "outcome": outcome,
+        }
         self._append(line)
         return line
 
@@ -192,6 +211,15 @@ class AuditLog:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+
+def update_fields(offer: UpdateOffer) -> dict[str, str]:
+    return {
+        "from": offer.from_version,
+        "to": offer.to_version,
+        "signer": offer.fingerprint,
+        "bundleSha256": offer.sha256,
+    }
 
 
 def audit_size_warning(state_dir: str) -> str | None:

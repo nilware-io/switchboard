@@ -91,6 +91,7 @@ from .incidents import (
     open_clause,
     owner_incident,
     relay_problem,
+    update_event,
     zone_of,
 )
 from .inventory import Inventory, resolve_machine
@@ -114,19 +115,24 @@ from .protocol import (
     PaneInfo,
     ResizeResponse,
     SendResponse,
+    UpdateResponse,
     VersionResponse,
 )
 from .redact import clean_name, clean_screen
+from .release import Release, ReleaseError, latest, load_bundle, newer
 from .send import (
     CLEAR,
     KEYS,
     PERMISSION_ANSWER_RE,
     RESIZE,
     TEXT,
+    UPDATE,
+    UPDATE_RISK,
     Confirmation,
     ConfirmationStore,
     RiskClassifier,
     ScreenEcho,
+    UpdateOffer,
     chosen_option,
     dialog_hash,
     key_words,
@@ -148,11 +154,14 @@ from .speech import (
     format_resize_readback,
     format_status,
     format_target_problem,
+    format_update_outcome,
+    format_update_readback,
     pane_label,
     quote,
     send_place,
     text_refusal,
     unreachable_sentence,
+    update_refusal,
 )
 from .summarize import Summarizer, SummarizerOptions, last_meaningful_line, mark_suggestion, screen_hash
 from .targets import Resolved, resolve_target
@@ -200,9 +209,68 @@ SUMMARY_FAILURES = {
 }
 CALL_COMPONENTS = ("transport", "dispatcher", "tmux", "agent_link")
 """Incidents an answer that says the machine failed already covers."""
+MIN_UPDATE_SECONDS = 8.0
+"""An update is not started with less time left: the machine verifies the signature and starts the
+new dispatcher once before it answers (about 1 to 5 seconds)."""
 UNREACHED_ERRORS = ("refused", "host_key", "auth", "not_connected")
 """ssh failed before it connected, or an agent machine had no connection: nothing was typed. Every other failure after the request was
 handed over (also `dispatcher_missing`, which an unexpected banner can cause) is an unknown outcome."""
+
+
+async def send_update(
+    transport: Transport, bundle: bytes, timeout_seconds: float
+) -> tuple[str, str | None, UpdateResponse | None]:
+    """Hands a signed bundle to a machine's `update` verb: (audit outcome, detail, answer) with the
+    outcome `sent`, `not_sent:<code>` (the dispatcher's refusal code, or a transport error before
+    anything was sent) or `unknown`."""
+    result = await transport.call("update", [], timeout_seconds=timeout_seconds, stdin=bundle)
+    data = result.data
+    if result.ok and isinstance(data, UpdateResponse) and data.updated:
+        return "sent", None, data
+    if result.ok:
+        return "unknown", None, None
+    if result.error in ("refused_by_policy", "remote_failed"):
+        return f"not_sent:{result.detail or 'other'}", result.detail, None
+    if result.error in UNREACHED_ERRORS:
+        return f"not_sent:{result.error}", None, None
+    return "unknown", None, None
+
+
+def short_fingerprint(fingerprint: str) -> str:
+    """The start of a key fingerprint (`SHA256:` and 12 characters): enough to tell keys apart in
+    the incident log, short enough that its redaction (long runs of base64) leaves it alone."""
+    return fingerprint[:19] + "..." if len(fingerprint) > 19 else fingerprint
+
+
+def update_incident(
+    machine: str, offer: UpdateOffer, outcome: str, answer: UpdateResponse | None, at_ms: int
+) -> Incident:
+    """The incident log's event for one update attempt (docs/SWITCHBOARD.md, "Self-update")."""
+    if outcome == "sent":
+        files = ", ".join(answer.files) if answer is not None and answer.files else "switchboard-remote"
+        return update_event(
+            machine=machine,
+            code="update_installed",
+            what=f"switchboard-remote on {machine} updated from {offer.from_version} to {offer.to_version}",
+            why=f"signed by the key {short_fingerprint(offer.fingerprint)}; replaced {files}, the old files kept as .prev",
+            at_ms=at_ms,
+        )
+    if outcome == "unknown":
+        return update_event(
+            machine=machine,
+            code="update_unknown",
+            what=f"an update of switchboard-remote on {machine} to {offer.to_version} has an unknown outcome",
+            why="the machine stopped answering after the bundle was sent",
+            at_ms=at_ms,
+        )
+    code = outcome.removeprefix("not_sent:")
+    return update_event(
+        machine=machine,
+        code="update_refused",
+        what=f"an update of switchboard-remote on {machine} to {offer.to_version} was not installed",
+        why=f"{code}: {update_refusal(machine, code)}",
+        at_ms=at_ms,
+    )
 
 
 @dataclass(frozen=True)
@@ -378,6 +446,9 @@ class RemoteTools:
         """Large videos held in memory for their one-time link (served by the HTTP app)."""
         self._link_fetch: _LinkFetch | None = None
         self._verbs: dict[str, tuple[int, frozenset[str]]] = {}
+        self._release_cache: tuple[tuple[tuple[str, int, int], ...], Release | None] | None = None
+        self._versions: dict[str, str] = {}
+        """The dispatcher version each machine last reported (`version`), for the update notes."""
         self._pending = PendingChecker(
             PendingCheckerOptions(
                 inventory=self.inventory,
@@ -429,6 +500,7 @@ class RemoteTools:
         await self.events.start()
         if self.agents is not None:
             self.agents.check = self._agent_check
+            self.agents.update = self.update_from_cli
             self.agents.on_link = self._on_link
             self.agents.on_relay_problem = self._on_relay_problem
             await self.agents.start()
@@ -611,8 +683,10 @@ class RemoteTools:
         self._logger.info(
             "tool call", {"tool": "list_remote_sessions", "machines": len(views), "reachable": sum(v.ok for v in views)}
         )
+        release = self._latest_release()
         clauses = {
             view.machine.name: open_clause(self.open_incidents(view.machine.name, failed_now=not view.ok))
+            + self._update_note(view.machine.name, release)
             for view in views
         }
         return ToolAnswer(format_list(views, total_machines=len(machines), notes=clauses))
@@ -702,7 +776,8 @@ class RemoteTools:
             if cut or (rows < RESIZE_ROWS[0] and (unread or len(screen.lstrip("\n").split("\n")) >= rows)):
                 note = cut_note(rows, found.item.allow_send and rows < RESIZE_ROWS[1], menu_cut=cut)
         answer = await self._describe(name, pane, label, screen, deadline, suggestion=captured.suggestion)
-        return ToolAnswer(self._with_clause(name, answer.text + note), answer.is_error)
+        update = self._update_note(name, self._latest_release())
+        return ToolAnswer(self._with_clause(name, answer.text + note) + update, answer.is_error)
 
     def _log_answer(self, machine: str, pane: PaneInfo, path: str, reason: str | None = None) -> None:
         """Which path answered `remote_status` (no screen text)."""
@@ -934,6 +1009,7 @@ class RemoteTools:
             return False
         verbs = frozenset(result.data.verbs)
         self._verbs[name] = (self._now(), verbs)
+        self._versions[name] = result.data.version
         return verb not in verbs
 
     async def remote_send_keys(
@@ -1385,6 +1461,8 @@ class RemoteTools:
             )
             return ToolAnswer(NEEDS_RISKY_OK, True)
         self.confirmations.consume(key)
+        if item.kind == UPDATE:
+            return await self._confirm_update(item, risky_ok, deadline)
         if item.kind == CLEAR:
             # One clear per draft: a second prepared clear of the same pane would press another Ctrl+C.
             self.confirmations.drop_pane(item.machine, item.pane_id, CLEAR)
@@ -1407,6 +1485,222 @@ class RemoteTools:
             },
         )
         return ToolAnswer(format_confirm_outcome(item, outcome, detail), outcome != "sent")
+
+    # --- self-update -------------------------------------------------------------------------
+
+    def _latest_release(self) -> Release | None:
+        """The newest release in `stateDir/releases` (re-read when the directory changed)."""
+        try:
+            stamp = tuple(
+                (entry.name, entry.stat().st_mtime_ns, entry.stat().st_size)
+                for entry in os.scandir(os.path.join(self._config.state_dir, "releases"))
+            )
+        except OSError:
+            return None
+        cached = self._release_cache
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        found = latest(self._config.state_dir)
+        self._release_cache = (stamp, found)
+        return found
+
+    def known_version(self, name: str) -> str | None:
+        """The machine's dispatcher version as last seen: an agent machine's hello, else the last
+        `version` answer."""
+        if self.agents is not None:
+            conn = self.agents.live(name)
+            if conn is not None:
+                return conn.hello.version
+        return self._versions.get(name)
+
+    def _update_note(self, name: str, release: Release | None) -> str:
+        """ " switchboard-remote there is 0.12.0; release 0.13.0 is published." when the machine's
+        known dispatcher is older than the newest published release."""
+        machine = self._machine(name)
+        if release is None or machine is None or machine.transport == "local":
+            return ""
+        version = self.known_version(name)
+        if version is None or not newer(release, version):
+            return ""
+        return f" Its switchboard-remote is {version}; release {release.version} is published, ask me to update {name}."
+
+    async def remote_update(self, machine: str | None, caller: Caller) -> ToolAnswer:
+        """Prepares installing the newest published release on a machine: checks the machine's
+        dispatcher (version, the `update` verb, `--allow-self-update`), reads back the versions and
+        the signing key, keeps a confirmation bound to the bundle's bytes. Sends nothing."""
+        deadline = self._deadline()
+        found = resolve_machine(self.inventory.machines, machine)
+        if not isinstance(found, MatchOk):
+            return ToolAnswer(
+                format_machine_problem(
+                    machine, [m.name for m in self.inventory.machines], ambiguous=found.reason == "ambiguous"
+                ),
+                True,
+            )
+        config = found.item
+        name = config.name
+
+        def refuse(message: str, reason: str) -> ToolAnswer:
+            self._logger.info("tool call", {"tool": "remote_update", "machine": name, "refused": reason})
+            return ToolAnswer(message, True)
+
+        if config.transport == "local":
+            return refuse(update_refusal(name, "local"), "local")
+        release = self._latest_release()
+        if release is None:
+            return refuse(
+                "No release is published on the hub. Build and sign one on your computer, then run "
+                "voice-coding-mcp release publish on the hub.",
+                "no_release",
+            )
+        result = await self.inventory.version(name, budget_seconds=deadline.left())
+        if not result.ok or not isinstance(result.data, VersionResponse):
+            return refuse(unreachable_sentence(name, result.error, result.detail), "unreachable")
+        data = result.data
+        self._versions[name] = data.version
+        self._verbs[name] = (self._now(), frozenset(data.verbs))
+        if "update" not in data.verbs:
+            return refuse(
+                f"switchboard-remote on {name} is version {data.version}, too old to update itself. Install "
+                f"{release.version} there by hand once; the setup guide for machines has the steps.",
+                "old_dispatcher",
+            )
+        if not data.allow_self_update:
+            return refuse(
+                f"Self-update is off on {name}: its switchboard-remote runs without --allow-self-update.",
+                "not_enabled",
+            )
+        if not newer(release, data.version):
+            return refuse(
+                f"switchboard-remote on {name} is already {data.version}; the newest published release is "
+                f"{release.version}.",
+                "up_to_date",
+            )
+        offer = UpdateOffer(
+            from_version=data.version,
+            to_version=release.version,
+            fingerprint=release.fingerprint,
+            sha256=release.sha256,
+            path=release.path,
+        )
+        dropped = [item for item in self.confirmations.drop_pane(name, "", UPDATE) if item.client == caller.fingerprint]
+        item, more = self.confirmations.add(
+            client=caller.fingerprint,
+            client_name=caller.name,
+            machine=name,
+            session="",
+            place=name,
+            pane_id="",
+            pane_pid=0,
+            session_id=None,
+            text="",
+            risky=[UPDATE_RISK],
+            permission_answer=False,
+            kind=UPDATE,
+            offer=offer,
+        )
+        self._logger.info(
+            "tool call",
+            {
+                "tool": "remote_update",
+                "machine": name,
+                "from": offer.from_version,
+                "to": offer.to_version,
+                "signer": offer.fingerprint,
+                "confirmation": item.id,
+            },
+        )
+        return ToolAnswer(format_update_readback(item, dropped=[*dropped, *more]))
+
+    async def _apply_update(
+        self, name: str, offer: UpdateOffer, left: float
+    ) -> tuple[str, str | None, UpdateResponse | None]:
+        """Sends exactly the bundle `offer` names (re-read and compared by SHA-256) to the machine,
+        and records the attempt in the incident log whatever its outcome."""
+        outcome, detail, answer = await self._send_update(name, offer, left)
+        try:
+            self.incident_log.write(update_incident(name, offer, outcome, answer, self._now()))
+        except Exception as err:
+            self._logger.error("incident observation failed", {"error": type(err).__name__})
+        self._logger.info(
+            "remote call", {"machine": name, "verb": "update", "outcome": outcome, "to": offer.to_version}
+        )
+        return outcome, detail, answer
+
+    async def _send_update(
+        self, name: str, offer: UpdateOffer, left: float
+    ) -> tuple[str, str | None, UpdateResponse | None]:
+        machine = self._machine(name)
+        if machine is None or machine.transport == "local":
+            return "not_sent:local", None, None
+        release = Release(
+            path=offer.path,
+            version=offer.to_version,
+            min_version="",
+            created="",
+            fingerprint=offer.fingerprint,
+            key_type="",
+            sha256=offer.sha256,
+            size=0,
+            targets=(),
+        )
+        try:
+            bundle = load_bundle(release)
+        except ReleaseError:
+            return "not_sent:changed", None, None
+        timeout = min(float(command_timeout_seconds(self._remote, machine)) + 30.0, left)
+        if timeout < MIN_UPDATE_SECONDS:
+            return "not_sent:slow", None, None
+        lock = self._send_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            outcome, detail, answer = await send_update(self.inventory.transport(name), bundle, timeout)
+        self._verbs.pop(name, None)
+        if answer is not None:
+            self._versions[name] = answer.to_version
+        else:
+            self._versions.pop(name, None)
+        return outcome, detail, answer
+
+    async def _confirm_update(self, item: Confirmation, risky_ok: bool, deadline: _Deadline) -> ToolAnswer:
+        assert item.offer is not None
+        # One update per machine: another prepared one (of any client) would only be refused.
+        self.confirmations.drop_pane(item.machine, "", UPDATE)
+        outcome, detail, _ = await self._apply_update(item.machine, item.offer, deadline.left())
+        self.audit.record(item, outcome=outcome, risky_ok=risky_ok)
+        self._logger.info(
+            "tool call",
+            {
+                "tool": "remote_send_confirm",
+                "confirmation": item.id,
+                "kind": UPDATE,
+                "machine": item.machine,
+                "outcome": outcome,
+            },
+        )
+        machine = self._machine(item.machine)
+        agent = machine is not None and machine.transport == "agent"
+        return ToolAnswer(format_update_outcome(item, outcome, detail, agent=agent), outcome != "sent")
+
+    async def update_from_cli(self, name: str, sha256: str) -> dict[str, object]:
+        """`remote-update <machine> --yes` for an agent machine, through the control socket (only the
+        hub holds its connection): the newest published release, only when its bundle is the one the
+        command line showed (`sha256`) and the machine is older."""
+        release = self._latest_release()
+        if release is None or release.sha256 != sha256:
+            return {"ok": False, "outcome": "not_sent:changed"}
+        version = self.known_version(name)
+        if version is None or not newer(release, version):
+            return {"ok": False, "outcome": "not_sent:not_newer"}
+        offer = UpdateOffer(
+            from_version=version,
+            to_version=release.version,
+            fingerprint=release.fingerprint,
+            sha256=release.sha256,
+            path=release.path,
+        )
+        outcome, _, answer = await self._apply_update(name, offer, 120.0)
+        self.audit.record_update(machine=name, offer=offer, outcome=outcome, client="cli")
+        return {"ok": outcome == "sent", "outcome": outcome, "files": list(answer.files) if answer else []}
 
     # --- attachments ---------------------------------------------------------------------------
 

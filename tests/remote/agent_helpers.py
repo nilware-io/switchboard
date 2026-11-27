@@ -240,10 +240,12 @@ class MachineLink:
     """The real machine side without ssh: the dispatcher in serve mode (a child process on the fake
     tmux) and the relay (a thread here), wired with pipes as sshd and ssh would carry them."""
 
-    def __init__(self, world: RemoteWorld, socket_path: str, machine: str, policy: list[str]) -> None:
+    def __init__(
+        self, world: RemoteWorld, socket_path: str, machine: str, policy: list[str], dispatcher: str = DISPATCHER
+    ) -> None:
         self.world = world
         self.dispatcher = subprocess.Popen(
-            [sys.executable, "-I", DISPATCHER, "--serve", *policy],
+            [sys.executable, "-I", dispatcher, "--serve", *policy],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             env={**world.tmux_env(), "PATH": "/usr/bin:/bin"},

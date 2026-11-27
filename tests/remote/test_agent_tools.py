@@ -20,10 +20,12 @@ from tests.helpers import FakeClock, LogCapture, claude_config
 from tests.remote.agent_helpers import MachineLink, agent_machine, agents_section, socket_dir, wait_until
 from tests.remote.helpers import SESSION_A, SESSION_B, RemoteWorld, pane
 from tests.remote.menu_fixtures import capture, menu_lines
+from tests.remote.release_helpers import OPENSSH, bundle, install_machine, new_key, programs
 from tests.test_cli import run_cli
 from tests.usage.helpers import S1, assistant, user, write_transcript
 from voice_coding_mcp.config import Config, parse_config
 from voice_coding_mcp.remote import dispatcher as d
+from voice_coding_mcp.remote import release as r
 from voice_coding_mcp.remote.audit import read_audit
 from voice_coding_mcp.remote.tools import Caller, RemoteTools, RemoteToolsOptions
 from voice_coding_mcp.remote.watcher import Watcher, WatcherOptions
@@ -330,3 +332,50 @@ async def test_status_and_remote_check_without_a_running_hub(ctx: Ctx) -> None:
     code, io = await run_cli("remote-check", "--config", ctx.config_path)
     assert code == 1
     assert "  not checked: the hub is not running (only the hub holds agent connections)" in io.stdout
+
+
+async def test_self_update_over_the_agent_transport_and_through_the_control_socket(ctx: Ctx, tmp_path: Path) -> None:
+    if OPENSSH is None or OPENSSH < d.MIN_OPENSSH:
+        pytest.skip(f"needs OpenSSH 8.1 or newer at {d.SSH_KEYGEN}")
+    key = new_key(tmp_path, "release")
+    installed = install_machine(Path(ctx.world.home), key)
+    policy = [*POLICY, "--allow-self-update"]
+    link = MachineLink(ctx.world, ctx.socket, "laptop", policy, dispatcher=str(installed))
+    ctx.links.append(link)
+    assert ctx.tools.agents is not None
+    await wait_until(lambda: ctx.tools.agents.live("laptop") is not None)
+    for version in ("0.13.1", "0.13.2"):
+        path = tmp_path / f"{version}.bundle"
+        path.write_bytes(bundle(key, tmp_path / "work", version=version))
+        if version == "0.13.1":
+            r.publish(str(path), ctx.config.state_dir)
+    readback = await ctx.tools.remote_update("laptop", OWNER)
+    assert readback.text.startswith(f"Ready to update switchboard-remote on laptop from {d.VERSION} to 0.13.1"), (
+        readback
+    )
+    ctx.later()
+    done = await ctx.tools.remote_send_confirm("4172", True, OWNER)
+    assert done.text == (
+        "Updated switchboard-remote on laptop to 0.13.1. Its connector starts the new version now, so it is back "
+        "in a few seconds."
+    )
+    assert installed.read_bytes() == programs("0.13.1")[d.UPDATE_PRODUCT]
+    assert link.dispatcher.wait(20) == d.EXIT_UPDATED
+    # What the connector does next: start the dispatcher again, now the new file.
+    await wait_until(lambda: ctx.tools.agents.live("laptop") is None)
+    link = MachineLink(ctx.world, ctx.socket, "laptop", policy, dispatcher=str(installed))
+    ctx.links.append(link)
+    await wait_until(lambda: ctx.tools.agents.live("laptop") is not None)
+    live = ctx.tools.agents.live("laptop")
+    assert live is not None
+    assert live.hello.version == "0.13.1"
+    # The command line: through the running hub's control socket.
+    r.publish(str(tmp_path / "0.13.2.bundle"), ctx.config.state_dir)
+    code, io = await run_cli("remote-update", "laptop", "--config", ctx.config_path)
+    assert code == 0, io.stderr
+    assert io.stdout.startswith("laptop: switchboard-remote 0.13.1 -> switchboard-remote 0.13.2")
+    code, io = await run_cli("remote-update", "laptop", "--yes", "--config", ctx.config_path)
+    assert code == 0, io.stderr
+    assert installed.read_bytes() == programs("0.13.2")[d.UPDATE_PRODUCT]
+    lines = (Path(ctx.config.state_dir) / "incidents.jsonl").read_text()
+    assert lines.count('"code":"update_installed"') == 2
