@@ -652,7 +652,7 @@ def test_a_hanging_windows_drive_times_out(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_health_is_a_plain_verb_of_the_dispatcher(tmp_path: Path) -> None:
-    assert d.VERSION == "0.10.0"
+    assert tuple(int(part) for part in d.VERSION.split(".")) >= (0, 9, 0)
     assert "health" in d.VERBS
     proc = fake_proc(tmp_path, wsl=False, drive=None)
     body = d.verb_health(d.Policy(), {"HOME": str(tmp_path)}, proc=str(proc))

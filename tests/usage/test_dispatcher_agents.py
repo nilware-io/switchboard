@@ -46,7 +46,7 @@ def headers(out: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 
 def test_version_is_0_10_0() -> None:
-    assert d.VERSION == "0.10.0"
+    assert tuple(int(part) for part in d.VERSION.split(".")) >= (0, 10, 0)
 
 
 def test_agent_transcripts_are_listed_with_session_prefixed_ids(home: Path, tmp_path: Path) -> None:

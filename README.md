@@ -78,6 +78,7 @@ This fork (nilware-io/switchboard) adds tools to talk to Claude Code sessions th
 - `pending_input`: which sessions wait for you, and what each asks. An optional watcher pushes a notification when one starts waiting or finishes a long turn.
 - `remote_send` and `remote_send_confirm`: type an instruction into a session after a read-back and your yes in a later turn; off by default, opt-in per machine in two places.
 - `remote_send_keys` and `remote_resize`: answer a menu on a session's screen with keys (arrows, enter, escape, a choice number) or make a window bigger, with the same read-back and confirm; same opt-ins as `remote_send`.
+- `remote_clear_input`: clear what is typed in an idle Claude Code session's input (it blocks `remote_send`), with the same read-back and confirm; Claude Code's grey prompt suggestion counts as nothing typed. Needs `switchboard-remote` 0.11.0.
 - `usage_report` and `voice-coding-mcp usage`: active hours, billable amount and token cost per project or session.
 - `timesheet_summary` and `voice-coding-mcp timesheet`: a draft timesheet per client and project (owner hours, agent hours, commits, pull requests) that you adjust and approve before exporting it; nothing is sent anywhere.
 

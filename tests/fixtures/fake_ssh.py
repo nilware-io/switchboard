@@ -148,6 +148,9 @@ def main() -> None:
         "SSH_CONNECTION": "127.0.0.1 50000 127.0.0.1 22",
         "SWITCHBOARD_REMOTE_TEST": "1",
         "SWITCHBOARD_REMOTE_TEST_TMUX": FAKE_TMUX,
+        # `clear` skips its waits (about 2.5 s per call); tests/remote/test_dispatcher_clear.py
+        # checks them.
+        "SWITCHBOARD_REMOTE_TEST_CLEAR_NO_WAIT": "1",
         "FAKE_TMUX_SCENARIO": config["scenario"],
         "FAKE_TMUX_LOG": config["tmuxLog"],
     }

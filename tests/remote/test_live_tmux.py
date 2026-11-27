@@ -123,3 +123,150 @@ def test_send_types_one_bracketed_paste_then_enter_on_an_isolated_tmux_server(so
     assert received == b"\x1b[200~line one\rline two with 'quotes' $(not run) C-c Enter\x1b[201~\r", received
     buffers = subprocess.run([*base, "list-buffers"], capture_output=True, text=True, check=False, timeout=10)
     assert "sb-" not in buffers.stdout, "the send buffer is deleted"
+
+
+def test_clear_and_the_prompt_suggestion_on_an_isolated_tmux_server(socket_name: str, tmp_path: Path) -> None:
+    """Real tmux behaviour the fakes only model: `capture-pane -e` keeps the dim attribute of a prompt
+    suggestion (cut from the plain screen, reported apart) and `send-keys C-c` reaches the program as
+    one byte 3; `clear` then sees the returning suggestion as an empty box. Takes about 3 s (the
+    verb's own waits)."""
+    base = ["tmux", "-L", socket_name, "-f", "/dev/null"]
+    record = tmp_path / "received.bin"
+    subprocess.run(
+        [
+            *base,
+            "new-window",
+            "-d",
+            "-t",
+            "fpga",
+            "-n",
+            "tui",
+            sys.executable,
+            "-I",
+            FAKE_TUI,
+            str(record),
+            "input-box",
+        ],
+        check=True,
+        timeout=10,
+    )
+    deadline = time.monotonic() + 10
+    while not Path(f"{record}.ready").exists():
+        assert time.monotonic() < deadline, "fake TUI did not start"
+        time.sleep(0.05)
+    time.sleep(0.3)
+    env = {"HOME": str(tmp_path), "SWITCHBOARD_REMOTE_TEST": "1"}
+    if "TMUX_TMPDIR" in os.environ:
+        env["TMUX_TMPDIR"] = os.environ["TMUX_TMPDIR"]
+    claude_home = tmp_path / "claude"
+    (claude_home / "sessions").mkdir(parents=True)
+    policy = [
+        "--policy-from-hub",
+        "--sessions",
+        "fpga",
+        "--allow-send",
+        "--claude-home",
+        str(claude_home),
+        "--tmux-socket-name",
+        socket_name,
+        "--",
+    ]
+    panes = d.handle([*policy, "list"], env)["panes"]
+    assert isinstance(panes, list)
+    tui = next(p for p in panes if p["windowName"] == "tui")
+    session_id = "44444444-0000-4000-8000-00000000000b"
+    (claude_home / "sessions" / "1.json").write_text(
+        json.dumps({"pid": os.getpid(), "sessionId": session_id, "status": "idle", "tmux": f"fpga:@9.{tui['paneId']}"}),
+        encoding="utf-8",
+    )
+    captured = d.handle([*policy, "capture", tui["paneId"], "20"], env)
+    assert captured["ok"] is True, captured
+    screen = str(captured["text"])
+    assert "fix the parser" in screen
+    assert "suggestion" not in captured
+    draft = d.draft_hash(screen)
+    assert draft is not None
+    started = time.monotonic()
+    out = d.handle([*policy, "clear", tui["paneId"], str(tui["panePid"]), session_id, draft], env)
+    assert time.monotonic() - started >= d.CLEAR_STABLE_SECONDS + d.CLEAR_SETTLE_SECONDS
+    assert out == {
+        "protocol": 1,
+        "ok": True,
+        "pressed": True,
+        "cleared": True,
+        "remainingLines": 0,
+        "remainingChars": 0,
+    }, out
+    assert record.read_bytes() == b"\x03", "exactly one Ctrl+C, nothing else"
+    captured = d.handle([*policy, "capture", tui["paneId"], "20"], env)
+    assert captured["suggestion"] == "open a PR for this"
+    assert "open a PR" not in str(captured["text"])
+    again = d.handle([*policy, "clear", tui["paneId"], str(tui["panePid"]), session_id, draft], env)
+    assert again == {"protocol": 1, "ok": False, "error": "nothing_to_clear"}
+    assert record.read_bytes() == b"\x03"
+
+
+def test_two_concurrent_clear_processes_press_one_ctrl_c(socket_name: str, tmp_path: Path) -> None:
+    """Two one-shot dispatcher processes (forced command or local transport) clearing the same draft
+    at the same time: without the mutation lock both pressed Ctrl+C within Claude Code's exit window
+    and the program exited (red team, also seen on real Claude Code 2.1.332). With it the second waits,
+    then refuses. Takes about 6 s (two runs of the verb's waits)."""
+    base = ["tmux", "-L", socket_name, "-f", "/dev/null"]
+    record = tmp_path / "received.bin"
+    subprocess.run(
+        [
+            *base,
+            "new-window",
+            "-d",
+            "-t",
+            "fpga",
+            "-n",
+            "tui",
+            sys.executable,
+            "-I",
+            FAKE_TUI,
+            str(record),
+            "input-box",
+        ],
+        check=True,
+        timeout=10,
+    )
+    deadline = time.monotonic() + 10
+    while not Path(f"{record}.ready").exists():
+        assert time.monotonic() < deadline, "fake TUI did not start"
+        time.sleep(0.05)
+    time.sleep(0.3)
+    env = {"HOME": str(tmp_path), "SWITCHBOARD_REMOTE_TEST": "1", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    if "TMUX_TMPDIR" in os.environ:
+        env["TMUX_TMPDIR"] = os.environ["TMUX_TMPDIR"]
+    claude_home = tmp_path / "claude"
+    (claude_home / "sessions").mkdir(parents=True)
+    policy = [
+        "--policy-from-hub",
+        "--sessions",
+        "fpga",
+        "--allow-send",
+        "--claude-home",
+        str(claude_home),
+        "--tmux-socket-name",
+        socket_name,
+        "--",
+    ]
+    panes = d.handle([*policy, "list"], env)["panes"]
+    assert isinstance(panes, list)
+    tui = next(p for p in panes if p["windowName"] == "tui")
+    session_id = "44444444-0000-4000-8000-00000000000b"
+    (claude_home / "sessions" / "1.json").write_text(
+        json.dumps({"pid": os.getpid(), "sessionId": session_id, "status": "idle", "tmux": f"fpga:@9.{tui['paneId']}"}),
+        encoding="utf-8",
+    )
+    draft = d.draft_hash(str(d.handle([*policy, "capture", tui["paneId"], "20"], env)["text"]))
+    assert draft is not None
+    argv = [sys.executable, "-I", d.__file__, *policy, "clear", tui["paneId"], str(tui["panePid"]), session_id, draft]
+    procs = [subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, text=True) for _ in range(2)]
+    outs = [json.loads(p.communicate(timeout=30)[0]) for p in procs]
+    assert record.read_bytes() == b"\x03", (outs, record.read_bytes())
+    assert sorted(bool(out.get("cleared")) for out in outs) == [False, True], outs
+    refused = next(out for out in outs if not out.get("cleared"))
+    assert refused["ok"] is False, outs
+    assert refused["error"] in ("nothing_to_clear", "exit_armed"), outs

@@ -32,6 +32,7 @@ VERBS: tuple[str, ...] = (
     "attachments",
     "attachment",
     "health",
+    "clear",
 )
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
@@ -56,6 +57,7 @@ MAX_PANES = 512
 NAME_MAX = 64
 WAITING_MAX = 200
 CAPTURE_MAX_CHARS = 64 * 1024
+SUGGESTION_MAX_CHARS = 300
 
 
 class BadRequestError(ValueError):
@@ -141,6 +143,10 @@ class CaptureResponse(_Response):
     alternate_on: bool = Field(default=False, alias="alternateOn")
     """The pane shows its alternate screen (a full-screen program), which has no scrollback: only
     the visible rows can be captured (dispatcher 0.5.0 and newer)."""
+    suggestion: Annotated[str, _capped(SUGGESTION_MAX_CHARS)] | None = None
+    """Claude Code's prompt suggestion (dim text in its empty input box, nobody typed it), cut from
+    `text` (dispatcher 0.11.0 and newer; an older dispatcher leaves it in `text`, where it looks like
+    a draft)."""
 
 
 class VersionResponse(_Response):
@@ -195,6 +201,16 @@ class HealthResponse(_Response):
     memory_total_bytes: int | None = Field(default=None, alias="memoryTotalBytes", ge=0, le=MAX_BYTES)
     memory_available_bytes: int | None = Field(default=None, alias="memoryAvailableBytes", ge=0, le=MAX_BYTES)
     uptime_seconds: float | None = Field(default=None, alias="uptimeSeconds", ge=0, le=1e12)
+
+
+class ClearResponse(_Response):
+    """Dispatcher 0.11.0: one Ctrl+C was pressed; `cleared` when the input box is visibly empty
+    afterwards, else what is still in it (None when the second capture failed)."""
+
+    pressed: bool
+    cleared: bool
+    remaining_lines: int | None = Field(default=None, alias="remainingLines", ge=0)
+    remaining_chars: int | None = Field(default=None, alias="remainingChars", ge=0)
 
 
 class UsageResponse(BaseModel):
@@ -414,6 +430,7 @@ RESPONSE_MODELS: dict[str, type[_Response]] = {
     "resize": ResizeResponse,
     "attachments": AttachmentsResponse,
     "health": HealthResponse,
+    "clear": ClearResponse,
 }
 
 
