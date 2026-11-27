@@ -7,7 +7,8 @@
 #
 # Edit the hub address and the dispatcher's policy flags after "--" (the same flags as a forced
 # command: --sessions, --allow-usage, --allow-send, --allow-permission-answers, --send-to-any-pane,
-# --slash-commands, --claude-home). The policy is this line; the hub cannot change it.
+# --slash-commands, --claude-home, --allow-attachments, --outbox). The policy is this line; the hub
+# cannot change it.
 
 [Unit]
 Description=Switchboard: outbound connection to the hub
