@@ -141,11 +141,12 @@ def apply_adjustments(
             return found
         client_id = projects.get(name)
         client = next((c for c in document["clients"] if c["id"] == client_id), None)
-        if client is None:
-            raise TimesheetError(f"project {name!r} is not configured")
         found = {"project": name, "days": [], "notes": []}
-        client["projects"].append(found)
-        client["projects"].sort(key=lambda p: p["project"])
+        # A project an adjustment names that a new draft no longer has: under its client, or
+        # unassigned (moves only ever target configured projects).
+        group = client["projects"] if client is not None else document["unassigned"]
+        group.append(found)
+        group.sort(key=lambda p: p["project"])
         by_name[name] = found
         return found
 

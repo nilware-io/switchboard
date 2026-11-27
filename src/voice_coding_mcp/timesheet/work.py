@@ -261,6 +261,8 @@ class WorkCollector:
             "core.fsmonitor=",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "log.showSignature=false",
             "-C",
             path,
             "log",

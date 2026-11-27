@@ -90,6 +90,8 @@ class TimesheetTool:
         if not running.done():
             return ToolAnswer("I am still collecting the hours and commits. Ask me again in a minute.")
         if running.cancelled() or running.exception() is not None:
+            error = None if running.cancelled() else running.exception()
+            self._logger.warn("timesheet draft failed", {"period": period_id, "error": type(error).__name__})
             return ToolAnswer("I could not draft the timesheet. Run voice-coding-mcp timesheet draft to see why.", True)
         return ToolAnswer(spoken_summary(running.result()))
 

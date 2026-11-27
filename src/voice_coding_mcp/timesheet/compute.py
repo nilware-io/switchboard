@@ -20,7 +20,7 @@
   each. Agent time is never split.
 - Copies (a resumed or forked session repeats earlier lines with their times) count once: per
   machine, assistant lines by message id, other lines by kind and time; the session that started
-  first keeps them.
+  first keeps them (on a tie an owner-driven one, then the older file).
 """
 
 from __future__ import annotations
@@ -152,8 +152,14 @@ def voice_pieces(calls: Iterable[VoiceEvent], idle_gap_ms: int) -> list[Piece]:
 
 
 def deduplicate(sources: Sequence[Source]) -> list[list[Record]]:
-    """Each source's records without the copies another source (started earlier) also has."""
-    started = [min((r.t for r in s.transcript.records), default=0) for s in sources]
+    """Each source's records without the copies another source also has. The keeper is the source
+    that started first; on a tie (a fork starts with the original's first line) an owner-driven
+    transcript before an agent-driven one (an ask fork of the owner's session must not turn the
+    owner's history into agent time), then the older file."""
+    started = [
+        (min((r.t for r in s.transcript.records), default=0), is_agent_driven(s.transcript), s.transcript.mtime)
+        for s in sources
+    ]
     keeper: dict[tuple[object, ...], int] = {}
     for index, source in enumerate(sources):
         for record in source.transcript.records:

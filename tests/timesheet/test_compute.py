@@ -257,3 +257,12 @@ def test_unattributed_voice_time_does_not_take_from_projects() -> None:
     # The voice chain from 5 to 12 minutes and 1 second counts only after 10 minutes.
     assert result.days[VOICE_PROJECT]["2026-11-17"].owner_ms == 2 * MIN + 1_000
     assert result.wall_owner_ms == 12 * MIN + 1_000
+
+
+def test_an_agent_fork_does_not_take_the_owners_history() -> None:
+    fork = transcript([u(T0), a(T0 + 10 * MIN, "m1"), a(T0 + 40 * MIN, "m2")], tid=S2, entrypoint="sdk-cli")
+    original = transcript([u(T0), a(T0 + 10 * MIN, "m1")])
+    # The fork comes first in the list and starts at the same moment.
+    result = run([Source("local", fork), Source("local", original)])
+    assert minutes(result, "alpha", "2026-11-17", "owner") == 10
+    assert minutes(result, "alpha", "2026-11-17", "agent") == 1
