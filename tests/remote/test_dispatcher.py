@@ -68,10 +68,12 @@ def test_version_reports_verbs_and_policy(world: RemoteWorld) -> None:
             "health",
             "clear",
             "events",
+            "update",
         ],
         "allowSend": False,
         "allowUsage": True,
         "allowAttachments": False,
+        "allowSelfUpdate": False,
     }
 
 
