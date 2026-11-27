@@ -439,6 +439,46 @@ def test_the_real_jitter_stays_in_range(machine: Machine) -> None:
     assert 1 <= connector.delays[0] <= 2
 
 
+# --- self-update (0.13.0) ------------------------------------------------------------------------------
+
+
+def test_the_dispatchers_update_exit_is_its_own_reason(machine: Machine) -> None:
+    connector = machine.connector()
+    connector.options.command = [sys.executable, "-c", "import sys; sys.exit(77)"]
+    assert connector.attempt().reason == "updated"
+
+
+def test_after_an_update_it_connects_again_at_once_with_the_new_dispatcher(machine: Machine) -> None:
+    script = Script(machine, [("refused", 1), ("updated", 1), ("closed", 1)])
+    assert script.run() == [2, 4]
+    assert "updated: connecting again with the new dispatcher" in script.log.getvalue()
+    assert not script.connector.reexec
+
+
+def test_an_update_that_replaced_the_connector_ends_the_loop_for_a_reexec(machine: Machine, tmp_path: Path) -> None:
+    own = tmp_path / "switchboard-connect"
+    own.write_bytes(CONNECTOR.read_bytes())
+    log = io.StringIO()
+    connector = c.Connector(machine.options(), machine.env(), log=log, wait=lambda _s: False, script=str(own))
+
+    def attempt() -> c.Outcome:
+        # What `update` does: a new file renamed over the old name.
+        new = tmp_path / ".switchboard-connect.update-1"
+        new.write_bytes(CONNECTOR.read_bytes())
+        new.rename(own)
+        return c.Outcome("updated", 1)
+
+    connector.attempt = attempt  # type: ignore[method-assign]
+    assert connector.run() == 0
+    assert connector.reexec
+    assert "starting the new switchboard-connect" in log.getvalue()
+
+
+def test_version_prints_the_version(capsys: pytest.CaptureFixture[str]) -> None:
+    assert c.main(["--version"]) == 0
+    assert capsys.readouterr().out == f"switchboard-connect {c.VERSION}\n"
+
+
 # --- the script --------------------------------------------------------------------------------------
 
 
