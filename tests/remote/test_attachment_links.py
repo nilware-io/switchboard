@@ -408,3 +408,154 @@ async def test_the_request_log_never_shows_the_token(served: Served) -> None:
 async def test_the_host_check_covers_the_link(served: Served) -> None:
     response = await served.app.http.get(served.path, headers={"Host": "evil.example"})
     assert response.status_code == 403
+
+
+# --- regressions (review): the fetch slot, a finished fetch, aborted and orphaned responses ----
+
+
+async def test_a_cancelled_call_leaves_the_slot_with_its_fetch(big: Tools) -> None:
+    # The MCP client cancels the call while it waits for a large video: the background fetch keeps
+    # the one slot until it ends, and the slot is released once, not twice.
+    big.transport.hold = asyncio.Event()
+    call = asyncio.create_task(big.tools.remote_attachment("dev", None, "video", OWNER))
+    await big.transport.started.wait()
+    fetch = big.tools._link_fetch
+    assert fetch is not None
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert big.tools._fetching == 1
+    assert (await big.tools.remote_attachment("dev", None, "image", OWNER)).text == att.BUSY_WORDS
+    big.transport.hold.set()
+    await fetch.task
+    await asyncio.sleep(0)
+    assert big.tools._fetching == 0
+    assert big.tools._link_fetch is None
+    again = await big.tools.remote_attachment("dev", None, "video", OWNER)
+    assert LINK_RE.search(again.text) is not None
+    assert big.transport.fetches == 1
+    assert big.tools._fetching == 0
+
+
+async def test_a_finished_fetch_is_not_replayed_after_its_link_ended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tools_module, "MIN_DEADLINE_SECONDS", 0.2)
+    monkeypatch.setattr(tools_module, "DEADLINE_MARGIN_SECONDS", 19.8)
+    clock = FakeClock(T0)
+    config = make_config(tmp_path, [machine("dev", allowAttachments=True)])
+    manager = await make_manager(config)
+    tools, transport = video_tools(config, manager, mkv_sized(BIG), clock=clock)
+    try:
+        transport.hold = asyncio.Event()
+        first = await tools.remote_attachment("dev", None, "video", OWNER)
+        assert "Ask me for it again in a moment" in first.text
+        fetch = tools._link_fetch
+        assert fetch is not None
+        transport.hold.set()
+        await fetch.task
+        await asyncio.sleep(0)
+        clock.t += 20 * 60 * 1000
+        # The old link expired: a new request fetches again and answers with a live link.
+        answer = await tools.remote_attachment("dev", None, "video", OWNER)
+        found = LINK_RE.search(answer.text)
+        assert found is not None, answer.text
+        assert tools.links.get(found.group(2)) is not None
+        assert transport.fetches == 2
+    finally:
+        await tools.stop()
+        await manager.shutdown("test over")
+
+
+class Client:
+    """An ASGI client that behaves like uvicorn: after `leave()` its send returns at once and its
+    receive reports the disconnect; `pause` (when set) holds the next body message."""
+
+    def __init__(self, *, leave_after: int | None = None) -> None:
+        self.status: int | None = None
+        self.bodies: list[bytes] = []
+        self.gone = asyncio.Event()
+        self.leave_after = leave_after
+        self.pause: asyncio.Event | None = None
+        self.paused = asyncio.Event()
+        self._asked = False
+
+    async def receive(self) -> dict[str, object]:
+        if not self._asked:
+            self._asked = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await self.gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(self, message: dict[str, object]) -> None:
+        if self.gone.is_set():
+            return
+        if message["type"] == "http.response.start":
+            status = message["status"]
+            assert isinstance(status, int)
+            self.status = status
+            return
+        if self.pause is not None:
+            self.paused.set()
+            await self.pause.wait()
+        body = message["body"]
+        assert isinstance(body, bytes)
+        self.bodies.append(body)
+        if self.leave_after is not None and len(self.bodies) >= self.leave_after:
+            self.gone.set()
+
+
+def scope_for(range_header: str | None = None) -> dict[str, object]:
+    headers = [] if range_header is None else [(b"range", range_header.encode())]
+    return {"type": "http", "method": "GET", "headers": headers}
+
+
+async def test_aborted_open_ended_ranges_cost_only_what_was_sent() -> None:
+    # A player asks for `bytes=N-` on every seek and drops the connection after a few KB: the link
+    # must survive many seeks, and an aborted range stops being copied.
+    store = links.LinkStore(now=FakeClock(T0))
+    size = 10 * 1024 * 1024
+    link = add(store, bytes(size), size=size)
+    for i in range(30):
+        client = Client(leave_after=1)
+        await links.serve_link(store, link, scope_for(f"bytes={i * 100_000}-"), client.receive, client.send)  # type: ignore[arg-type]
+        assert client.status == 206
+        assert len(client.bodies) == 1
+    assert store.get(link.token) is link
+    assert link.served <= 30 * 2 * links.SEND_BYTES
+    assert link.requests == 30
+
+
+async def test_the_budget_is_charged_per_slice_and_cuts_the_response() -> None:
+    store = links.LinkStore(now=FakeClock(T0))
+    size = 3 * links.SEND_BYTES
+    link = add(store, bytes(size), size=size)
+    link.served = links.MAX_SERVED_FACTOR * size - links.SEND_BYTES - 1
+    client = Client()
+    await links.serve_link(store, link, scope_for(), client.receive, client.send)  # type: ignore[arg-type]
+    # The first slice still fit, the second did not: the response stopped and the link ended.
+    assert client.status == 200
+    assert len(client.bodies) == 1
+    assert store.get(link.token) is None
+
+
+@pytest.mark.parametrize("end", ["evicted", "expired"])
+async def test_a_stalled_reader_does_not_keep_an_ended_link_alive(end: str) -> None:
+    clock = FakeClock(T0)
+    store = links.LinkStore(now=clock, max_bytes=4 * links.SEND_BYTES)
+    size = 3 * links.SEND_BYTES
+    link = add(store, bytes(size), size=size)
+    client = Client()
+    client.pause = asyncio.Event()
+    serving = asyncio.create_task(links.serve_link(store, link, scope_for(), client.receive, client.send))  # type: ignore[arg-type]
+    await client.paused.wait()
+    if end == "evicted":
+        add(store, bytes(2 * links.SEND_BYTES), name="newer.mkv")
+    else:
+        clock.t += links.LINK_TTL_MS
+        store.sweep()
+    assert link.data == b""
+    client.pause.set()
+    await asyncio.wait_for(serving, 5)
+    # The slice in flight went out; nothing after it.
+    assert len(client.bodies) == 1

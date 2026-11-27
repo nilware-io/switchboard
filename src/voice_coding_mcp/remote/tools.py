@@ -179,6 +179,22 @@ class ToolAnswer:
     """`remote_attachment`: the checked media to return as MCP content after the text."""
 
 
+class _FetchSlot:
+    """The one fetch slot a `remote_attachment` call takes; released exactly once, by the call or,
+    once handed over, by the background fetch for a link (a cancelled call must not release a slot
+    its fetch still holds)."""
+
+    def __init__(self, release: Callable[[], None]) -> None:
+        self._release = release
+        self.handed_over = False
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._release()
+
+
 @dataclass
 class _LinkFetch:
     """A large video on its way to a link: the fetch outlives the tool call that started it."""
@@ -1022,77 +1038,80 @@ class RemoteTools:
         machine_name = found.name
         waiting = self._link_fetch
         if waiting is not None:
-            # A large video still on its way (or arrived after its call gave up): asking for it
-            # again waits for it instead of fetching it a second time.
+            # A large video still on its way: asking for it again waits for it instead of
+            # fetching it a second time. Once it is done it is forgotten (`_fetch_done`); a link
+            # it made is found again by `links.find`, as long as it is live.
             if waiting.machine == machine_name and pick([waiting.entry], name, kind) is not None:
                 return await self._link_answer(waiting, self._deadline())
-            if not waiting.task.done():
-                return ToolAnswer(BUSY_WORDS, True)
-            self._link_fetch = None
+            return ToolAnswer(BUSY_WORDS, True)
         if self._fetching >= MAX_CONCURRENT_FETCHES:
             return ToolAnswer(BUSY_WORDS, True)
         self._fetching += 1
-        handed_over = False
+        slot = _FetchSlot(self._release_fetch)
         try:
-            answer, handed_over = await self._remote_attachment(machine_name, name, kind, caller)
-            return answer
+            return await self._remote_attachment(machine_name, name, kind, caller, slot)
         finally:
-            if not handed_over:
-                self._fetching -= 1
+            if not slot.handed_over:
+                slot.release()
 
     async def _link_answer(self, waiting: _LinkFetch, deadline: _Deadline) -> ToolAnswer:
         """The answer of a large video's fetch once it is done, or that it is still coming."""
         done, _ = await asyncio.wait({waiting.task}, timeout=max(0.0, deadline.left()))
         if not done:
             return ToolAnswer(format_still_coming(waiting.machine, waiting.entry))
-        if self._link_fetch is waiting:
-            self._link_fetch = None
         return waiting.task.result()
 
-    def _release_fetch(self, _task: asyncio.Task[ToolAnswer]) -> None:
+    def _release_fetch(self) -> None:
         self._fetching -= 1
 
+    def _fetch_done(self, waiting: _LinkFetch, slot: _FetchSlot) -> None:
+        """A background fetch ended: its slot is free, and it is no longer the one being waited for."""
+        slot.release()
+        if self._link_fetch is waiting:
+            self._link_fetch = None
+
     async def _remote_attachment(
-        self, machine_name: str, name: str | None, kind: str | None, caller: Caller
-    ) -> tuple[ToolAnswer, bool]:
-        """(answer, whether the fetch slot went to a background fetch for a link)."""
+        self, machine_name: str, name: str | None, kind: str | None, caller: Caller, slot: _FetchSlot
+    ) -> ToolAnswer:
+        """The answer; `slot` is handed over when a background fetch for a link takes it."""
         if not self.fetches.allows(machine_name):
-            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True), False
+            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
         deadline = self._deadline()
         listing, problem = await self._list_attachments(machine_name, deadline)
         if listing is None:
             assert problem is not None
-            return problem, False
+            return problem
         entry = pick(listing.attachments, name, kind)
         if entry is None:
             what = {"image": "image", "audio": "audio file", "video": "video"}.get(kind or "", "media file")
             if name:
-                return ToolAnswer(
-                    f"I found no {what} called {quote(name)} in the outbox on {machine_name}.", True
-                ), False
-            return ToolAnswer(f"The outbox on {machine_name} has no {what}.", True), False
+                return ToolAnswer(f"I found no {what} called {quote(name)} in the outbox on {machine_name}.", True)
+            return ToolAnswer(f"The outbox on {machine_name} has no {what}.", True)
         large = entry.kind == "video" and entry.size > EMBED_MAX_BYTES
         if large:
             held = self.links.find(machine_name, entry.name, entry.size, entry.mtime)
             if held is not None:
                 # The same file is still held for a link: hand that link out again.
                 self._audit_fetch(machine_name, entry, entry.kind, 0, outcome="link_again", caller=caller)
-                return ToolAnswer(format_link(held, self._link_url(held), entry.mtime, self._now())), False
+                return ToolAnswer(format_link(held, self._link_url(held), entry.mtime, self._now()))
         if not self.fetches.fits(entry.size):
-            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True), False
+            return ToolAnswer("That is a lot of attachments in a short time. Try again in a few minutes.", True)
         # Counted before the machine is asked, so refused, failed and rejected transfers count too.
         reservation = self.fetches.reserve(machine_name, entry.size)
         if not large:
-            return await self._fetch_and_audit(machine_name, entry, deadline, reservation, caller), False
+            return await self._fetch_and_audit(machine_name, entry, deadline, reservation, caller)
         # Too large for the tool call's time: the fetch runs on in the background (holding the
         # fetch slot) for up to LINK_FETCH_SECONDS, and a later call for it gets the link.
         task = asyncio.create_task(
             self._background_fetch(machine_name, entry, _Deadline(LINK_FETCH_SECONDS), reservation, caller)
         )
-        task.add_done_callback(self._release_fetch)
+        # Handed over before anything is awaited: if this call is cancelled while it waits, the
+        # slot stays with the fetch.
+        slot.handed_over = True
         waiting = _LinkFetch(machine=machine_name, entry=entry, task=task)
+        task.add_done_callback(lambda _task: self._fetch_done(waiting, slot))
         self._link_fetch = waiting
-        return await self._link_answer(waiting, deadline), True
+        return await self._link_answer(waiting, deadline)
 
     async def _background_fetch(
         self, machine: str, entry: AttachmentInfo, deadline: _Deadline, reservation: Reservation, caller: Caller

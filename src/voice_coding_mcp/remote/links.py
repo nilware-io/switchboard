@@ -5,7 +5,8 @@ A video over `EMBED_MAX_BYTES` cannot go back inside an MCP tool result (a 250 M
 333 MB of base64). The hub keeps its own cleaned copy in memory only, never on disk, under a random
 256-bit token for `LINK_TTL_MS`, and serves it at `<publicUrl>/attachments/<token>` with HTTP range
 support (phones play video by ranges). The store holds at most `MAX_LINK_BYTES` in all (the oldest
-link is dropped beyond it) and serves at most `MAX_SERVED_FACTOR` times a file's size per link.
+link is dropped beyond it) and serves at most `MAX_SERVED_FACTOR` times a file's size per link,
+counted as bytes are sent.
 
 Lookup is by the SHA-256 of the token, so the dict lookup and the comparison after it depend only
 on the hash, never on how many characters of a guess are right; the token itself is kept in memory
@@ -14,6 +15,8 @@ only to hand the same link out again. Logs and audit lines carry only `log.finge
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import re
@@ -151,12 +154,24 @@ class LinkStore:
         for link in list(self._links.values()):
             self._end(link, "closed")
 
+    def live(self, link: Link) -> bool:
+        """Whether the link is still held (not expired, evicted, used up or closed)."""
+        return self._links.get(link.key) is link and link.expires > self.now()
+
     def served(self, link: Link, length: int) -> bool:
-        """Counts `length` bytes about to be served; False (and the link dropped) past the limit."""
+        """Counts `length` bytes about to be handed to the client; False (and the link dropped) past
+        the limit. Charged per slice as it is sent, so a player that asks for `bytes=N-` and drops
+        the connection after a few KB (every seek) pays only for what it got."""
+        if not self.can_serve(link, length):
+            return False
+        link.served += length
+        return True
+
+    def can_serve(self, link: Link, length: int) -> bool:
+        """Whether `length` more bytes fit the link's budget; False (and the link dropped) if not."""
         if link.served + length > MAX_SERVED_FACTOR * max(1, len(link.data)):
             self._end(link, "served_limit")
             return False
-        link.served += length
         return True
 
 
@@ -204,11 +219,24 @@ def link_headers(link: Link) -> list[tuple[bytes, bytes]]:
     ]
 
 
+async def _disconnected(receive: Receive, gone: asyncio.Event) -> None:
+    """Sets `gone` when the client disconnects (the request body of a GET is empty, so every other
+    message is skipped)."""
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            gone.set()
+            return
+
+
 async def serve_link(store: LinkStore, link: Link, scope: Scope, receive: Receive, send: Send) -> None:
     """GET or HEAD of a live link: 200 with the whole file, 206 with one range, 416 for a range
-    past the end. The bytes go out as slices of the held copy, nothing is copied whole."""
-    data = link.data
-    size = len(data)
+    past the end. The bytes go out as slices of the held copy, nothing is copied whole. Before each
+    slice the link must still be live and within its served budget, and the client still there:
+    otherwise the response stops (the connection closes short of Content-Length). So a stalled or
+    slow reader keeps at most one slice alive once its link has ended, and an aborted range costs
+    the budget only what was sent."""
+    size = len(link.data)
     headers = dict((k.decode("latin-1").lower(), v.decode("latin-1")) for k, v in scope.get("headers", []))
     wanted = parse_range(headers.get("range"), size)
     head = scope["method"] == "HEAD"
@@ -234,7 +262,7 @@ async def serve_link(store: LinkStore, link: Link, scope: Scope, receive: Receiv
         link.ranges += 1
         extra = [(b"content-range", f"bytes {first}-{last}/{size}".encode("ascii"))]
     length = last - first + 1 if size else 0
-    if not head and not store.served(link, length):
+    if not head and length and not store.can_serve(link, min(length, SEND_BYTES)):
         await send(
             {
                 "type": "http.response.start",
@@ -254,10 +282,22 @@ async def serve_link(store: LinkStore, link: Link, scope: Scope, receive: Receiv
     if head or length == 0:
         await send({"type": "http.response.body", "body": b""})
         return
-    view = memoryview(data)
-    position = first
-    end = last + 1
-    while position < end:
-        stop = min(end, position + SEND_BYTES)
-        await send({"type": "http.response.body", "body": bytes(view[position:stop]), "more_body": stop < end})
-        position = stop
+    gone = asyncio.Event()
+    watcher = asyncio.create_task(_disconnected(receive, gone))
+    try:
+        position = first
+        end = last + 1
+        while position < end:
+            stop = min(end, position + SEND_BYTES)
+            if gone.is_set() or not store.live(link) or not store.served(link, stop - position):
+                return
+            # A copy of one slice: no reference to the held bytes outlives this line.
+            body = bytes(memoryview(link.data)[position:stop])
+            await send({"type": "http.response.body", "body": body, "more_body": stop < end})
+            position = stop
+            # The server's send returns at once after a disconnect: give the watcher its turn.
+            await asyncio.sleep(0)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
