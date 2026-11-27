@@ -523,7 +523,7 @@ def test_the_docs_state_the_real_outbox_and_caps() -> None:
     assert f"`~/{d.OUTBOX_DIR}`" in contract
     assert f"images {d.ATTACHMENT_CAPS['image']:,} bytes" in contract
     assert f"audio {d.ATTACHMENT_CAPS['audio'] // (1024 * 1024)} MiB" in contract
-    assert f"video {d.ATTACHMENT_CAPS['video'] // (1024 * 1024)} MiB" in contract
+    assert f"video {d.ATTACHMENT_CAPS['video']:,} bytes" in contract
     for _, mime in d.MEDIA_FORMATS.values():
         assert f"`{mime}`" in contract, mime
     reference = (repo / "docs" / "REFERENCE.md").read_text(encoding="utf-8")

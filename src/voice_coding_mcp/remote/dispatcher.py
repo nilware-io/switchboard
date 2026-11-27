@@ -1608,9 +1608,11 @@ OUTBOX_DIR = os.path.join(".local", "share", "switchboard", "outbox")
 MAX_ATTACHMENTS = 50
 MAX_OUTBOX_ENTRIES = 1000
 """Directory entries looked at by `attachments` (the rest count as skipped)."""
-ATTACHMENT_CAPS = {"image": 3_750_000, "audio": 8 * 1024 * 1024, "video": 16 * 1024 * 1024}
+ATTACHMENT_CAPS = {"image": 3_750_000, "audio": 8 * 1024 * 1024, "video": 250_000_000}
 """Bytes per file by kind. An image stays at most 5,000,000 bytes as base64 (the Claude API's image
-limit is 5 MB); audio and video are sent in chunks, so only the hub's response cap bounds them."""
+limit is 5 MB); audio and video are sent in chunks, so only the hub's response cap bounds them. The
+video cap is the owner's "250 MB" in decimal bytes; the hub hands a video over 16 MiB to the client
+as a one-time link instead of inside the tool result."""
 ATTACHMENT_CHUNK_BYTES = 1024 * 1024
 """Raw bytes per chunk document: about 1.4 MB as base64, well inside one 5 MiB agent frame."""
 SNIFF_BYTES = 256

@@ -30,10 +30,12 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+
 from ..clock import now_ms
 from ..log import Logger
 from .config import MACHINE_NAME_RE, MachineConfig, RemoteConfig
-from .protocol import ARG_RE, ResponseError, parse_response, request_tokens, response_cap
+from .protocol import ARG_RE, AttachmentStream, ResponseError, parse_response, request_tokens, response_cap
 from .transport import TransportError, TransportResult
 
 PROTOCOL = 1
@@ -319,10 +321,17 @@ class AgentConnection:
                 return
 
     async def request(
-        self, verb: str, args: Sequence[str], data: str | None, deadline: float
+        self,
+        verb: str,
+        args: Sequence[str],
+        data: str | None,
+        deadline: float,
+        sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]] | TransportResult | _Closed:
         """The documents of one request, a failed result, or _Closed (with `written` folded in:
-        _Closed is returned only after the request frame was handed to the connection)."""
+        _Closed is returned only after the request frame was handed to the connection). With
+        `sink` each document goes there as it arrives instead (the list stays empty); a
+        ResponseError from it cancels the request as `bad_response`."""
         started = time.monotonic()
 
         def failed(code: TransportError, detail: str | None = None) -> TransportResult:
@@ -364,7 +373,15 @@ class AgentConnection:
                     if size > cap:
                         self.send_later({"t": "cancel", "id": request_id})
                         return failed("bad_response")
-                    docs.append(answer["doc"])
+                    if sink is None:
+                        docs.append(answer["doc"])
+                    else:
+                        try:
+                            sink(answer["doc"])
+                        except ResponseError:
+                            if answer.get("more"):
+                                self.send_later({"t": "cancel", "id": request_id})
+                            return failed("bad_response")
                     if not answer.get("more"):
                         return docs
         except TimeoutError:
@@ -758,11 +775,16 @@ class AgentTransport:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         attempts = 2 if verb in READ_ONLY_VERBS else 1
         outcome: list[dict[str, Any]] | TransportResult | _Closed = _Closed(False)
+        stream: AttachmentStream | None = None
         for _ in range(attempts):
             conn = self._hub.live(self.machine.name)
             if conn is None:
                 return failed("not_connected")
-            outcome = await conn.request(verb, args, data, deadline)
+            # An attachment is decoded chunk by chunk as the frames arrive (a fresh stream for a
+            # retry on a new connection).
+            stream = AttachmentStream() if verb == "attachment" else None
+            sink = stream.feed if stream is not None else None
+            outcome = await conn.request(verb, args, data, deadline, sink)
             if not (isinstance(outcome, _Closed) and outcome.replaced):
                 break
         if isinstance(outcome, _Closed):
@@ -770,9 +792,13 @@ class AgentTransport:
             return failed("disconnected")
         if isinstance(outcome, TransportResult):
             return outcome
-        stdout = b"\n".join(json.dumps(doc, ensure_ascii=True).encode("ascii") for doc in outcome)
+        parsed: BaseModel | str
         try:
-            parsed = parse_response(verb, stdout)
+            if stream is not None:
+                parsed = stream.result()
+            else:
+                stdout = b"\n".join(json.dumps(doc, ensure_ascii=True).encode("ascii") for doc in outcome)
+                parsed = parse_response(verb, stdout)
         except ResponseError:
             return failed("bad_response")
         if isinstance(parsed, str):

@@ -33,11 +33,11 @@ FETCH_WINDOW_MS = 10 * 60 * 1000
 MAX_FETCHES_PER_WINDOW = 20
 """Attachments one machine may send within FETCH_WINDOW_MS."""
 BYTE_WINDOW_MS = 60 * 60 * 1000
-MAX_BYTES_PER_WINDOW = 256 * 1024 * 1024
-"""Bytes all machines together may send within BYTE_WINDOW_MS."""
+MAX_BYTES_PER_WINDOW = 1024 * 1024 * 1024
+"""Bytes all machines together may send within BYTE_WINDOW_MS: four 250 MB videos an hour."""
 MAX_CONCURRENT_FETCHES = 1
-"""Attachment fetches in flight on the hub at once (each holds up to about 100 MB of buffers, and
-the media check runs in a worker thread)."""
+"""Attachment fetches in flight on the hub at once (a 250 MB video needs about twice its size while
+it is reassembled and checked, and the check runs in a worker thread)."""
 BUSY_WORDS = "I am already fetching an attachment. Try again in a moment."
 SPOKEN_ATTACHMENTS = 5
 KIND_WORDS = {"image": "an image", "audio": "audio", "video": "a video"}

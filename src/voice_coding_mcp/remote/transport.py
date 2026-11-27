@@ -20,7 +20,7 @@ import re
 import signal
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -28,7 +28,16 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from pydantic import BaseModel
 
 from .config import MachineConfig, RemoteConfig, known_hosts_path
-from .protocol import MAX_RESPONSE_BYTES, ResponseError, build_command, parse_response, request_tokens, response_cap
+from .protocol import (
+    MAX_ATTACHMENT_LINE_BYTES,
+    MAX_RESPONSE_BYTES,
+    AttachmentStream,
+    ResponseError,
+    build_command,
+    parse_response,
+    request_tokens,
+    response_cap,
+)
 from .ssh import build_ssh_argv, ssh_env
 
 if TYPE_CHECKING:
@@ -84,6 +93,8 @@ class ProcessResult:
     timed_out: bool = False
     overflow: bool = False
     spawn_error: bool = False
+    stream_error: bool = False
+    """`on_line` refused a line (the process was killed)."""
 
 
 async def run_process(
@@ -93,9 +104,12 @@ async def run_process(
     timeout_seconds: float,
     stdout_cap: int = MAX_RESPONSE_BYTES,
     stdin: bytes | None = None,
+    on_line: Callable[[bytes], None] | None = None,
 ) -> ProcessResult:
     """Runs argv with stdin from /dev/null (or the `stdin` bytes, then closed), stdout capped, in its
-    own process group. Never raises."""
+    own process group. Never raises. With `on_line`, stdout is handed over line by line as it
+    arrives (a line at most MAX_ATTACHMENT_LINE_BYTES) and only its first line is kept in
+    `stdout`; a ResponseError from `on_line` kills the process (`stream_error`)."""
     try:
         process = await asyncio.create_subprocess_exec(
             *argv,
@@ -112,6 +126,11 @@ async def run_process(
     out = bytearray()
     err = bytearray()
     overflow = False
+    stream_error = False
+
+    def kill() -> None:
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, signal.SIGKILL)
 
     async def read_out() -> None:
         nonlocal overflow
@@ -120,9 +139,50 @@ async def run_process(
             out.extend(chunk)
             if len(out) > stdout_cap:
                 overflow = True
-                with contextlib.suppress(OSError):
-                    os.killpg(process.pid, signal.SIGKILL)
+                kill()
                 return
+
+    async def read_lines() -> None:
+        nonlocal overflow, stream_error
+        assert process.stdout is not None
+        assert on_line is not None
+        pending = bytearray()
+        total = 0
+        first = True
+
+        def deliver(line: bytes) -> bool:
+            nonlocal first, stream_error
+            if first and line.strip():
+                out.extend(line)
+                first = False
+            try:
+                on_line(line)
+            except ResponseError:
+                stream_error = True
+                kill()
+                return False
+            return True
+
+        while chunk := await process.stdout.read(65536):
+            total += len(chunk)
+            if total > stdout_cap:
+                overflow = True
+                kill()
+                return
+            start = len(pending)
+            pending.extend(chunk)
+            while (newline := pending.find(b"\n", start)) >= 0:
+                line = bytes(pending[:newline])
+                del pending[: newline + 1]
+                start = 0
+                if not deliver(line):
+                    return
+            if len(pending) > MAX_ATTACHMENT_LINE_BYTES:
+                stream_error = True
+                kill()
+                return
+        if pending:
+            deliver(bytes(pending))
 
     async def read_err() -> None:
         assert process.stderr is not None
@@ -144,8 +204,8 @@ async def run_process(
     timed_out = False
     try:
         async with asyncio.timeout(timeout_seconds):
-            await asyncio.gather(read_out(), read_err(), write_in())
-            if not overflow:
+            await asyncio.gather(read_out() if on_line is None else read_lines(), read_err(), write_in())
+            if not overflow and not stream_error:
                 await process.wait()
     except TimeoutError:
         timed_out = True
@@ -155,11 +215,16 @@ async def run_process(
         with contextlib.suppress(OSError):
             os.killpg(process.pid, signal.SIGKILL)
         raise
-    if timed_out or overflow or process.returncode is None:
+    if timed_out or overflow or stream_error or process.returncode is None:
         await _kill_group(process)
     tail = bytes(err[-STDERR_TAIL_BYTES:]).decode("utf-8", "replace")
     return ProcessResult(
-        returncode=process.returncode, stdout=bytes(out), stderr_tail=tail, timed_out=timed_out, overflow=overflow
+        returncode=process.returncode,
+        stdout=bytes(out),
+        stderr_tail=tail,
+        timed_out=timed_out,
+        overflow=overflow,
+        stream_error=stream_error,
     )
 
 
@@ -203,7 +268,9 @@ def map_ssh_failure(stderr_tail: str) -> TransportError:
     return "other"
 
 
-def interpret(verb: str, result: ProcessResult, *, via_ssh: bool, started: float) -> TransportResult:
+def interpret(
+    verb: str, result: ProcessResult, *, via_ssh: bool, started: float, stream: AttachmentStream | None = None
+) -> TransportResult:
     elapsed = round((time.monotonic() - started) * 1000)
 
     def failed(code: TransportError, detail: str | None = None) -> TransportResult:
@@ -229,12 +296,35 @@ def interpret(verb: str, result: ProcessResult, *, via_ssh: bool, started: float
         # missing dispatcher.
         return failed("other")
     try:
-        parsed = parse_response(verb, result.stdout)
+        parsed = parse_response(verb, result.stdout) if stream is None else stream.result()
     except ResponseError as err:
         return failed("bad_response" if err.code == "bad_response" else "dispatcher_missing")
     if isinstance(parsed, str):
         return failed("refused_by_policy", parsed)
     return TransportResult(ok=True, data=parsed, elapsed_ms=elapsed)
+
+
+async def _run(
+    verb: str,
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    timeout_seconds: float,
+    stdin: bytes | None,
+    *,
+    via_ssh: bool,
+    started: float,
+) -> TransportResult:
+    """One dispatcher process; an `attachment` answer is decoded line by line as it arrives."""
+    stream = AttachmentStream() if verb == "attachment" else None
+    result = await run_process(
+        argv,
+        env,
+        timeout_seconds=timeout_seconds,
+        stdout_cap=response_cap(verb),
+        stdin=stdin,
+        on_line=stream.feed_line if stream is not None else None,
+    )
+    return interpret(verb, result, via_ssh=via_ssh, started=started, stream=stream)
 
 
 class SshTransport:
@@ -258,10 +348,7 @@ class SshTransport:
             argv = self.argv(verb, args)
         except ValueError:
             return TransportResult(ok=False, error="other")
-        result = await run_process(
-            argv, self._env, timeout_seconds=timeout_seconds, stdout_cap=response_cap(verb), stdin=stdin
-        )
-        return interpret(verb, result, via_ssh=True, started=started)
+        return await _run(verb, argv, self._env, timeout_seconds, stdin, via_ssh=True, started=started)
 
 
 class LocalTransport:
@@ -309,10 +396,7 @@ class LocalTransport:
             argv = self.argv(verb, args)
         except ValueError:
             return TransportResult(ok=False, error="other")
-        result = await run_process(
-            argv, self._env, timeout_seconds=timeout_seconds, stdout_cap=response_cap(verb), stdin=stdin
-        )
-        return interpret(verb, result, via_ssh=False, started=started)
+        return await _run(verb, argv, self._env, timeout_seconds, stdin, via_ssh=False, started=started)
 
 
 class OfflineTransport:
