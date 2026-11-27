@@ -2,7 +2,8 @@
 sending failed (docs/SWITCHBOARD.md, "Audit"). Messages are `remote_send` lines, keys
 `remote_send_keys` lines (with the key names, which come from a fixed list), window sizes
 `remote_resize` lines and cleared input drafts `remote_clear_input` lines (without the draft: its
-text, hash and length are not stored).
+text, hash and length are not stored). Each `remote_attachment` fetch that reached the machine adds a
+`remote_attachment` line (machine, HMAC of the file name, kind, bytes, outcome; no content).
 
 The file is 0600, opened in append mode and fsynced per line. The text itself is stored only as an
 HMAC-SHA256 with a random key in `stateDir/audit.key` (0600), because a plain hash of a short text
@@ -115,6 +116,75 @@ class AuditLog:
             line["size"] = {"columns": item.size[0], "rows": item.size[1]}
         if self.log_prompts and item.kind != CLEAR:
             line["text"] = redact(item.text)
+        self._append(line)
+        return line
+
+    def record_attachment(
+        self,
+        *,
+        machine: str,
+        name: str,
+        kind: str | None,
+        size: int,
+        outcome: str,
+        client: str,
+        client_name: str | None,
+    ) -> dict[str, Any]:
+        """Appends the line of one `remote_attachment` fetch: the file name only as an HMAC, never
+        any content."""
+        key = load_key(self.state_dir)
+        line: dict[str, Any] = {
+            "time": to_iso(self.now()),
+            "event": "remote_attachment",
+            "client": client,
+            "clientName": client_name,
+            "machine": machine,
+            "nameHmac": text_hmac(key, name),
+            "kind": kind,
+            "bytes": size,
+            "outcome": outcome,
+        }
+        self._append(line)
+        return line
+
+    def record_link(
+        self,
+        *,
+        link: str,
+        machine: str,
+        name: str,
+        kind: str,
+        size: int,
+        outcome: str,
+        expires: int | None = None,
+        requests: int | None = None,
+        ranges: int | None = None,
+        served: int | None = None,
+    ) -> dict[str, Any]:
+        """Appends an `attachment_link` line: outcome `created` (with `expiresAt`), or how the link
+        ended (`expired`, `evicted`, `served_limit`, `closed`) with the requests, range requests
+        and bytes it served. The token only as its fingerprint, the file name as an HMAC."""
+        key = load_key(self.state_dir)
+        line: dict[str, Any] = {
+            "time": to_iso(self.now()),
+            "event": "attachment_link",
+            "link": link,
+            "machine": machine,
+            "nameHmac": text_hmac(key, name),
+            "kind": kind,
+            "bytes": size,
+            "outcome": outcome,
+        }
+        if expires is not None:
+            line["expiresAt"] = to_iso(expires)
+        if requests is not None:
+            line["requests"] = requests
+            line["ranges"] = ranges
+            line["bytesServed"] = served
+        self._append(line)
+        return line
+
+    def _append(self, line: dict[str, Any]) -> None:
         data = (json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
@@ -122,7 +192,6 @@ class AuditLog:
             os.fsync(fd)
         finally:
             os.close(fd)
-        return line
 
 
 def audit_size_warning(state_dir: str) -> str | None:
@@ -172,6 +241,8 @@ AUDIT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("riskyOk", "risky ok"),
     ("textChars", "chars"),
     ("keys", "keys"),
+    ("kind", "kind"),
+    ("bytes", "bytes"),
     ("clientName", "client"),
 )
 

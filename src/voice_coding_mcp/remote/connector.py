@@ -36,7 +36,7 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
-VERSION = "0.11.0"
+VERSION = "0.10.0"
 HOST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 HOST_IPV6_RE = re.compile(r"[0-9A-Fa-f:]{2,39}")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")

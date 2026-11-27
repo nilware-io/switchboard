@@ -281,7 +281,9 @@ async def test_a_shell_pane_is_never_cleared(make: Make) -> None:
 async def test_an_older_dispatcher_is_named_when_preparing(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = await make()
     show(ctx.world, DRAFT)
-    old = VersionResponse.model_validate({"protocol": 1, "ok": True, "version": "0.7.0", "verbs": ["version", "keys"]})
+    # 0.9.0, the dispatcher with attachments and health but without clear.
+    verbs = ["version", "list", "capture", "send", "usage", "keys", "resize", "attachments", "attachment", "health"]
+    old = VersionResponse.model_validate({"protocol": 1, "ok": True, "version": "0.9.0", "verbs": verbs})
 
     async def version(name: str, *, budget_seconds: float | None = None) -> TransportResult:
         return TransportResult(ok=True, data=old, elapsed_ms=1)
@@ -319,7 +321,7 @@ async def test_an_older_dispatcher_is_named_when_preparing(make: Make, monkeypat
         ("not_allowed", "Not cleared: switchboard-remote on dev does not allow sending."),
         (
             "bad_request",
-            "Not cleared: switchboard-remote on dev refused the request. If it is older than 0.11.0, update it there.",
+            "Not cleared: switchboard-remote on dev refused the request. If it is older than 0.10.0, update it there.",
         ),
     ],
 )

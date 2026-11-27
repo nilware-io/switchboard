@@ -47,6 +47,7 @@ AGENT_ONLY_KEYS = (
     "sessions",
     "allow_usage",
     "allow_send",
+    "allow_attachments",
     "allow_permission_answers",
     "send_to_any_pane",
 )
@@ -149,6 +150,9 @@ class MachineConfig(_Section):
     allow_send: bool = False
     allow_permission_answers: bool = False
     send_to_any_pane: bool = False
+    allow_attachments: bool = False
+    """`remote_attachments` and `remote_attachment` (media from the machine's outbox); the
+    dispatcher must also run with `--allow-attachments`."""
 
 
 class SshConfig(_Section):

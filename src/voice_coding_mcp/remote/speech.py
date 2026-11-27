@@ -533,7 +533,7 @@ _NOT_DONE_CLEAR: dict[str, str] = {
     "vim_normal": "Not cleared: that input is in vim normal mode. Clear it at the keyboard.",
     "not_claude": "Not cleared: that pane no longer runs Claude Code.",
     "no_input_box": "Not cleared: I cannot see the input box on that screen any more, so I pressed nothing. Clear it at the keyboard.",
-    "bad_request": "Not cleared: switchboard-remote on {machine} refused the request. If it is older than 0.11.0, update it there.",
+    "bad_request": "Not cleared: switchboard-remote on {machine} refused the request. If it is older than 0.10.0, update it there.",
 }
 _NOT_DONE_RESIZE: dict[str, str] = {
     "not_claude": "Not resized: switchboard-remote on {machine} does not allow resizing panes without Claude Code.",

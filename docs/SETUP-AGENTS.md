@@ -79,7 +79,7 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 1. Your own copy of the repository at a commit you checked, exactly as in [SETUP-WSL.md](SETUP-WSL.md#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root) (`git clone`, `git checkout --detach <commit>`, `git rev-parse HEAD`, `git status --porcelain`). Two files from it run as you: the dispatcher and the connector. Never copy them from the hub.
 
-2. Read both, then install them. The dispatcher is one Python file of about 2500 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 450 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
+2. Read both, then install them. The dispatcher is one Python file of about 4400 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 450 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
 
    ```sh
    cd ~/src/switchboard
@@ -125,7 +125,7 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
    {"name": "laptop", "transport": "agent", "sessions": ["fpga", "notes"], "allowUsage": true}
    ```
 
-   As for SSH machines, `allowSend`, `allowPermissionAnswers` and `sendToAnyPane` are the hub's half of each opt-in; the dispatcher's flags in the next step are the other half.
+   As for SSH machines, `allowSend`, `allowPermissionAnswers`, `sendToAnyPane` and `allowAttachments` are the hub's half of each opt-in; the dispatcher's flags in the next step are the other half.
 
 6. The user unit. Install the example, then edit `--host` and the dispatcher's flags after `--` (the same flags as a forced command; add `--allow-send` only when you want to send by voice):
 
@@ -141,6 +141,8 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
    In WSL systemd must be on (`[boot] systemd=true` in `/etc/wsl.conf`, see [SETUP-WSL.md](SETUP-WSL.md#1-before-you-start)); the machine is reachable while the WSL VM runs.
 
+   Attachments (images, audio and video for you in the Claude app, see [SWITCHBOARD.md](SWITCHBOARD.md#attachments)): add `--allow-attachments` to the dispatcher's flags after `--` in the unit (for example `... switchboard-remote --serve --sessions fpga,notes --allow-attachments`) and `"allowAttachments": true` to the machine in the hub config. Sessions put files into `~/.local/share/switchboard/outbox` on the machine (create it yourself, `mkdir -p ~/.local/share/switchboard/outbox`; `--outbox /other/path` for another folder). `status` on the hub warns when the two halves disagree.
+
 7. Verify:
 
    ```sh
@@ -155,9 +157,11 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 8. Off: `systemctl --user stop switchboard-connect` (and `disable` to keep it off after a reboot). The hub then says "laptop is not connected right now." You decide when the machine can be reached.
 
-## Updating the dispatcher (0.9.0: machine health)
+## Updating the dispatcher (0.9.0: machine health; 0.10.0: clearing the input)
 
 Dispatcher 0.9.0 adds the read-only `health` verb (free disk space, read-only file systems, memory; on WSL also the Windows disk C:), which the hub polls for the [incident log](SWITCHBOARD.md#incident-log). It needs no new flag. On each machine, from your own copy at the new verified commit: read `git diff <old>..<new> -- deploy/remote`, then install `switchboard-remote` and `switchboard-connect` again as in part 2.2 (`sha256sum` both copies), and `systemctl --user restart switchboard-connect`. `remote-check` shows `switchboard-remote 0.9.0` with `health` among its verbs. Until a machine is updated the hub polls it with `version` instead and reports no health incidents for it. For SSH machines the same install (SETUP-WSL.md steps 5.2 and 6.1) is enough; the forced command does not change.
+
+Dispatcher 0.10.0 adds the `clear` verb (`remote_clear_input`, under the same `--allow-send`) and reports Claude Code's grey prompt suggestion apart from typed text. Update it the same way; `remote-check` then lists `clear` among its verbs. Until a machine is updated, `remote_clear_input` says its dispatcher is too old and a suggestion still counts as typed text there.
 
 ## 3. Moving a machine from the ssh transport
 

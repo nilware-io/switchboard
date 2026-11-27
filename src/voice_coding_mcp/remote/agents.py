@@ -30,10 +30,12 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+
 from ..clock import now_ms
 from ..log import Logger
 from .config import MACHINE_NAME_RE, MachineConfig, RemoteConfig
-from .protocol import ARG_RE, ResponseError, parse_response, request_tokens, response_cap
+from .protocol import ARG_RE, AttachmentStream, ResponseError, parse_response, request_tokens, response_cap
 from .transport import TransportError, TransportResult, dispatcher_error
 
 PROTOCOL = 1
@@ -58,7 +60,7 @@ FLAP_WINDOW_MS = 60_000
 FLAP_LIMIT = 3
 """More replacements of one machine than this within FLAP_WINDOW_MS log a warning."""
 HOUR_MS = 3_600_000
-READ_ONLY_VERBS = ("version", "list", "capture", "usage", "health")
+READ_ONLY_VERBS = ("version", "list", "capture", "usage", "attachments", "attachment", "health")
 """Retried once on the new connection when the one they went out on was replaced."""
 SOCKET_DIR_MODE = 0o2750
 CONTROL_SOCKET_NAME = "agents-control.sock"
@@ -120,12 +122,16 @@ class Hello:
     allow_usage: bool
     policy: str
     """`ok`, or `bad_policy` when the dispatcher's command line is broken (it refuses everything)."""
+    allow_attachments: bool = False
+    """Sent (as true) only by a dispatcher 0.7.0 or newer started with `--allow-attachments`."""
 
 
 def parse_hello(line: bytes) -> Hello | None:
     data = _object(line)
     keys = {"t", "protocol", "version", "verbs", "allowSend", "allowUsage", "policy"}
-    if data is None or set(data) != keys or data["t"] != "hello":
+    if data is None or not keys <= set(data) <= keys | {"allowAttachments"} or data["t"] != "hello":
+        return None
+    if data.get("allowAttachments", True) is not True:
         return None
     if type(data["protocol"]) is not int or data["protocol"] != PROTOCOL:
         return None
@@ -146,6 +152,7 @@ def parse_hello(line: bytes) -> Hello | None:
         allow_send=data["allowSend"],
         allow_usage=data["allowUsage"],
         policy=data["policy"],
+        allow_attachments="allowAttachments" in data,
     )
 
 
@@ -314,10 +321,17 @@ class AgentConnection:
                 return
 
     async def request(
-        self, verb: str, args: Sequence[str], data: str | None, deadline: float
+        self,
+        verb: str,
+        args: Sequence[str],
+        data: str | None,
+        deadline: float,
+        sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]] | TransportResult | _Closed:
         """The documents of one request, a failed result, or _Closed (with `written` folded in:
-        _Closed is returned only after the request frame was handed to the connection)."""
+        _Closed is returned only after the request frame was handed to the connection). With
+        `sink` each document goes there as it arrives instead (the list stays empty); a
+        ResponseError from it cancels the request as `bad_response`."""
         started = time.monotonic()
 
         def failed(code: TransportError, detail: str | None = None) -> TransportResult:
@@ -359,7 +373,15 @@ class AgentConnection:
                     if size > cap:
                         self.send_later({"t": "cancel", "id": request_id})
                         return failed("bad_response")
-                    docs.append(answer["doc"])
+                    if sink is None:
+                        docs.append(answer["doc"])
+                    else:
+                        try:
+                            sink(answer["doc"])
+                        except ResponseError:
+                            if answer.get("more"):
+                                self.send_later({"t": "cancel", "id": request_id})
+                            return failed("bad_response")
                     if not answer.get("more"):
                         return docs
         except TimeoutError:
@@ -681,6 +703,11 @@ class AgentHub:
             out.append(
                 f"allowUsage is {'on' if machine.allow_usage else 'off'} on the hub, --allow-usage is not the same"
             )
+        if machine.allow_attachments != hello.allow_attachments:
+            out.append(
+                f"allowAttachments is {'on' if machine.allow_attachments else 'off'} on the hub, "
+                "--allow-attachments is not the same"
+            )
         return out
 
     # --- status and control ------------------------------------------------------------------
@@ -706,6 +733,7 @@ class AgentHub:
                         "verbs": list(conn.hello.verbs),
                         "allowSend": conn.hello.allow_send,
                         "allowUsage": conn.hello.allow_usage,
+                        "allowAttachments": conn.hello.allow_attachments,
                         "policy": conn.hello.policy,
                         "peer": conn.peer,
                         "warnings": self.disagreements(name, conn.hello),
@@ -771,11 +799,16 @@ class AgentTransport:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         attempts = 2 if verb in READ_ONLY_VERBS else 1
         outcome: list[dict[str, Any]] | TransportResult | _Closed = _Closed(False)
+        stream: AttachmentStream | None = None
         for _ in range(attempts):
             conn = self._hub.live(self.machine.name)
             if conn is None:
                 return failed("not_connected")
-            outcome = await conn.request(verb, args, data, deadline)
+            # An attachment is decoded chunk by chunk as the frames arrive (a fresh stream for a
+            # retry on a new connection).
+            stream = AttachmentStream() if verb == "attachment" else None
+            sink = stream.feed if stream is not None else None
+            outcome = await conn.request(verb, args, data, deadline, sink)
             if not (isinstance(outcome, _Closed) and outcome.replaced):
                 break
         if isinstance(outcome, _Closed):
@@ -783,9 +816,13 @@ class AgentTransport:
             return failed("disconnected")
         if isinstance(outcome, TransportResult):
             return outcome
-        stdout = b"\n".join(json.dumps(doc, ensure_ascii=True).encode("ascii") for doc in outcome)
+        parsed: BaseModel | str
         try:
-            parsed = parse_response(verb, stdout)
+            if stream is not None:
+                parsed = stream.result()
+            else:
+                stdout = b"\n".join(json.dumps(doc, ensure_ascii=True).encode("ascii") for doc in outcome)
+                parsed = parse_response(verb, stdout)
         except ResponseError:
             return failed("bad_response")
         if isinstance(parsed, str):
