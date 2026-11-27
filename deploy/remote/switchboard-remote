@@ -1652,35 +1652,129 @@ MEDIA_EXTENSIONS = {
 ATTACHMENT_ERRORS = ("not_media", "too_large", "not_found", "changed", "bad_outbox")
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-PNG_STRIP = (b"tEXt", b"iTXt", b"zTXt", b"eXIf", b"tIME")
-"""Text, EXIF (with GPS) and time chunks are dropped."""
-JPEG_STRIP = (0xE1, 0xED, 0xFE)
-"""APP1 (EXIF with GPS and the thumbnail, XMP), APP13 (IPTC) and comments are dropped."""
+PNG_KEEP = (
+    b"IHDR",
+    b"PLTE",
+    b"IDAT",
+    b"IEND",
+    b"tRNS",
+    b"cHRM",
+    b"gAMA",
+    b"iCCP",
+    b"sBIT",
+    b"sRGB",
+    b"cICP",
+    b"mDCV",
+    b"cLLI",
+    b"bKGD",
+    b"pHYs",
+    b"acTL",
+    b"fcTL",
+    b"fdAT",
+)
+"""PNG chunks that are kept (an allowlist): pixels, color and animation. Every other chunk (text,
+EXIF with GPS, time, private chunks of any name) is dropped."""
+PNG_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+"""Bit depths by color type."""
+PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+PNG_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+MAX_IMAGE_SIDE = 8000
+"""Pixels per side: the Claude API refuses larger images."""
+MAX_PNG_RAW_BYTES = 256 * 1024 * 1024
+"""Decompressed PNG image data (all frames together) that is inflated to check it."""
+INFLATE_STEP = 1024 * 1024
+JPEG_SEGMENTS = frozenset(range(0xC0, 0xD0)) - {0xC8} | {0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF}
+"""Standard JPEG segments kept: SOFn, DHT, DAC, SOS, DQT, DNL, DRI, DHP, EXP. Other markers are
+refused, except APPn and comments, which are dropped unless JPEG_KEEP_APPS keeps them."""
+JPEG_KEEP_APPS = {0xE0: (b"JFIF\x00", b"JFXX\x00"), 0xE2: (b"ICC_PROFILE\x00",), 0xEE: (b"Adobe",)}
+"""APP segments kept by their identifier: JFIF, the ICC color profile, Adobe's color transform. An
+EXIF APP1 is replaced by a new one that holds only the orientation."""
 GIF_KEEP_APPS = (b"\x0bNETSCAPE2.0", b"\x0bANIMEXTS1.0")
-"""Application extensions kept (looping); others (XMP) and comments are dropped."""
+"""Application extensions kept (looping); others (XMP), comments and plain text are dropped."""
 WEBP_CHUNKS = (b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP", b"EXIF", b"XMP ")
 WEBP_STRIP = (b"EXIF", b"XMP ")
-WAV_STRIP = (b"LIST", b"id3 ", b"ID3 ")
+WAV_KEEP = (b"fmt ", b"fact", b"data", b"cue ", b"smpl")
+"""WAV chunks kept (an allowlist); LIST (INFO tags), id3, bext and any other chunk are dropped."""
 OGG_CODECS = (b"OpusHead", b"\x01vorbis", b"\x7fFLAC")
 FLAC_KEEP = (0, 3, 5)
 """STREAMINFO, SEEKTABLE and CUESHEET; padding, application data, tags and pictures are dropped."""
 FLAC_LAST_FRAME_TRIES = 64
 FLAC_MAX_FRAME = 1024 * 1024
+FLAC_CRC_BUDGET = 2 * 1024 * 1024
+"""Bytes the backward search for the last frame may run through CRC-16 (pure Python, about a tenth
+of a second per MiB)."""
+_FLAC_SYNC = re.compile(b"\xff[\xf8\xf9]")
 MP4_AUDIO_BRANDS = (b"M4A ", b"M4B ")
 MP4_VIDEO_BRANDS = (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"M4V ", b"dash")
 MP4_QUICKTIME = b"qt  "
-MP4_STRIP = (b"udta", b"meta")
-"""User data and metadata boxes (tags, GPS location) under the top level, `moov` and each `trak`
-are kept in size but renamed `free` and zeroed, so no sample offset moves."""
+MP4_ZERO = (b"free", b"skip", b"wide", b"uuid", b"udta", b"meta")
+"""Boxes kept in size but renamed `free` and zeroed, so no sample offset moves: padding, private
+`uuid` boxes, user data and metadata (tags, the GPS location phones write)."""
+_MP4_STBL = (
+    b"stsd",
+    b"stts",
+    b"ctts",
+    b"cslg",
+    b"stss",
+    b"stps",
+    b"sdtp",
+    b"stsc",
+    b"stsz",
+    b"stz2",
+    b"stco",
+    b"co64",
+    b"sbgp",
+    b"sgpd",
+    b"subs",
+    b"saiz",
+    b"saio",
+    b"padb",
+    b"stdp",
+)
+MP4_CHILDREN = {
+    b"": (b"ftyp", b"moov", b"mdat", b"moof", b"mfra", b"sidx", b"styp", b"prft"),
+    b"moov": (b"mvhd", b"trak", b"mvex", b"iods"),
+    b"trak": (b"tkhd", b"tref", b"edts", b"mdia", b"trgr", b"load", b"tapt", b"clip", b"matt", b"txas", b"imap"),
+    b"mdia": (b"mdhd", b"hdlr", b"minf", b"elng"),
+    b"minf": (b"vmhd", b"smhd", b"hmhd", b"nmhd", b"sthd", b"gmhd", b"dinf", b"stbl", b"hdlr"),
+    b"stbl": _MP4_STBL,
+    b"mvex": (b"mehd", b"trex", b"leva", b"trep"),
+    b"moof": (b"mfhd", b"traf"),
+    b"traf": (b"tfhd", b"tfdt", b"trun", b"sbgp", b"sgpd", b"subs", b"saiz", b"saio", b"senc"),
+    b"mfra": (b"tfra", b"mfro"),
+}
+"""Boxes allowed in each container that is walked (b"" is the top level); any other box type there
+is refused. Boxes not listed as containers (sample descriptions, data references) are not walked."""
 EBML_HEADER = 0x1A45DFA3
 EBML_DOCTYPE = 0x4282
+EBML_HEADER_CHILDREN = (0x4286, 0x42F7, 0x42F2, 0x42F3, EBML_DOCTYPE, 0x4287, 0x4285)
 EBML_SEGMENT = 0x18538067
 EBML_CLUSTER = 0x1F43B675
-EBML_LEVEL1 = (0x114D9B74, 0x1549A966, 0x1654AE6B, EBML_CLUSTER, 0x1C53BB6B, 0x1043A770, 0x1254C367, 0xEC, 0xBF)
+EBML_TRACKS = 0x1654AE6B
+EBML_TRACK_ENTRY = 0xAE
+EBML_VOID = 0xEC
+EBML_CRC = 0xBF
+EBML_TAGS = 0x1254C367
+EBML_CHAPTERS = 0x1043A770
+EBML_LEVEL1 = (
+    0x114D9B74,
+    0x1549A966,
+    EBML_TRACKS,
+    EBML_CLUSTER,
+    0x1C53BB6B,
+    EBML_CHAPTERS,
+    EBML_TAGS,
+    EBML_VOID,
+    EBML_CRC,
+)
 """SeekHead, Info, Tracks, Cluster, Cues, Chapters, Tags, Void, CRC-32. Attachments (embedded
 files) are refused."""
-EBML_TRACKS = 0x1654AE6B
-EBML_CLUSTER_CHILDREN = (0xE7, 0xA7, 0xAB, 0xA3, 0xA0, 0xAF, 0x5854, 0xEC, 0xBF)
+EBML_BLANK = (EBML_VOID, EBML_TAGS, EBML_CHAPTERS)
+"""Replaced by a zeroed Void of the same size: padding, tags and chapter titles."""
+EBML_CLUSTER_CHILDREN = (0xE7, 0xA7, 0xAB, 0xA3, 0xA0, 0xAF, 0x5854, EBML_VOID, EBML_CRC)
+MAX_MEDIA_ELEMENTS = 200_000
+"""Chunks, boxes, elements, pages, frames or blocks one file may have: the walks are pure Python,
+so a file of millions of tiny elements would hold up the hub for seconds."""
 
 _MP3_BITRATES = {
     (3, 3): (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
@@ -1693,10 +1787,24 @@ _MP3_BITRATES = {
 """kbit/s by (version, layer): version 3 is MPEG-1, 2 is MPEG-2 (MPEG-2.5 uses its table)."""
 _MP3_RATES = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
 _BIT_REVERSE = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
+_JPEG_MARKER = re.compile(b"\xff(?=[^\x00\xd0-\xd7\xff])")
+"""The 0xFF that starts the next marker after entropy-coded data (not a stuffed 0xFF00, a restart
+marker or a fill byte)."""
 
 
 class _NotMediaError(Exception):
     """The bytes are not a whole file of the expected format."""
+
+
+class _Budget:
+    """Counts the elements one media check visits (MAX_MEDIA_ELEMENTS)."""
+
+    def __init__(self) -> None:
+        self.left = MAX_MEDIA_ELEMENTS
+
+    def step(self) -> None:
+        self.left -= 1
+        _need(self.left >= 0)
 
 
 def _need(condition: bool) -> None:
@@ -1716,6 +1824,10 @@ def _le(data: bytes, pos: int, size: int) -> int:
 
 def _fourcc(value: bytes) -> bool:
     return len(value) == 4 and all(0x20 <= c < 0x7F or c == 0xA9 for c in value)
+
+
+def _side(value: int) -> None:
+    _need(1 <= value <= MAX_IMAGE_SIDE)
 
 
 def _crc_table(poly: int, width: int) -> list[int]:
@@ -1755,34 +1867,128 @@ def ogg_crc(data: bytes) -> int:
     return int(f"{reflected:032b}"[::-1], 2)
 
 
-def _png(data: bytes) -> bytes:
+def _png_raw_size(width: int, height: int, bits: int, interlaced: bool) -> int:
+    """The bytes of filtered scanlines an image of this size inflates to."""
+    if not interlaced:
+        return height * (1 + (width * bits + 7) // 8)
+    total = 0
+    for x0, y0, dx, dy in PNG_ADAM7:
+        columns, rows = (width - x0 + dx - 1) // dx, (height - y0 + dy - 1) // dy
+        if columns > 0 and rows > 0:
+            total += rows * (1 + (columns * bits + 7) // 8)
+    return total
+
+
+def _inflate_exact(stream: bytes, expected: int) -> None:
+    """The zlib stream must inflate to exactly `expected` bytes and end where the data ends."""
+    inflater = zlib.decompressobj()
+    total, pending = 0, stream
+    while True:
+        out = inflater.decompress(pending, INFLATE_STEP)
+        total += len(out)
+        _need(total <= expected)
+        pending = inflater.unconsumed_tail
+        if not out and not pending:
+            break
+    _need(inflater.eof and total == expected and not inflater.unused_data)
+
+
+def _png(data: bytes, budget: _Budget) -> bytes:
     _need(data.startswith(PNG_SIGNATURE))
     out = [PNG_SIGNATURE]
-    pos, first, image = 8, True, False
+    pos = 8
+    header: tuple[int, int, int, bool] | None = None
+    # (width, height, data parts) of the default image (IDAT) and each later frame (fdAT).
+    frames: list[tuple[int, int, list[bytes]]] = []
+    image = False
     while True:
+        budget.step()
         length = _be(data, pos, 4)
         kind = data[pos + 4 : pos + 8]
         end = pos + 12 + length
         _need(length < 2**31 and kind.isalpha() and len(kind) == 4 and end <= len(data))
         _need(zlib.crc32(data[pos + 4 : end - 4]) == _be(data, end - 4, 4))
-        _need(not first or (kind == b"IHDR" and length == 13))
-        first = False
-        image = image or kind == b"IDAT"
-        if kind not in PNG_STRIP:
+        payload = data[pos + 8 : end - 4]
+        if header is None:
+            _need(kind == b"IHDR" and length == 13)
+            width, height, depth, color = _be(payload, 0, 4), _be(payload, 4, 4), payload[8], payload[9]
+            _side(width)
+            _side(height)
+            _need(depth in PNG_DEPTHS.get(color, ()) and payload[10] == 0 and payload[11] == 0)
+            _need(payload[12] in (0, 1))
+            header = (width, height, depth * PNG_CHANNELS[color], payload[12] == 1)
+        elif kind == b"IDAT":
+            if not image:
+                image = True
+                frames.insert(0, (header[0], header[1], []))
+            frames[0][2].append(payload)
+        elif kind == b"fcTL":
+            _need(length == 26)
+            if image:
+                frames.append((_be(payload, 4, 4), _be(payload, 8, 4), []))
+                _side(frames[-1][0])
+                _side(frames[-1][1])
+        elif kind == b"fdAT":
+            _need(image and len(frames) > 1 and length > 4)
+            frames[-1][2].append(payload[4:])
+        if kind in PNG_KEEP:
             out.append(data[pos:end])
         pos = end
         if kind == b"IEND":
             break
-    _need(pos == len(data) and image)
+    _need(pos == len(data) and image and header is not None)
+    assert header is not None
+    # The image data must inflate to exactly the scanlines its size needs: no other bytes hide there.
+    raw = 0
+    for width, height, parts in frames:
+        expected = _png_raw_size(width, height, header[2], header[3])
+        raw += expected
+        _need(bool(parts) and raw <= MAX_PNG_RAW_BYTES)
+        _inflate_exact(b"".join(parts), expected)
     return b"".join(out)
 
 
-def _jpeg(data: bytes) -> bytes:
+def _exif_orientation(payload: bytes) -> int | None:
+    """The EXIF Orientation (2 to 8) of an APP1 payload, else None (1, absent or unreadable)."""
+    if not payload.startswith(b"Exif\x00\x00"):
+        return None
+    tiff = payload[6:]
+    if tiff[:4] not in (b"MM\x00\x2a", b"II\x2a\x00") or len(tiff) < 8:
+        return None
+    big = tiff[:2] == b"MM"
+
+    def number(value: bytes) -> int:
+        return int.from_bytes(value, "big") if big else int.from_bytes(value, "little")
+
+    ifd = number(tiff[4:8])
+    if ifd + 2 > len(tiff):
+        return None
+    for index in range(min(number(tiff[ifd : ifd + 2]), 512)):
+        entry = tiff[ifd + 2 + 12 * index : ifd + 14 + 12 * index]
+        if len(entry) < 12:
+            return None
+        if number(entry[:2]) == 0x0112 and number(entry[2:4]) == 3:
+            value = number(entry[8:10])
+            return value if 2 <= value <= 8 else None
+    return None
+
+
+def orientation_segment(value: int) -> bytes:
+    """A minimal EXIF APP1 segment that holds only IFD0 Orientation."""
+    tiff = b"MM\x00\x2a" + (8).to_bytes(4, "big") + (1).to_bytes(2, "big")
+    tiff += (0x0112).to_bytes(2, "big") + (3).to_bytes(2, "big") + (1).to_bytes(4, "big")
+    tiff += value.to_bytes(2, "big") + b"\x00\x00" + bytes(4)
+    payload = b"Exif\x00\x00" + tiff
+    return b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload
+
+
+def _jpeg(data: bytes, budget: _Budget) -> bytes:
     _need(data[:3] == b"\xff\xd8\xff")
     out = [b"\xff\xd8"]
     size = len(data)
-    pos, frame, scan = 2, False, False
+    pos, frame, scan, oriented = 2, False, False, False
     while True:
+        budget.step()
         _need(pos + 2 <= size and data[pos] == 0xFF)
         marker = data[pos + 1]
         if marker == 0xFF:
@@ -1791,39 +1997,44 @@ def _jpeg(data: bytes) -> bytes:
         if marker == 0xD9:
             pos += 2
             break
-        _need(marker not in (0x00, 0x01, 0xD8) and not 0xD0 <= marker <= 0xD7)
         length = _be(data, pos + 2, 2)
         end = pos + 2 + length
         _need(length >= 2 and end <= size)
-        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+        payload = data[pos + 4 : end]
+        if 0xE0 <= marker <= 0xEF or marker == 0xFE:
+            if marker == 0xE1 and not oriented:
+                value = _exif_orientation(payload)
+                if value is not None:
+                    oriented = True
+                    out.append(orientation_segment(value))
+            elif any(payload.startswith(tag) for tag in JPEG_KEEP_APPS.get(marker, ())):
+                out.append(data[pos:end])
+            pos = end
+            continue
+        _need(marker in JPEG_SEGMENTS)
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xCC):
             frame = True
-        if marker not in JPEG_STRIP:
-            out.append(data[pos:end])
+            _need(_be(payload, 1, 2) <= MAX_IMAGE_SIDE)
+            _side(_be(payload, 3, 2))
+        out.append(data[pos:end])
         pos = end
         if marker == 0xDA:
             _need(frame)
             scan = True
-            start = pos
-            while True:
-                found = data.find(b"\xff", pos)
-                _need(0 <= found < size - 1)
-                following = data[found + 1]
-                if following == 0x00 or 0xD0 <= following <= 0xD7:
-                    pos = found + 2
-                elif following == 0xFF:
-                    pos = found + 1
-                else:
-                    break
-            out.append(data[start:found])
-            pos = found
+            found = _JPEG_MARKER.search(data, pos)
+            _need(found is not None and found.start() < size - 1)
+            assert found is not None
+            out.append(data[pos : found.start()])
+            pos = found.start()
     _need(pos == size and scan)
     out.append(b"\xff\xd9")
     return b"".join(out)
 
 
-def _gif_blocks(data: bytes, pos: int) -> int:
+def _gif_blocks(data: bytes, pos: int, budget: _Budget) -> int:
     """The end of the data sub-blocks that start at `pos`."""
     while True:
+        budget.step()
         _need(pos < len(data))
         length = data[pos]
         pos += 1
@@ -1832,14 +2043,17 @@ def _gif_blocks(data: bytes, pos: int) -> int:
         pos += length
 
 
-def _gif(data: bytes) -> bytes:
+def _gif(data: bytes, budget: _Budget) -> bytes:
     _need(data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 13)
+    _side(_le(data, 6, 2))
+    _side(_le(data, 8, 2))
     packed = data[10]
     pos = 13 + (3 * (2 << (packed & 7)) if packed & 0x80 else 0)
     _need(pos <= len(data))
     out = [data[:pos]]
     images = 0
     while True:
+        budget.step()
         _need(pos < len(data))
         block = data[pos]
         if block == 0x3B:
@@ -1848,17 +2062,19 @@ def _gif(data: bytes) -> bytes:
             break
         if block == 0x2C:
             _need(pos + 10 <= len(data))
+            _side(_le(data, pos + 5, 2))
+            _side(_le(data, pos + 7, 2))
             local = data[pos + 9]
             end = pos + 10 + (3 * (2 << (local & 7)) if local & 0x80 else 0) + 1
             _need(end <= len(data))
-            end = _gif_blocks(data, end)
+            end = _gif_blocks(data, end, budget)
             out.append(data[pos:end])
             images += 1
         elif block == 0x21:
             _need(pos + 2 <= len(data))
             label = data[pos + 1]
-            end = _gif_blocks(data, pos + 2)
-            if label in (0xF9, 0x01) or (label == 0xFF and data[pos + 2 : pos + 14] in GIF_KEEP_APPS):
+            end = _gif_blocks(data, pos + 2, budget)
+            if label == 0xF9 or (label == 0xFF and data[pos + 2 : pos + 14] in GIF_KEEP_APPS):
                 out.append(data[pos:end])
         else:
             raise _NotMediaError()
@@ -1867,12 +2083,13 @@ def _gif(data: bytes) -> bytes:
     return b"".join(out)
 
 
-def _riff(data: bytes, form: bytes) -> list[tuple[bytes, int, int]]:
+def _riff(data: bytes, form: bytes, budget: _Budget) -> list[tuple[bytes, int, int]]:
     """(fourcc, start, end with padding) of every chunk; the RIFF size must cover the file."""
     _need(data[:4] == b"RIFF" and data[8:12] == form and _le(data, 4, 4) + 8 == len(data))
     chunks = []
     pos = 12
     while pos < len(data):
+        budget.step()
         kind = data[pos : pos + 4]
         length = _le(data, pos + 4, 4)
         end = pos + 8 + length + (length & 1)
@@ -1887,9 +2104,27 @@ def _rebuild_riff(data: bytes, form: bytes, kept: list[bytes]) -> bytes:
     return b"RIFF" + len(body).to_bytes(4, "little") + body
 
 
-def _webp(data: bytes) -> bytes:
-    chunks = _riff(data, b"WEBP")
+def _webp_size(kind: bytes, payload: bytes) -> None:
+    """Both sides of the canvas (VP8X) or of a single image (VP8L, VP8) within MAX_IMAGE_SIDE."""
+    if kind == b"VP8X":
+        _side(_le(payload, 4, 3) + 1)
+        _side(_le(payload, 7, 3) + 1)
+    elif kind == b"VP8L":
+        _need(_be(payload, 0, 1) == 0x2F)
+        bits = _le(payload, 1, 4)
+        _side((bits & 0x3FFF) + 1)
+        _side(((bits >> 14) & 0x3FFF) + 1)
+    else:
+        _need(payload[3:6] == b"\x9d\x01\x2a")
+        _side(_le(payload, 6, 2) & 0x3FFF)
+        _side(_le(payload, 8, 2) & 0x3FFF)
+
+
+def _webp(data: bytes, budget: _Budget) -> bytes:
+    chunks = _riff(data, b"WEBP", budget)
     _need(bool(chunks) and chunks[0][0] in (b"VP8 ", b"VP8L", b"VP8X"))
+    first, start, end = chunks[0]
+    _webp_size(first, data[start + 8 : end])
     kept = []
     for kind, start, end in chunks:
         _need(kind in WEBP_CHUNKS)
@@ -1904,11 +2139,11 @@ def _webp(data: bytes) -> bytes:
     return _rebuild_riff(data, b"WEBP", kept)
 
 
-def _wav(data: bytes) -> bytes:
-    chunks = _riff(data, b"WAVE")
+def _wav(data: bytes, budget: _Budget) -> bytes:
+    chunks = _riff(data, b"WAVE", budget)
     kinds = [kind for kind, _, _ in chunks]
     _need(b"fmt " in kinds and b"data" in kinds)
-    return _rebuild_riff(data, b"WAVE", [data[s:e] for kind, s, e in chunks if kind not in WAV_STRIP])
+    return _rebuild_riff(data, b"WAVE", [data[s:e] for kind, s, e in chunks if kind in WAV_KEEP])
 
 
 def _ogg_page(data: bytes, pos: int) -> int:
@@ -1924,12 +2159,15 @@ def _ogg_crc_ok(page: bytes) -> bool:
     return ogg_crc(page[:22] + b"\x00\x00\x00\x00" + page[26:]) == int.from_bytes(page[22:26], "little")
 
 
-def _ogg(data: bytes) -> bytes:
+def _ogg(data: bytes, budget: _Budget) -> bytes:
     pos, first, last = 0, None, 0
     while pos < len(data):
+        budget.step()
         end = _ogg_page(data, pos)
         if first is None:
             first = (pos, end)
+        # One logical stream: a second one (a multiplexed video or data stream) is refused.
+        _need(data[pos + 14 : pos + 18] == data[first[0] + 14 : first[0] + 18])
         last = pos
         pos = end
     _need(first is not None)
@@ -1974,10 +2212,11 @@ def _flac_header(data: bytes, pos: int) -> int | None:
         return None
 
 
-def _flac(data: bytes) -> bytes:
+def _flac(data: bytes, budget: _Budget) -> bytes:
     _need(data[:4] == b"fLaC")
     pos, kept, first = 4, [], True
     while True:
+        budget.step()
         header = _be(data, pos, 1)
         kind, length = header & 0x7F, _be(data, pos + 1, 3)
         end = pos + 4 + length
@@ -1992,14 +2231,23 @@ def _flac(data: bytes) -> bytes:
     frames = pos
     _need(_flac_header(data, frames) is not None)
     # The last frame must end exactly at the end of the file: find its start backwards (a valid
-    # header whose frame CRC-16 covers the rest). Frames in between are not decoded.
-    start, tries = len(data) - 2, 0
-    while True:
-        start = max(data.rfind(b"\xff\xf8", frames, start), data.rfind(b"\xff\xf9", frames, start))
-        _need(start >= frames and tries < FLAC_LAST_FRAME_TRIES and len(data) - start <= FLAC_MAX_FRAME)
+    # header whose frame CRC-16 covers the rest), within the last FLAC_MAX_FRAME bytes, at most
+    # FLAC_LAST_FRAME_TRIES valid headers and FLAC_CRC_BUDGET bytes of CRC work. Frames in between
+    # are not decoded.
+    tail = max(frames, len(data) - FLAC_MAX_FRAME)
+    starts = [sync.start() for sync in _FLAC_SYNC.finditer(data, tail, len(data) - 2)]
+    tries, crc_bytes, found = 0, 0, False
+    for start in reversed(starts):
+        budget.step()
+        if _flac_header(data, start) is None:
+            continue
         tries += 1
-        if _flac_header(data, start) is not None and flac_crc16(data[start:-2]) == _be(data, len(data) - 2, 2):
+        crc_bytes += len(data) - 2 - start
+        _need(tries <= FLAC_LAST_FRAME_TRIES and crc_bytes <= FLAC_CRC_BUDGET)
+        if flac_crc16(data[start:-2]) == _be(data, len(data) - 2, 2):
+            found = True
             break
+    _need(found)
     for index in range(len(kept)):
         flag = 0x80 if index == len(kept) - 1 else 0
         kept[index] = bytes([(kept[index][0] & 0x7F) | flag]) + kept[index][1:]
@@ -2033,13 +2281,14 @@ def _id3_length(data: bytes) -> int:
     return 10 + size + (10 if data[5] & 0x10 else 0)
 
 
-def _mp3(data: bytes) -> bytes:
+def _mp3(data: bytes, budget: _Budget) -> bytes:
     start = _id3_length(data)
     end = len(data)
     if end - start >= 128 + 4 and data[end - 128 : end - 125] == b"TAG":
         end -= 128
     pos, frames = start, 0
     while pos < end:
+        budget.step()
         length = mp3_frame_length(data, pos)
         _need(length is not None and length >= 4)
         assert length is not None
@@ -2050,17 +2299,19 @@ def _mp3(data: bytes) -> bytes:
     return data[start:end]
 
 
-def _boxes(data: bytes, start: int, end: int, *, open_end: bool) -> list[tuple[bytes, int, int, int]]:
-    """(type, start, payload start, end) of the ISO BMFF boxes that exactly fill start..end."""
+def _boxes(data: bytes, start: int, end: int, budget: _Budget) -> list[tuple[bytes, int, int, int]]:
+    """(type, start, payload start, end) of the ISO BMFF boxes that exactly fill start..end. Only
+    an `mdat` at the top level may run to the end of the file (size 0)."""
     boxes = []
     pos = start
     while pos < end:
+        budget.step()
         size, kind, header = _be(data, pos, 4), data[pos + 4 : pos + 8], 8
         _need(pos + 8 <= end and _fourcc(kind))
         if size == 1:
             size, header = _be(data, pos + 8, 8), 16
         elif size == 0:
-            _need(open_end)
+            _need(start == 0 and end == len(data) and kind == b"mdat")
             size = end - pos
         _need(size >= header and pos + size <= end)
         boxes.append((kind, pos, pos + header, pos + size))
@@ -2069,36 +2320,68 @@ def _boxes(data: bytes, start: int, end: int, *, open_end: bool) -> list[tuple[b
 
 
 def _mp4_format(data: bytes) -> str | None:
-    """`m4a`, `mp4` or `mov` from the `ftyp` box at the start, else None."""
+    """`m4a` (an audio brand), `mov` (QuickTime) or `mp4` (a video or generic brand) from the
+    `ftyp` box at the start, else None. Whether a file is audio or video is decided later by its
+    tracks (`_mp4`); a generic brand (`isom`, `mp42`) may hold either."""
     if len(data) < 16 or data[4:8] != b"ftyp":
         return None
-    size = int.from_bytes(data[:4], "big")
     major = data[8:12]
-    compatible = [data[i : i + 4] for i in range(16, min(size, len(data)) - 3, 4)]
-    if major in MP4_AUDIO_BRANDS or (major in MP4_VIDEO_BRANDS and any(b in MP4_AUDIO_BRANDS for b in compatible)):
+    if major in MP4_AUDIO_BRANDS:
         return "m4a"
     if major == MP4_QUICKTIME:
         return "mov"
     return "mp4" if major in MP4_VIDEO_BRANDS else None
 
 
-def _mp4(data: bytes) -> bytes:
-    top = _boxes(data, 0, len(data), open_end=True)
-    _need(bool(top) and top[0][0] == b"ftyp" and [b[0] for b in top].count(b"moov") == 1)
-    out = bytearray(data)
-    strip = [box for box in top if box[0] in MP4_STRIP]
-    for kind, _, payload, end in top:
-        if kind != b"moov":
+def _mp4_walk(
+    data: bytes,
+    *,
+    parent: bytes,
+    start: int,
+    end: int,
+    budget: _Budget,
+    zero: list[tuple[int, int, int]],
+    seen: list[tuple[bytes, bytes, int, int]],
+) -> None:
+    for kind, box_start, payload, box_end in _boxes(data, start, end, budget):
+        if kind in MP4_ZERO:
+            zero.append((box_start, payload, box_end))
             continue
-        for child in _boxes(data, payload, end, open_end=False):
-            if child[0] in MP4_STRIP:
-                strip.append(child)
-            elif child[0] == b"trak":
-                strip += [g for g in _boxes(data, child[2], child[3], open_end=False) if g[0] in MP4_STRIP]
-    for _, start, payload, end in strip:
-        out[start + 4 : start + 8] = b"free"
-        out[payload:end] = bytes(end - payload)
+        _need(kind in MP4_CHILDREN[parent])
+        seen.append((parent, kind, payload, box_end))
+        if kind in MP4_CHILDREN:
+            _mp4_walk(data, parent=kind, start=payload, end=box_end, budget=budget, zero=zero, seen=seen)
+
+
+def _mp4(data: bytes, budget: _Budget, *, audio: bool) -> bytes:
+    """ISO BMFF (MP4, MOV, M4A): only known boxes in the walked containers, one `moov` with an
+    `mvhd` and at least one track with a sound or video handler, media data present. With `audio`
+    (M4A) every track handler must be sound; otherwise at least one must be video."""
+    zero: list[tuple[int, int, int]] = []
+    seen: list[tuple[bytes, bytes, int, int]] = []
+    _need(data[4:8] == b"ftyp")
+    _mp4_walk(data, parent=b"", start=0, end=len(data), budget=budget, zero=zero, seen=seen)
+    top = [kind for parent, kind, _, _ in seen if parent == b""]
+    _need(top.count(b"ftyp") == 1 and top.count(b"moov") == 1 and b"mdat" in top)
+    _need(any(parent == b"moov" and kind == b"mvhd" for parent, kind, _, _ in seen))
+    handlers = [data[p + 8 : p + 12] for parent, kind, p, e in seen if parent == b"mdia" and kind == b"hdlr"]
+    if audio:
+        _need(b"soun" in handlers and b"vide" not in handlers)
+    else:
+        _need(b"vide" in handlers)
+    out = bytearray(data)
+    for box_start, payload, box_end in zero:
+        out[box_start + 4 : box_start + 8] = b"free"
+        out[payload:box_end] = bytes(box_end - payload)
     return bytes(out)
+
+
+def _m4a(data: bytes, budget: _Budget) -> bytes:
+    return _mp4(data, budget, audio=True)
+
+
+def _mp4_video(data: bytes, budget: _Budget) -> bytes:
+    return _mp4(data, budget, audio=False)
 
 
 def _ebml(data: bytes, pos: int, end: int) -> tuple[int, int, int | None]:
@@ -2121,6 +2404,20 @@ def _ebml(data: bytes, pos: int, end: int) -> tuple[int, int, int | None]:
     return element, payload, payload + value
 
 
+def _ebml_children(data: bytes, start: int, end: int, budget: _Budget) -> list[tuple[int, int, int, int]]:
+    """(id, start, payload start, end) of the known-size elements that exactly fill start..end."""
+    children = []
+    pos = start
+    while pos < end:
+        budget.step()
+        element, payload, child_end = _ebml(data, pos, end)
+        _need(child_end is not None)
+        assert child_end is not None
+        children.append((element, pos, payload, child_end))
+        pos = child_end
+    return children
+
+
 def _webm_doctype(data: bytes) -> bytes | None:
     try:
         element, payload, end = _ebml(data, 0, len(data))
@@ -2139,35 +2436,68 @@ def _webm_doctype(data: bytes) -> bytes | None:
     return None
 
 
-def _webm(data: bytes) -> bytes:
+def ebml_void(size: int) -> bytes:
+    """A zeroed Void element of exactly `size` bytes (at least 2)."""
+    length = min(8, size - 1)
+    return (
+        bytes([EBML_VOID])
+        + ((size - 1 - length) | (1 << (7 * length))).to_bytes(length, "big")
+        + bytes(size - 1 - length)
+    )
+
+
+def _webm(data: bytes, budget: _Budget) -> bytes:
     _need(_webm_doctype(data) == b"webm")
-    _, _, header_end = _ebml(data, 0, len(data))
+    _, header_start, header_end = _ebml(data, 0, len(data))
     assert header_end is not None
+    blank: list[tuple[int, int]] = []
+    for child, child_start, _, child_end in _ebml_children(data, header_start, header_end, budget):
+        _need(child in EBML_HEADER_CHILDREN or child in (EBML_VOID, EBML_CRC))
+        if child == EBML_VOID:
+            blank.append((child_start, child_end))
     element, pos, segment_end = _ebml(data, header_end, len(data))
     _need(element == EBML_SEGMENT)
     if segment_end is None:
         segment_end = len(data)
     _need(segment_end == len(data))
-    tracks = False
+    tracks = 0
     while pos < segment_end:
+        budget.step()
+        start = pos
         element, payload, end = _ebml(data, pos, segment_end)
         _need(element in EBML_LEVEL1)
-        tracks = tracks or element == EBML_TRACKS
-        if end is not None:
+        if element != EBML_CLUSTER:
+            _need(end is not None)
+            assert end is not None
+            if element in EBML_BLANK:
+                blank.append((start, end))
+            elif element == EBML_CRC:
+                _need(end - payload == 4)
+            elif element == EBML_TRACKS:
+                entries = _ebml_children(data, payload, end, budget)
+                _need(all(child in (EBML_TRACK_ENTRY, EBML_VOID, EBML_CRC) for child, _, _, _ in entries))
+                tracks += sum(1 for child, _, _, _ in entries if child == EBML_TRACK_ENTRY)
             pos = end
             continue
-        # A live recording writes clusters of unknown size: they end where a top-level element starts.
-        _need(element == EBML_CLUSTER)
+        # A cluster's children are walked; a live recording writes clusters of unknown size, which
+        # end where a top-level element starts.
         pos = payload
-        while pos < segment_end:
-            child, _, child_end = _ebml(data, pos, segment_end)
-            if child in EBML_LEVEL1:
+        stop = segment_end if end is None else end
+        while pos < stop:
+            budget.step()
+            child, _, block_end = _ebml(data, pos, stop)
+            if end is None and child in EBML_LEVEL1:
                 break
-            _need(child in EBML_CLUSTER_CHILDREN and child_end is not None)
-            assert child_end is not None
-            pos = child_end
-    _need(tracks)
-    return data
+            _need(child in EBML_CLUSTER_CHILDREN and block_end is not None)
+            assert block_end is not None
+            if child == EBML_VOID:
+                blank.append((pos, block_end))
+            pos = block_end
+    _need(tracks > 0)
+    out = bytearray(data)
+    for blank_start, blank_end in blank:
+        out[blank_start:blank_end] = ebml_void(blank_end - blank_start)
+    return bytes(out)
 
 
 _MEDIA_VALIDATORS = {
@@ -2179,9 +2509,9 @@ _MEDIA_VALIDATORS = {
     "wav": _wav,
     "ogg": _ogg,
     "flac": _flac,
-    "m4a": _mp4,
-    "mp4": _mp4,
-    "mov": _mp4,
+    "m4a": _m4a,
+    "mp4": _mp4_video,
+    "mov": _mp4_video,
     "webm": _webm,
 }
 
@@ -2210,6 +2540,13 @@ def sniff_media(head: bytes) -> str | None:
     return None
 
 
+def sniff_agrees(head: bytes, expected: str) -> bool:
+    """Whether the magic bytes show the format the extension promises. An `.m4a` may also carry a
+    generic ISO brand (`isom`, `mp42`); its tracks must then be sound only (`_mp4`)."""
+    sniffed = sniff_media(head)
+    return sniffed == expected or (expected == "m4a" and sniffed == "mp4")
+
+
 def expected_format(name: str) -> str | None:
     """The format an outbox file name promises (its lower-case extension), else None."""
     if not ATTACHMENT_NAME_RE.fullmatch(name) or "." not in name:
@@ -2220,16 +2557,17 @@ def expected_format(name: str) -> str | None:
 def media_check(name: str, data: bytes) -> tuple[str, str, bytes]:
     """(kind, MIME type, the bytes to send) of a whole media file, or RefusedError `not_media`
     (wrong extension, magic bytes that disagree with it, not a whole file of that format, anything
-    after the container's end) or `too_large`. Metadata is dropped where that is cheap and safe."""
+    after the container's end, too many elements) or `too_large`. Metadata and unknown chunks are
+    dropped (allowlists) where that is cheap and safe."""
     expected = expected_format(name)
-    if expected is None or not data or sniff_media(data[:SNIFF_BYTES]) != expected:
+    if expected is None or not data or not sniff_agrees(data[:SNIFF_BYTES], expected):
         raise RefusedError("not_media")
     kind, mime = MEDIA_FORMATS[expected]
     if len(data) > ATTACHMENT_CAPS[kind]:
         raise RefusedError("too_large")
     try:
-        cleaned = _MEDIA_VALIDATORS[expected](data)
-    except (_NotMediaError, IndexError, ValueError):
+        cleaned = _MEDIA_VALIDATORS[expected](data, _Budget())
+    except (_NotMediaError, IndexError, ValueError, zlib.error):
         raise RefusedError("not_media") from None
     return kind, mime, cleaned
 
@@ -2307,7 +2645,7 @@ def verb_attachments(policy: Policy, env: dict[str, str]) -> dict[str, object]:
                 finally:
                     os.close(fd)
                 kind, mime = MEDIA_FORMATS[expected]
-                if sniff_media(head) != expected or not 0 < info.st_size <= ATTACHMENT_CAPS[kind]:
+                if not sniff_agrees(head, expected) or not 0 < info.st_size <= ATTACHMENT_CAPS[kind]:
                     skipped += 1
                     continue
                 mtime = int(info.st_mtime * 1000)

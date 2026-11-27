@@ -4,7 +4,9 @@ bit by bit, independently of the dispatcher's table and zlib based versions."""
 
 from __future__ import annotations
 
+import io
 import struct
+import zipfile
 import zlib
 
 GPS = b"GPS 47.3769 N 8.5417 E"
@@ -168,12 +170,27 @@ def box(kind: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data) + 8) + kind + data
 
 
-def mp4(brand: bytes = b"isom", *, mdat: bytes = b"\x00" * 64, udta: bool = True) -> bytes:
-    """ftyp, moov (mvhd, a trak with a udta, a udta with a location), mdat."""
+def hdlr(handler: bytes) -> bytes:
+    return box(b"hdlr", bytes(8) + handler + bytes(12) + b"\x00")
+
+
+def trak(handler: bytes, *, udta: bool = True) -> bytes:
+    """A track: tkhd, mdia (mdhd, hdlr, minf with an empty stbl), and a udta with a name."""
+    minf = box(b"minf", box(b"vmhd" if handler == b"vide" else b"smhd", bytes(12)) + box(b"stbl", b""))
+    mdia = box(b"mdia", box(b"mdhd", bytes(24)) + hdlr(handler) + minf)
+    return box(b"trak", box(b"tkhd", bytes(84)) + mdia + (box(b"udta", box(b"name", GPS)) if udta else b""))
+
+
+def mp4(
+    brand: bytes = b"isom", *, mdat: bytes = b"\x00" * 64, udta: bool = True, handlers: tuple[bytes, ...] = ()
+) -> bytes:
+    """ftyp, moov (mvhd, a trak per handler with a udta, a udta with a location), mdat. The
+    handlers default to a sound track for an audio brand, else a video and a sound track."""
+    handlers = handlers or ((b"soun",) if brand in (b"M4A ", b"M4B ") else (b"vide", b"soun"))
     ftyp = box(b"ftyp", brand + b"\x00\x00\x02\x00" + brand + b"mp41")
     location = box(b"udta", box(b"\xa9xyz", b"\x00\x12\x15\xc7" + GPS)) if udta else b""
-    trak = box(b"trak", box(b"tkhd", bytes(84)) + (box(b"udta", box(b"name", GPS)) if udta else b""))
-    moov = box(b"moov", box(b"mvhd", bytes(100)) + trak + location)
+    tracks = trak(handlers[0], udta=udta) + b"".join(trak(h, udta=False) for h in handlers[1:])
+    moov = box(b"moov", box(b"mvhd", bytes(100)) + tracks + location)
     return ftyp + moov + box(b"mdat", mdat)
 
 
@@ -236,3 +253,64 @@ NOT_MEDIA: dict[str, bytes] = {
     "empty.png": b"",
 }
 """Not media, or media of a type that is not allowed, whatever the name says."""
+
+
+# --- attacks (red-team review) ---------------------------------------------------------------
+
+SECRET = b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+"""Stands for a file a payload smuggles out: it must never reach the client readable."""
+
+
+def zip_of_secret(*, cover: int = 0) -> bytes:
+    """A real ZIP holding `.env` (SECRET). `cover` sets the end record's comment length, so the
+    archive still opens when the container appends that many bytes after it (a PNG chunk's CRC
+    and IEND, for example)."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(".env", SECRET)
+    data = bytearray(buffer.getvalue())
+    end = data.rfind(b"PK\x05\x06")
+    struct.pack_into("<H", data, end + 20, cover)
+    return bytes(data)
+
+
+def zip_secret(data: bytes) -> bytes | None:
+    """`.env` from a ZIP anywhere in `data` (as a ZIP reader finds it from the end), else None."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return archive.read(".env")
+    except (zipfile.BadZipFile, KeyError, OSError, ValueError):
+        return None
+
+
+def apng(frame_data: bytes | None = None) -> bytes:
+    """A 1x1 animated PNG: acTL, the default image (fcTL + IDAT) and a second frame (fcTL + fdAT)."""
+    header = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    actl = png_chunk(b"acTL", struct.pack(">II", 2, 0))
+
+    def fctl(sequence: int) -> bytes:
+        return png_chunk(b"fcTL", struct.pack(">IIIIIHHBB", sequence, 1, 1, 0, 0, 1, 10, 0, 0))
+
+    pixels = zlib.compress(b"\x00\xff\x00\x00")
+    second = pixels if frame_data is None else frame_data
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + header
+        + actl
+        + fctl(0)
+        + png_chunk(b"IDAT", pixels)
+        + fctl(1)
+        + png_chunk(b"fdAT", struct.pack(">I", 2) + second)
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def png_sized(width: int, height: int) -> bytes:
+    header = png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+    idat = png_chunk(b"IDAT", zlib.compress(bytes((1 + width) * height)))
+    return b"\x89PNG\r\n\x1a\n" + header + idat + png_chunk(b"IEND", b"")
+
+
+def ebml_short(element: bytes, data: bytes) -> bytes:
+    """An EBML element with a one-byte size (at most 126 bytes of data)."""
+    return element + bytes([0x80 | len(data)]) + data
