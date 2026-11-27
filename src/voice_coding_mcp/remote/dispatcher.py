@@ -34,7 +34,8 @@ dialog), `keys <paneId> <panePid> <sessionId|none> menu <menuHash|none> <key>...
 `keys <paneId> <panePid> <sessionId|none> answer <dialogHash|none> <key>...` (1 to MAX_KEYS key names
 from KEY_NAMES, only with --allow-send; bound to the menu or permission dialog the owner heard),
 `resize <paneId> <panePid> <sessionId|none> <columns> <rows>` (the pane's window, only with
---allow-send),
+--allow-send), `clear <paneId> <panePid> <sessionId> <draftHash>` (one Ctrl+C that clears the draft
+in an idle Claude Code input box, only the draft the owner heard, only with --allow-send),
 `usage <sinceEpochSeconds> <maxMegabytes>` (the hub's known transcripts as JSON on stdin,
 only with --allow-usage), `health` (free space and the read-only flag of the file systems that matter,
 load, memory and uptime; read-only, no opt-in, 0.9.0). Every response is one JSON document on stdout,
@@ -61,6 +62,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import unicodedata
 from collections.abc import Iterator
@@ -68,7 +70,7 @@ from typing import BinaryIO
 
 VERSION = "0.9.0"
 PROTOCOL = 1
-VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize", "health")
+VERBS = ("version", "list", "capture", "send", "usage", "keys", "resize", "health", "clear")
 PROGRAM = "switchboard-remote"
 
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}")
@@ -114,6 +116,20 @@ MAX_KEYS = 10
 RESIZE_COLUMNS = (80, 300)
 RESIZE_ROWS = (24, 120)
 """Inclusive bounds of `resize`."""
+CLEAR_KEY = "C-c"
+"""The one key `clear` presses: Ctrl+C clears a whole Claude Code input draft (any length, any
+cursor position, a paste placeholder, an open slash list) in Claude Code 2.1.332. It also arms
+Claude Code's exit for about 0.8 s ("Press Ctrl-C again to exit"), so it is pressed once, never
+repeated, and never while that hint shows. Not in KEY_NAMES: `keys` never presses modifiers."""
+CLEAR_STABLE_SECONDS = 0.5
+"""`clear` checks the screen, waits this long and checks it again before the key (race guard): a
+Ctrl+C just pressed at the keyboard shows its exit hint within this time, and a screen that changes
+(typing, a dialog opening, Claude Code starting to work) is not cleared."""
+CLEAR_SETTLE_SECONDS = 2.0
+"""After the key `clear` waits this long before it checks the result and returns, past Claude
+Code's exit window, so no later request can land as a second Ctrl+C inside it."""
+TEST_CLEAR_NO_WAIT = "SWITCHBOARD_REMOTE_TEST_CLEAR_NO_WAIT"
+"""Test only (with SWITCHBOARD_REMOTE_TEST=1): `clear` skips both waits."""
 
 MAX_SESSION_GLOBS = 64
 MAX_LINES = 500
@@ -318,11 +334,20 @@ def dialog_hash(screen: str) -> str | None:
     return hashlib.sha256(block.encode("utf-8")).hexdigest()[:24]
 
 
+_SCROLLED_BORDER_RE = re.compile(r"[\u2500-\u257f]+\s*↑\s*\d+\s+more\s*[\u2500-\u257f]+")
+"""The top border of a Claude Code input box whose draft is taller than the box (`─── ↑ 35 more ───`):
+the prompt line has scrolled out of view, only continuation lines show."""
+
+
 def shows_draft(screen: str) -> bool:
     """Text is already typed in Claude Code's input box: the last input line (`>` or `❯`) has text
-    after the prompt that is not the empty box's hint. A heuristic; it refuses rather than submit the
-    owner's unsent draft together with the send."""
+    after the prompt that is not the empty box's hint, or a box border says that lines scrolled out
+    of view above (`_SCROLLED_BORDER_RE`, a draft taller than the box, whose prompt line is not on
+    the screen). A heuristic; it refuses rather than submit the owner's unsent draft together with
+    the send."""
     tail = _screen_tail(screen)
+    if any(_SCROLLED_BORDER_RE.fullmatch(line) for line in tail):
+        return True
     for line in reversed(tail):
         if line.startswith(_INPUT_PROMPTS):
             typed = line[1:].strip()
@@ -642,6 +667,92 @@ def bound_menu_hash(screen: str, claude_pane: bool) -> str | None:
     return menu_hash(screen)
 
 
+INPUT_BOX_BELOW = 10
+"""Non-empty lines (status line, hints, an open slash list) allowed under the input box's bottom
+border."""
+_EXIT_ARMED_RE = re.compile(r"\bagain to exit\b", re.I)
+
+
+def input_box(screen: str) -> tuple[list[str], bool] | None:
+    """Claude Code's input box at the bottom of the screen: (its content lines, cleaned and with
+    whitespace collapsed, the input prompt removed from the first; `scrolled`, True when its top
+    border says lines scrolled out of view above), or None when no input box is recognised. The box
+    is the last border line with at most INPUT_BOX_BELOW non-empty lines under it, up to the border
+    above it; its first non-empty line starts with an input prompt (`❯`, `>`), unless the top border
+    is a scrolled one. The empty box's hint (`Try "..."`) is no content."""
+    lines = _menu_lines(screen)
+    while lines and not lines[-1]:
+        lines.pop()
+    bottom = len(lines) - 1
+    below = 0
+    while bottom >= 0 and not _BORDER_RE.fullmatch(lines[bottom]):
+        if lines[bottom]:
+            below += 1
+            if below > INPUT_BOX_BELOW:
+                return None
+        bottom -= 1
+    if bottom < 0:
+        return None
+    top = bottom - 1
+    while top >= 0 and not _BORDER_RE.fullmatch(lines[top]) and not _SCROLLED_BORDER_RE.fullmatch(lines[top]):
+        top -= 1
+    if top < 0:
+        return None
+    scrolled = _SCROLLED_BORDER_RE.fullmatch(lines[top]) is not None
+    content = [" ".join(clean_text(line, 400).split()) for line in lines[top + 1 : bottom]]
+    while content and not content[0]:
+        content.pop(0)
+    while content and not content[-1]:
+        content.pop()
+    if not scrolled:
+        if not content or not content[0].startswith(_INPUT_PROMPTS):
+            return None
+        content[0] = content[0][1:].strip()
+        if len(content) == 1 and (not content[0] or _PLACEHOLDER_RE.match(content[0])):
+            content = []
+    return content, scrolled
+
+
+def input_draft(screen: str) -> tuple[list[str], bool] | None:
+    """The draft typed in Claude Code's input box, as `input_box` reads it ((lines, scrolled)), or
+    None when nothing is typed. When no box is recognised but `shows_draft` sees a draft, its typed
+    prompt line (or, for a scrolled box, nothing readable) stands for it."""
+    box = input_box(screen)
+    if box is not None:
+        return box if box[0] or box[1] else None
+    if not shows_draft(screen):
+        return None
+    for line in reversed(_screen_tail(screen)):
+        if line.startswith(_INPUT_PROMPTS):
+            return [" ".join(clean_text(line[1:], 400).split())], False
+    return [], True
+
+
+def draft_hash(screen: str) -> str | None:
+    """What identifies the draft `input_draft` sees, so `clear` removes only the draft the owner
+    heard: a hash of its lines (and whether lines scrolled out above). None without a draft. Hub
+    and dispatcher run this function on the same kind of capture."""
+    draft = input_draft(screen)
+    if draft is None:
+        return None
+    lines, scrolled = draft
+    block = ("\u2191\n" if scrolled else "") + "\n".join(lines)
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()[:24]
+
+
+def shows_empty_input(screen: str) -> bool:
+    """Positive evidence of an empty Claude Code input: `input_box` finds a box with no content and
+    nothing scrolled out above, and `shows_draft` sees no draft. A screen without a recognisable box
+    is not empty."""
+    box = input_box(screen)
+    return box is not None and not box[0] and not box[1] and not shows_draft(screen)
+
+
+def shows_exit_armed(screen: str) -> bool:
+    """Claude Code's "Press Ctrl-C again to exit" (or Ctrl-D) hint: a Ctrl+C now would exit it."""
+    return any(_EXIT_ARMED_RE.search(line) for line in _screen_tail(screen))
+
+
 # --- options and policy ----------------------------------------------------------------------
 
 
@@ -842,6 +953,13 @@ def validate_request(tokens: list[str]) -> tuple[str, list[str]]:
             not RESIZE_COLUMNS[0] <= int(args[3]) <= RESIZE_COLUMNS[1]
             or not RESIZE_ROWS[0] <= int(args[4]) <= RESIZE_ROWS[1]
         ):
+            raise RefusedError("bad_request")
+    if verb == "clear":
+        if len(args) != 4 or not PANE_ID_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
+            raise RefusedError("bad_request")
+        if args[2] != SEND_NO_SESSION and not UUID_RE.fullmatch(args[2]):
+            raise RefusedError("bad_request")
+        if not DIALOG_HASH_RE.fullmatch(args[3]):
             raise RefusedError("bad_request")
     if verb == "usage":
         if len(args) != 2 or not NUMBER_RE.fullmatch(args[0]) or not DECIMAL_RE.fullmatch(args[1]):
@@ -1457,6 +1575,79 @@ def verb_health(
     }
 
 
+def _clear_check(policy: Policy, env: dict[str, str], args: list[str]) -> str:
+    """The screen of the pane `clear` would press its key in, after every check; raises the refusal.
+    Claude Code panes only (a shell's Ctrl+C interrupts its program; `none` is `not_claude`, also
+    with --send-to-any-pane), idle (`not_idle`: Ctrl+C interrupts a working session and cancels a
+    question), no permission dialog (`permission_prompt`), no menu or picker footer (`menu_present`),
+    no vim normal mode, no exit hint (`exit_armed`), a draft (`nothing_to_clear`) and the one the
+    owner heard (`draft_changed`)."""
+    pane_id, pane_pid, session_id, draft = args
+    pane, entry, screen = _send_state(policy, env, pane_id)
+    if pane is None:
+        raise RefusedError("gone")
+    if pane["pane_pid"] != pane_pid or not _same_session(entry, session_id):
+        raise RefusedError("changed")
+    if entry is None:
+        raise RefusedError("not_claude")
+    if _asks_permission(entry, screen):
+        raise RefusedError("permission_prompt")
+    if bound_menu_hash(screen, claude_pane=True) is not None or shows_picker(screen):
+        raise RefusedError("menu_present")
+    if entry.get("status") != "idle":
+        raise RefusedError("not_idle")
+    if shows_vim_normal(screen):
+        raise RefusedError("vim_normal")
+    if shows_exit_armed(screen):
+        raise RefusedError("exit_armed")
+    current = draft_hash(screen)
+    if current is None:
+        raise RefusedError("nothing_to_clear")
+    if current != draft:
+        raise RefusedError("draft_changed")
+    return screen
+
+
+def _pause(seconds: float) -> None:
+    """The waits of `clear` (a function of its own, so tests record them instead of sleeping)."""
+    time.sleep(seconds)
+
+
+def verb_clear(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str, object]:
+    """Clears the draft in a Claude Code pane's input box with one Ctrl+C (CLEAR_KEY), after the
+    checks of `_clear_check`, run twice CLEAR_STABLE_SECONDS apart (race guard; the second run is
+    right before the key). Waits CLEAR_SETTLE_SECONDS after the key, past Claude Code's exit window,
+    captures again and reports whether the input is now empty (`shows_empty_input`: a visible empty
+    box, not just a missing draft). Never presses a second key, whatever the result. Returns
+    `{"pressed": true, "cleared": bool, "remainingLines": n, "remainingChars": n}`."""
+    if not policy.allow_send:
+        raise RefusedError("not_allowed")
+    pane_id = args[0]
+    wait = not (env.get(TEST_FLAG) == "1" and env.get(TEST_CLEAR_NO_WAIT) == "1")
+    _clear_check(policy, env, args)
+    if wait:
+        _pause(CLEAR_STABLE_SECONDS)
+    _clear_check(policy, env, args)
+    code, _, _ = run_tmux(["send-keys", "-t", pane_id, CLEAR_KEY], policy, env)
+    if code != 0:
+        raise RefusedError("tmux_failed")
+    if wait:
+        # Serve mode runs mutating verbs one at a time (`send_lock`), so nothing else is typed into
+        # any pane before Claude Code's exit window has closed.
+        _pause(CLEAR_SETTLE_SECONDS)
+    code, screen, _ = run_tmux(["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{SEND_CHECK_LINES}"], policy, env)
+    if code != 0:
+        return {"pressed": True, "cleared": False, "remainingLines": None, "remainingChars": None}
+    left = input_draft(screen)
+    lines = left[0] if left is not None else []
+    return {
+        "pressed": True,
+        "cleared": shows_empty_input(screen),
+        "remainingLines": len(lines),
+        "remainingChars": sum(len(line) for line in lines),
+    }
+
+
 # --- usage -------------------------------------------------------------------------------------
 
 _TIMESTAMP_RE = re.compile(
@@ -1734,6 +1925,8 @@ def run_request(
             body = verb_resize(policy, env, args)
         elif verb == "health":
             body = verb_health(policy, env)
+        elif verb == "clear":
+            body = verb_clear(policy, env, args)
         elif verb == "usage":
             lines = verb_usage(policy, env, args, stdin)
             body = {"stream": "usage"}
@@ -1775,7 +1968,7 @@ SERVE_SILENCE_SECONDS = 180.0
 EXIT_REPLACED = 75
 EXIT_REFUSED = 76
 BYE_EXIT = {"replaced": EXIT_REPLACED, "unknown_machine": EXIT_REFUSED, "protocol": EXIT_REFUSED, "shutdown": 0}
-MUTATING_VERBS = ("send", "keys", "resize")
+MUTATING_VERBS = ("send", "keys", "resize", "clear")
 STDIN_VERBS = ("send", "usage")
 FRAME_ERRORS = ("bad_frame", "frame_too_large", "duplicate_id", "busy", "crashed")
 _HUB_FRAMES = {

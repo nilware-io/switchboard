@@ -875,7 +875,10 @@ async def test_a_numbered_draft_is_no_menu_to_the_hub(make: Make, lines: int, bo
     assert "I see no menu on its screen." in readback
     assert "fix the parser" not in readback
     ctx.later()
-    assert await ctx.confirm("4172") == ("Not pressed: something is already typed in that session's input.", True)
+    assert await ctx.confirm("4172") == (
+        "Not pressed: something is already typed in the input of fpga on dev. If it can go, say clear the input of fpga on dev first.",
+        True,
+    )
     assert pressed(ctx) == []
 
 
@@ -954,7 +957,10 @@ async def test_numbered_drafts_with_an_empty_last_line_or_a_quote_line_are_no_me
     assert "fix the parser" not in readback
     assert "That should choose" not in readback
     ctx.later()
-    assert await ctx.confirm("4172") == ("Not pressed: something is already typed in that session's input.", True)
+    assert await ctx.confirm("4172") == (
+        "Not pressed: something is already typed in the input of fpga on dev. If it can go, say clear the input of fpga on dev first.",
+        True,
+    )
     assert pressed(ctx) == []
 
 
@@ -964,7 +970,7 @@ async def test_a_menu_without_a_picker_footer_over_a_draft_is_refused_by_the_hub
     show(ctx := await make(), capture(lines[:-1], rows=30, alternate=True))
     assert await prepare(ctx, ["Enter"]) == (
         "Something is already typed in the input of fpga on dev, so I will not press keys there. "
-        "Send or clear it at the keyboard first.",
+        "If it can go, say clear the input of fpga on dev first.",
         True,
     )
     assert len(ctx.tools.confirmations) == 0

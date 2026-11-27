@@ -1,7 +1,8 @@
 """`stateDir/audit.jsonl`: one line per `remote_send_confirm` that reached the send step, also when
 sending failed (docs/SWITCHBOARD.md, "Audit"). Messages are `remote_send` lines, keys
-`remote_send_keys` lines (with the key names, which come from a fixed list) and window sizes
-`remote_resize` lines.
+`remote_send_keys` lines (with the key names, which come from a fixed list), window sizes
+`remote_resize` lines and cleared input drafts `remote_clear_input` lines (without the draft: its
+text, hash and length are not stored).
 
 The file is 0600, opened in append mode and fsynced per line. The text itself is stored only as an
 HMAC-SHA256 with a random key in `stateDir/audit.key` (0600), because a plain hash of a short text
@@ -23,14 +24,14 @@ from typing import Any
 from ..clock import now_ms, to_iso
 from ..json_file import ensure_dir
 from .redact import redact
-from .send import KEYS, RESIZE, Confirmation
+from .send import CLEAR, KEYS, RESIZE, Confirmation
 
 AUDIT_FILE = "audit.jsonl"
 KEY_FILE = "audit.key"
 KEY_BYTES = 32
 WARN_BYTES = 10 * 1024 * 1024
 MAX_LINE_BYTES = 64 * 1024
-EVENTS = {KEYS: "remote_send_keys", RESIZE: "remote_resize"}
+EVENTS = {KEYS: "remote_send_keys", RESIZE: "remote_resize", CLEAR: "remote_clear_input"}
 
 
 def audit_path(state_dir: str) -> str:
@@ -104,12 +105,15 @@ class AuditLog:
             "textChars": len(item.text),
             "outcome": outcome,
         }
+        if item.kind == CLEAR:
+            # Nothing of the owner's draft goes into the audit file, not even its length.
+            del line["textHmac"], line["textChars"]
         if item.kind == KEYS:
             line["keys"] = list(item.keys)
             line["menuBound"] = item.menu is not None
         if item.kind == RESIZE and item.size is not None:
             line["size"] = {"columns": item.size[0], "rows": item.size[1]}
-        if self.log_prompts:
+        if self.log_prompts and item.kind != CLEAR:
             line["text"] = redact(item.text)
         data = (json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)

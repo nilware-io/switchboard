@@ -10,7 +10,8 @@ render empty. Answers `list-panes -a -F <format>` and `capture-pane -p -J -t <pa
 last n lines of the pane's text), and for sends `load-buffer -b <name> -` (the buffer from stdin),
 `paste-buffer -p -d -b <name> -t <pane>`, `send-keys -t <pane> Enter` and `delete-buffer -b <name>`;
 `send-keys -t <pane> <key>...` records the keys in the scenario's `keys` list and applies
-its `afterKeys` once (like `afterPaste`); `resize-window -t <pane> -x <n> -y <n>` records `resized`.
+its `afterKeys` once (like `afterPaste`, and its `panes` replace the pane list); `captureSequence` ({pane: [text, ...]}) makes each capture
+of that pane first take the next text from its list (a screen that changes between two checks); `resize-window -t <pane> -x <n> -y <n>` records `resized`.
 Buffers live in `<scenario>.buffers.json`. After a paste, the scenario's `afterPaste` (once) replaces
 pane texts (`text`) and writes files (`write`: {path: JSON value}), so a test can open a permission
 dialog or change the registry between the paste and the Enter. `failOn` lists subcommands that fail.
@@ -77,6 +78,10 @@ def main() -> int:
             sys.stderr.write(f"can't find pane: {pane_id}\n")
             return 1
         lines = int(argv[6].lstrip("-"))
+        sequence = scenario.get("captureSequence", {}).get(pane_id)
+        if sequence:
+            scenario.setdefault("text", {})[pane_id] = sequence.pop(0)
+            _save(scenario_path, scenario)
         text = scenario.get("text", {}).get(pane_id, "")
         sys.stdout.write("\n".join(text.split("\n")[-lines:]) + "\n")
         return 0
@@ -114,6 +119,8 @@ def main() -> int:
         after = scenario.pop("afterKeys", None)
         if isinstance(after, dict):
             scenario.setdefault("text", {}).update(after.get("text", {}))
+            if "panes" in after:
+                scenario["panes"] = after["panes"]
         _save(scenario_path, scenario)
         return 0
     if argv[:2] == ["resize-window", "-t"] and len(argv) == 7 and argv[3] == "-x" and argv[5] == "-y":

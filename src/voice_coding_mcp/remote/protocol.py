@@ -18,7 +18,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 from ..usage.records import UsageBatch, UsageStreamError, parse_lines
 
 DISPATCHER_PROGRAM = "switchboard-remote"
-VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage", "keys", "resize", "health")
+VERBS: tuple[str, ...] = ("version", "list", "capture", "send", "usage", "keys", "resize", "health", "clear")
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -169,6 +169,16 @@ class HealthResponse(_Response):
     uptime_seconds: float | None = Field(default=None, alias="uptimeSeconds", ge=0, le=1e12)
 
 
+class ClearResponse(_Response):
+    """Dispatcher 0.8.0: one Ctrl+C was pressed; `cleared` when the input box is visibly empty
+    afterwards, else what is still in it (None when the second capture failed)."""
+
+    pressed: bool
+    cleared: bool
+    remaining_lines: int | None = Field(default=None, alias="remainingLines", ge=0)
+    remaining_chars: int | None = Field(default=None, alias="remainingChars", ge=0)
+
+
 class UsageResponse(BaseModel):
     """The parsed JSON lines of `usage` (built with `model_construct`, already checked)."""
 
@@ -188,6 +198,7 @@ RESPONSE_MODELS: dict[str, type[_Response]] = {
     "keys": KeysResponse,
     "resize": ResizeResponse,
     "health": HealthResponse,
+    "clear": ClearResponse,
 }
 
 

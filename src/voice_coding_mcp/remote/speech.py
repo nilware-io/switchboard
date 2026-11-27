@@ -17,7 +17,7 @@ from .menu import ScreenMenu
 from .pending import PendingEntry, PendingReport, waits_for_permission
 from .protocol import ClaudeInfo, PaneInfo
 from .redact import clean_name, redact
-from .send import KEYS, RESIZE, Confirmation, key_words, risk_words, yes_phrase
+from .send import CLEAR, KEYS, RESIZE, Confirmation, key_words, risk_words, yes_phrase
 from .targets import Ambiguous, NoTarget, NotFound
 from .transport import TransportError
 
@@ -367,7 +367,7 @@ def _message(text: str) -> str:
     return f'"{text}"'
 
 
-_DROPPED_KIND = {KEYS: "key presses", RESIZE: "resize"}
+_DROPPED_KIND = {KEYS: "key presses", RESIZE: "resize", CLEAR: "input clearing"}
 
 
 def dropped_words(dropped: Sequence[Confirmation]) -> str:
@@ -459,13 +459,47 @@ def format_resize_readback(
     return " ".join(parts)
 
 
+DRAFT_WORDS = 12
+"""At most this many words of a draft are read back by `remote_clear_input`."""
+DRAFT_CHARS = 100
+
+
+def draft_words(lines: Sequence[str]) -> str:
+    """The first words of a draft (its lines joined), redacted and clipped."""
+    words = " ".join(lines).split()
+    text = " ".join(words[:DRAFT_WORDS])
+    if len(words) > DRAFT_WORDS:
+        text += " ..."
+    return clip(redact(text), DRAFT_CHARS)
+
+
+def format_clear_readback(
+    item: Confirmation, *, lines: Sequence[str], scrolled: bool, dropped: Sequence[Confirmation]
+) -> str:
+    """What `remote_clear_input` returns: the target, the first words of the draft (quoted as the
+    screen's), that it is thrown away, and the yes phrase, then the confirmation id for the model."""
+    parts: list[str] = [dropped_words(dropped)] if dropped else []
+    if lines:
+        above = ", and more lines above it" if scrolled else ""
+        shown = f"Its screen shows this typed there{above}: {quote(draft_words(lines))}."
+    else:
+        shown = "Its screen shows a long draft whose first lines are scrolled out of view."
+    parts.append(f"Ready to clear what is typed in the input of {item.place}. {shown}")
+    parts.append(
+        "Clearing throws that text away; I send nothing and press only Ctrl+C once. At the keyboard, "
+        "the up arrow may bring it back."
+    )
+    parts.append("Say yes to clear it.")
+    parts.append(f"(confirmation {item.id}, do not read this number aloud)")
+    return " ".join(parts)
+
+
 _NOT_SENT: dict[str, str] = {
     "not_connected": "Not sent: {machine} is not connected right now.",
     "busy": "Not sent: switchboard-remote on {machine} was busy. Try again in a moment.",
     "gone": "Not sent: the pane is gone.",
     "changed": "Not sent: that pane now runs a different session.",
     "dialog_changed": "Not sent: the permission question you answered is no longer on that screen.",
-    "draft_present": "Not sent: something is already typed in that session's input.",
     "vim_normal": "Not sent: that session's input is in vim normal mode, so the text would be read as commands.",
     "not_claude": "Not sent: switchboard-remote on {machine} does not allow typing into panes without Claude Code.",
     "not_allowed": "Not sent: switchboard-remote on {machine} does not allow sending.",
@@ -488,6 +522,16 @@ _NOT_DONE_KEYS: dict[str, str] = {
     "dialog_not_visible": "Not pressed: the permission question is not visible on that screen. Check it at the keyboard.",
     "bad_request": "Not pressed: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
 }
+_NOT_DONE_CLEAR: dict[str, str] = {
+    "nothing_to_clear": "Not cleared: nothing is typed in that input any more.",
+    "draft_changed": "Not cleared: what is typed there changed since I read it to you. Ask me to read it again.",
+    "not_idle": "Not cleared: that session is working or waiting for an answer now, and Ctrl+C would interrupt it.",
+    "menu_present": "Not cleared: that screen now shows a menu, and Ctrl+C would close it. Ask me what it says.",
+    "exit_armed": "Not cleared: that screen asks to press Ctrl-C again to exit, so I pressed nothing. Try again in a few seconds.",
+    "vim_normal": "Not cleared: that input is in vim normal mode. Clear it at the keyboard.",
+    "not_claude": "Not cleared: that pane no longer runs Claude Code.",
+    "bad_request": "Not cleared: switchboard-remote on {machine} refused the request. If it is older than 0.8.0, update it there.",
+}
 _NOT_DONE_RESIZE: dict[str, str] = {
     "not_claude": "Not resized: switchboard-remote on {machine} does not allow resizing panes without Claude Code.",
     "bad_request": "Not resized: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
@@ -507,6 +551,26 @@ def format_confirm_outcome(item: Confirmation, outcome: str, detail: str | None)
         if code in _NOT_DONE_KEYS:
             return _NOT_DONE_KEYS[code].format(machine=machine)
         return "Not pressed: " + _confirm_problem(item, outcome).removeprefix("Not sent: ")
+    if item.kind == CLEAR:
+        if outcome == "sent":
+            return f"Cleared the input of {item.place}."
+        if outcome == "not_cleared":
+            left = f" (about {detail} characters)" if detail else ""
+            return (
+                f"I pressed Ctrl+C once in {item.place}, but its input still shows text{left}. I pressed "
+                "nothing else. Ask me what its screen says, or clear it at the keyboard."
+            )
+        if outcome == "not_verified":
+            return (
+                f"I pressed Ctrl+C once in {item.place}, but could not read its screen afterwards. Ask me "
+                "what its screen says before clearing again."
+            )
+        if outcome == "unknown":
+            session = item.place.removesuffix(f" on {machine}")
+            return f"I do not know whether the input was cleared, {machine} stopped answering. Ask me what {session} is doing before clearing again."
+        if code in _NOT_DONE_CLEAR:
+            return _NOT_DONE_CLEAR[code].format(machine=machine)
+        return "Not cleared: " + _confirm_problem(item, outcome).removeprefix("Not sent: ")
     if item.kind == RESIZE:
         if outcome == "sent":
             assert item.size is not None
@@ -534,6 +598,11 @@ def _confirm_problem(item: Confirmation, outcome: str) -> str:
     code = outcome.removeprefix("not_sent:")
     if code == "permission_prompt":
         return "Not sent: that session is now waiting for a permission decision. Approve it at the keyboard or in the Claude app."
+    if code == "draft_present":
+        return (
+            f"Not sent: something is already typed in the input of {item.place}. If it can go, say "
+            f"clear the input of {item.place} first."
+        )
     if code in _NOT_SENT:
         return _NOT_SENT[code].format(machine=machine)
     return f"Not sent: {machine} could not be reached."
