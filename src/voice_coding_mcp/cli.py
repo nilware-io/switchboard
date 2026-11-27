@@ -1,5 +1,5 @@
 """Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher,
-remote-connector, agent-relay, audit, incidents, usage, set-public-url (argparse; usage errors exit 2).
+remote-connector, remote-hook, agent-relay, audit, incidents, usage, set-public-url (argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -183,6 +183,10 @@ def build_parser() -> argparse.ArgumentParser:
     command(
         "remote-connector",
         "print the switchboard-connect script, for installing it on a machine that connects out to the hub",
+    )
+    command(
+        "remote-hook",
+        "print the switchboard-hook script (Claude Code hooks and notify_owner), for installing it on a machine",
     )
     agent_relay = command(
         "agent-relay",
@@ -1044,6 +1048,18 @@ def _cmd_remote_connector(io: CliIo) -> int:
     return EXIT_OK
 
 
+HOOK_PATH = os.path.join(os.path.dirname(DISPATCHER_PATH), "hook.py")
+
+
+def _cmd_remote_hook(io: CliIo) -> int:
+    with open(HOOK_PATH, encoding="utf-8") as handle:
+        io.out(handle.read())
+    return EXIT_OK
+
+
+BUNDLED_SCRIPTS = {"remote-dispatcher": DISPATCHER_PATH, "remote-connector": CONNECTOR_PATH, "remote-hook": HOOK_PATH}
+
+
 async def main(argv: Sequence[str], io: CliIo) -> int:
     """Runs one CLI invocation and returns the exit code."""
     try:
@@ -1055,10 +1071,14 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
         io.err(f"{err.usage}{err.prog}: error: {err}\n")
         return EXIT_USAGE
 
-    if args.command in ("remote-dispatcher", "remote-connector"):
+    if args.command in BUNDLED_SCRIPTS:
         # Needs no config: it prints the bundled script.
         try:
-            return _cmd_remote_dispatcher(io) if args.command == "remote-dispatcher" else _cmd_remote_connector(io)
+            if args.command == "remote-dispatcher":
+                return _cmd_remote_dispatcher(io)
+            if args.command == "remote-connector":
+                return _cmd_remote_connector(io)
+            return _cmd_remote_hook(io)
         except OSError as err:
             io.err(f"Error: {err}\n")
             return EXIT_ERROR
