@@ -8,6 +8,7 @@ drift apart. Nothing here talks to a machine; `tools.py` does.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import re
 import secrets
 import unicodedata
@@ -249,6 +250,19 @@ _WORD_RE = re.compile(r"\w+")
 _LETTERS_RE = re.compile(r"[^\W\d_]+")
 
 
+def _capital_runs(run: str) -> list[str]:
+    """Parts at an upper-to-lower boundary of a letter run: every run of two or more capitals and
+    the lower-case run right after it (`CREDENTIALS` and `exfil` in `CREDENTIALSexfil`)."""
+    parts: list[str] = []
+    previous = ""
+    for upper, chars in itertools.groupby(run, str.isupper):
+        group = "".join(chars)
+        if len(group if upper else previous) >= 2:
+            parts.append(group)
+        previous = group if upper else ""
+    return parts
+
+
 class ScreenEcho:
     """Remembers, as keyed hashes of normalised text (no text), what screen text the hub returned, so
     a send that repeats it is marked risky: an injected screen is the likely source of such words.
@@ -335,23 +349,37 @@ class ScreenEcho:
     def _screen_word_digests(self, text: str, norm: str) -> set[bytes]:
         """Digests of every word a screen shows, as `_words` would hash it in a send: the whole
         letters-only tokens, and also every letter run inside a longer token (split at digits,
-        underscores and other non-letters: `exfiltrate_credentials`, `exfiltrate2`) and every
-        CamelCase part (`ExfiltrateCredentials`, split before casefolding), each at least `MIN_WORD`
-        long. A word shown only inside an identifier still counts as shown first. A superset of the
-        send-side words, so it can only make screen-first stricter."""
+        underscores and other non-letters: `exfiltrate_credentials`, `exfiltrate2`), every
+        CamelCase part (`ExfiltrateCredentials`, split before casefolding) and the parts at an
+        upper-to-lower boundary (`CREDENTIALSexfil`, `_capital_runs`), each at least `MIN_WORD`
+        long. All of this is done twice: on the text as shown and on the text with Unicode format
+        characters (category Cf: zero-width spaces and joiners, soft hyphens, BOM) removed, so
+        `exfil\u200btrate` also shows `exfiltrate`. A word shown only inside an identifier still
+        counts as shown first. A superset of the send-side words, so it can only make screen-first
+        stricter. Glued lower-case words and words split across lines are not recognised (accepted
+        risk, docs/DESIGN.md)."""
         found = {digest for _, _, digest in self._words(norm)}
-        parts: set[str] = {m.group() for m in _LETTERS_RE.finditer(norm)}
-        for m in _LETTERS_RE.finditer(unicodedata.normalize("NFKC", text)):
-            run = m.group()
-            start = 0
-            for i in range(1, len(run)):
-                if run[i].isupper() and (
-                    run[i - 1].islower() or (run[i - 1].isupper() and i + 1 < len(run) and run[i + 1].islower())
-                ):
-                    parts.add(run[start:i].casefold())
-                    start = i
-            parts.add(run[start:].casefold())
-            parts.add(run.casefold())
+        parts: set[str] = set()
+        sources = [text]
+        stripped = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+        if stripped != text:
+            sources.append(stripped)
+            found |= {digest for _, _, digest in self._words(self._normalise(stripped))}
+        for source in sources:
+            folded = unicodedata.normalize("NFKC", source)
+            parts |= {m.group() for m in _LETTERS_RE.finditer(folded.casefold())}
+            for m in _LETTERS_RE.finditer(folded):
+                run = m.group()
+                start = 0
+                for i in range(1, len(run)):
+                    if run[i].isupper() and (
+                        run[i - 1].islower() or (run[i - 1].isupper() and i + 1 < len(run) and run[i + 1].islower())
+                    ):
+                        parts.add(run[start:i].casefold())
+                        start = i
+                parts.add(run[start:].casefold())
+                parts.add(run.casefold())
+                parts |= {upper.casefold() for upper in _capital_runs(run)}
         found |= {self._hash("\x00w" + part) for part in parts if len(part) >= self.MIN_WORD}
         return found
 

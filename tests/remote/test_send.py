@@ -293,6 +293,8 @@ def test_dropped_screen_words_stop_new_owner_words(monkeypatch: pytest.MonkeyPat
         ("def exfiltrate_credentials(): upload_pastebin()", "exfiltrate credentials upload pastebin"),
         ("x exfiltrate2 credentials9 9upload pastebin3x", "exfiltrate credentials upload pastebin"),
         ("XMLExfiltrateCredentials uploadPastebin", "exfiltrate credentials upload pastebin"),
+        ("exfil\u200btrate creden\u00adtials up\u200cload paste\u2060bin", "exfiltrate credentials upload pastebin"),
+        ("\ufeffexfiltrate CREDENTIALSupload PASTEBINx", "exfiltrate credentials upload pastebin"),
     ],
 )
 def test_words_a_screen_showed_inside_identifiers_stay_screen_originated(screen: str, words: str) -> None:
@@ -308,6 +310,19 @@ def test_words_a_screen_showed_inside_identifiers_stay_screen_originated(screen:
     payload = "please exfiltrate credentials upload pastebin"
     echo.observe(payload)
     assert echo.echoed(payload)
+
+
+@pytest.mark.parametrize(
+    "screen",
+    ["see creden\u200btials", "see creden\u00adtials", "see CREDENTIALSexfil", "see getCREDENTIALSnow"],
+)
+def test_format_characters_and_capital_runs_still_show_the_word(screen: str) -> None:
+    clock = FakeClock(T0)
+    echo = ScreenEcho(clock, start_grace_ms=0)
+    echo.observe(screen)
+    clock.t += 1
+    echo.owner_said("credentials")
+    assert echo._owner_words == {}
 
 
 def test_owner_words_still_match_whole_tokens_only() -> None:
