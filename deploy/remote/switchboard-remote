@@ -1933,8 +1933,10 @@ EBML_RESYNC_IDS = (
 Chapters, Tags). When an element fails to parse while a demuxer reads the header, libavformat
 resyncs: it scans forward byte by byte for one of these ids and parses what it finds as a top-level
 element, so an Attachments element hidden in opaque bytes (CodecPrivate) would be read. None may
-appear in a CodecPrivate value, nor anywhere before the first Cluster of the cleaned copy other
-than at the start of a walked top-level element."""
+appear in a CodecPrivate value, nor anywhere from one byte after the Segment's start to the first
+Cluster of the cleaned copy other than at the start of a walked top-level element or as a SeekID
+value. A SeekID value is still a landing spot (see `_ebml_no_resync_target`): the closure rests on
+no kept element failing to parse, the id scan only narrows where a resync can land."""
 EBML_LANGUAGE_RE = re.compile(rb"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8}){0,2}")
 EBML_MAX_LANGUAGE = 32
 """A kept `Language` or `LanguageBCP47` element: at most 32 bytes, holding a tag of at most 21
@@ -2982,6 +2984,8 @@ def _ebml_master(
             _need(size in (0, 4, 8))
         elif rule == "id":
             _need(1 <= size <= 4)
+            # SeekPosition right after: a resync landing on this value reads a 5,036-byte size.
+            _need(data[child_end : child_end + 2] == b"\x53\xac" and child_end + 2 < end)
             walk.ids.add(payload)
         elif rule == "private":
             _need(size <= EBML_MAX_CODEC_PRIVATE)
@@ -3173,8 +3177,11 @@ def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
     header_end_at = segment + clusters[0][0] if clusters[0] else segment_end
     # A SeekID names a top-level element by its id; the pointer check holds it to walked elements.
     starts = {segment + offset for offset in level1[0]} | walk.ids
+    # libavformat's first resync starts one byte after the Segment element's start, so the Segment's
+    # size field is scanned too: a 4-byte size can spell a level-1 id (19 41 A4 69 is 155,296,873).
+    scan_from = header_end + 1
     if not walk.blank:
-        _ebml_no_resync_target(data, segment, header_end_at, starts)
+        _ebml_no_resync_target(data, scan_from, header_end_at, starts)
         return data
     out = bytearray(data)
     for blank_start, blank_end in walk.blank:
@@ -3185,15 +3192,20 @@ def _matroska(data: bytes, budget: _Budget, expected: str) -> bytes | bytearray:
         if any(a < covered_end and b > covered_start for a, b in walk.blank):
             out[value : value + 4] = zlib.crc32(view[covered_start:covered_end]).to_bytes(4, "little")
     view.release()
-    _ebml_no_resync_target(out, segment, header_end_at, starts)
+    _ebml_no_resync_target(out, scan_from, header_end_at, starts)
     return out
 
 
 def _ebml_no_resync_target(data: bytes | bytearray, start: int, end: int, starts: set[int]) -> None:
-    """No top-level id between the Segment's payload and the first Cluster other than at the start
-    of a walked top-level element or as a SeekID value (`EBML_RESYNC_IDS`): whatever a demuxer's
-    error resync finds there is one of the elements the walk checked. Checked on the cleaned copy,
-    after CRCs are recomputed."""
+    """No top-level id (`EBML_RESYNC_IDS`) from one byte after the Segment element's start (its size
+    field included) to the first Cluster, other than at the start of a walked top-level element or
+    as a SeekID value. This narrows where a demuxer's error resync can land; it does not make the
+    landing spots safe. A SeekID value is such a spot: resync parses a fake element with that id
+    and a size read from the bytes after it, which `_ebml_master` bounds by requiring SeekPosition
+    right after every SeekID (`53 AC` as a 2-byte size: 5,036 bytes), but which can still reach
+    into frame data when the SeekHead sits that close to the first Cluster. The guarantee is that
+    no kept element before the first Cluster fails to parse in libavformat (verified for ffmpeg
+    6.1), so no resync starts there. Checked on the cleaned copy, after CRCs are recomputed."""
     for resync_id in EBML_RESYNC_IDS:
         found = data.find(resync_id, start, end)
         while found >= 0:

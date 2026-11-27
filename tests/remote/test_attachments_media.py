@@ -984,6 +984,35 @@ def test_seek_entries_must_name_the_element_at_their_offset() -> None:
     assert refused("movie.mkv", mkv(extra=el(0x114D9B74, el(0x4DBB, el(0x53AB, b"\x15\x49\xa9\x66"))))) == ("not_media")
 
 
+def segment_sized(size: int) -> bytes:
+    """A live recording with a 4-byte Segment size of `size`, filled out by one block of zeros."""
+    head = mkv(live=True, cluster=el(0xE7, b"\x00"))
+    segment = head.index(b"\x18\x53\x80\x67")
+    body = head[segment + 12 :]
+    frame = size - len(body) - 13
+    block = b"\xa3" + (1 << 56 | (4 + frame)).to_bytes(8, "big") + b"\x81\x00\x00\x80"
+    field = (size | 1 << 28).to_bytes(4, "big")
+    return head[:segment] + b"\x18\x53\x80\x67" + field + body + block + bytes(frame)
+
+
+def test_a_segment_size_that_spells_a_top_level_id_is_refused() -> None:
+    """libavformat's first resync starts one byte after the Segment's start, so its size field is a
+    landing spot: 0x0941A469 as a 4-byte size is 19 41 A4 69, the Attachments id."""
+    assert refused("movie.mkv", segment_sized(0x0941A469)) == "not_media"
+    assert d.media_check("movie.mkv", segment_sized(0x0941A468))[0] == "video"
+
+
+def test_seek_id_must_come_right_before_seek_position() -> None:
+    """A resync landing on a SeekID value reads the bytes after it as a size: SeekPosition's id
+    (53 AC) bounds that to 5,036 bytes. Any other order, or a Void between them, is refused."""
+    info_at = len(seekhead([(0, 0)] * 4)).to_bytes(8, "big")
+    seek_id = el(0x53AB, b"\x15\x49\xa9\x66")
+    position = el(0x53AC, info_at)
+    assert d.media_check("movie.mkv", mkv(extra=el(0x114D9B74, el(0x4DBB, seek_id + position))))[0] == "video"
+    for entry in (position + seek_id, seek_id + el(0xEC, b"") + position):
+        assert refused("movie.mkv", mkv(extra=el(0x114D9B74, el(0x4DBB, entry)))) == "not_media"
+
+
 def test_the_seek_entry_of_blanked_tags_is_blanked_too() -> None:
     clean = bytes(d.media_check("movie.mkv", mkv())[2])
     assert b"\x53\xab\x01\x00\x00\x00\x00\x00\x00\x04\x12\x54\xc3\x67" not in clean
