@@ -44,6 +44,7 @@ from .dispatcher import (
     SEND_ANSWER,
     SEND_CHECK_LINES,
     SEND_MESSAGE,
+    accepts_suggestion,
     bound_menu_hash,
     dialog_bound,
     draft_hash,
@@ -126,7 +127,7 @@ from .speech import (
     text_refusal,
     unreachable_sentence,
 )
-from .summarize import Summarizer, SummarizerOptions, last_meaningful_line, screen_hash
+from .summarize import Summarizer, SummarizerOptions, last_meaningful_line, mark_suggestion, screen_hash
 from .targets import Resolved, resolve_target
 from .transport import Transport, make_transport
 
@@ -569,7 +570,7 @@ class RemoteTools:
             cut = unread and shows_picker(screen)
             if cut or (rows < RESIZE_ROWS[0] and (unread or len(screen.lstrip("\n").split("\n")) >= rows)):
                 note = cut_note(rows, found.item.allow_send and rows < RESIZE_ROWS[1], menu_cut=cut)
-        answer = await self._describe(name, pane, label, screen, deadline)
+        answer = await self._describe(name, pane, label, screen, deadline, suggestion=captured.suggestion)
         return ToolAnswer(self._with_clause(name, answer.text + note), answer.is_error)
 
     def _log_answer(self, machine: str, pane: PaneInfo, path: str, reason: str | None = None) -> None:
@@ -579,8 +580,21 @@ class RemoteTools:
             fields["reason"] = reason
         self._logger.info("remote_status answer", fields)
 
-    async def _describe(self, machine: str, pane: PaneInfo, label: str, screen: str, deadline: _Deadline) -> ToolAnswer:
+    async def _describe(
+        self,
+        machine: str,
+        pane: PaneInfo,
+        label: str,
+        screen: str,
+        deadline: _Deadline,
+        *,
+        suggestion: str | None = None,
+    ) -> ToolAnswer:
+        """The answer of `remote_status`. The heuristic reads the screen as captured (a prompt
+        suggestion cut off); the summariser gets the suggestion marked on the input line
+        (`mark_suggestion`)."""
         menu = screen_menu(screen)
+        shown = mark_suggestion(screen, suggestion)
         # A menu that cannot be read still has its question and options above the key hints.
         line = (footer_block(screen) if menu is None else None) or last_meaningful_line(screen)
 
@@ -593,7 +607,7 @@ class RemoteTools:
         if not self._summarizer.enabled:
             return ToolAnswer(heuristic("disabled"))
         key = f"{machine}:{pane.pane_id}"
-        cached = self._summarizer.cached(key, screen_hash(screen))
+        cached = self._summarizer.cached(key, screen_hash(shown))
         if cached is not None:
             self.echo.observe(cached)
             self._log_answer(machine, pane, "cached")
@@ -603,7 +617,7 @@ class RemoteTools:
         if lease is None:
             # No queueing for a status read: the heuristic answers at once.
             return ToolAnswer(heuristic("locked" if self._manager.is_locked(lock_key) else "no_slot"))
-        run = asyncio.ensure_future(self._summarizer.summarize(key, screen, lease))
+        run = asyncio.ensure_future(self._summarizer.summarize(key, shown, lease))
         self._background.add(run)
         run.add_done_callback(self._background.discard)
         budget = min(float(self._remote.summary.timeout_seconds), deadline.left() - SUMMARY_MARGIN_SECONDS)
@@ -925,6 +939,20 @@ class RemoteTools:
                     "menu_unreadable",
                 )
             problem = keys_problem(parsed, menu_bound=False)
+            if (
+                problem is None
+                and captured.suggestion is not None
+                and claude is not None
+                and accepts_suggestion(parsed)
+            ):
+                # Right (and Tab) take Claude Code's grey suggestion into the input, where a later
+                # Enter submits a prompt nobody typed. The dispatcher refuses the same
+                # (`suggestion_present`).
+                return refuse(
+                    f"The input of {place} shows a prompt that Claude Code suggests, which nobody typed; right "
+                    "arrow would accept it, so I will not press it. Tell me the message instead.",
+                    "suggestion_present",
+                )
             if problem == "mode_keys":
                 # Tab and Shift+Tab at a Claude Code input switch modes (Shift+Tab cycles the
                 # permission mode up to accept edits or bypass), a broader grant than answering one

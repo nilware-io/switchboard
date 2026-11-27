@@ -99,7 +99,7 @@ def assert_fixed_shapes(world: RemoteWorld) -> None:
         if argv[:1] == ["list-panes"]:
             assert argv == ["list-panes", "-a", "-F", d.LIST_FORMAT]
         elif argv[:1] == ["capture-pane"]:
-            assert argv == ["capture-pane", "-p", "-J", "-t", "%1", "-S", f"-{d.SEND_CHECK_LINES}"]
+            assert argv == ["capture-pane", "-p", "-e", "-J", "-t", "%1", "-S", f"-{d.SEND_CHECK_LINES}"]
         elif argv[:1] == ["send-keys"]:
             assert argv == ["send-keys", "-t", "%1", "C-c"]
         else:

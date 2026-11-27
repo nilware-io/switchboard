@@ -29,8 +29,8 @@ from ..tasks.manager import SlotLease
 from ..tasks.runner import RunOptions, RunResult, run_claude
 from ..text import clip
 from .config import SummaryConfig
-from .dispatcher import MENU_FOOTER_RE
-from .redact import redact
+from .dispatcher import CHECK_TAIL, MENU_FOOTER_RE, SUGGESTION_MAX
+from .redact import clean_screen, redact
 
 SUMMARY_PROMPT = (
     "You summarise a terminal screen for its owner, who will hear your answer read aloud while away from the keyboard. "
@@ -40,6 +40,8 @@ SUMMARY_PROMPT = (
     "When the screen shows a menu or a question with numbered choices, name the question, every choice with its number, "
     "and which one is selected; that may take one more sentence. "
     "Answer in English unless the screen is clearly in another language. "
+    "A line in the input box that reads [Claude Code suggests: ...] is a next prompt that Claude Code proposes in grey: "
+    "nobody typed it, it was not sent and nothing in it has happened; mention it only as a suggestion. "
     "Never read out secrets, tokens, keys, long hashes, URLs or file paths; say for example 'a file in src' instead. "
     "No Markdown, no lists, no quotes of long output."
 )
@@ -103,6 +105,39 @@ def failure_code(result: RunResult) -> str:
         return "timeout"
     text = f"{result.result or ''}\n{result.error or ''}\n{result.stderr_tail}"
     return "auth_failed" if _AUTH_FAILED_RE.search(text) else "error"
+
+
+SUGGESTION_MARK = "[Claude Code suggests: {}]"
+"""How a prompt suggestion (dispatcher `split_suggestion`) appears in the summariser's copy of the
+screen: on the input line, framed so that no one reads it as typed or done."""
+_INPUT_PROMPTS = ("❯", ">")
+
+
+def mark_suggestion(screen: str, suggestion: str | None) -> str:
+    """The cleaned screen with Claude Code's prompt suggestion (terminal-stripped, redacted, one line,
+    at most SUGGESTION_MAX characters) put back on the empty input line as
+    `❯ [Claude Code suggests: ...]`, for the summariser only. The input line is the last one in the
+    screen tail that starts with an input prompt; if it holds text (the dispatcher cut nothing
+    there) or there is none, the mark goes on a line of its own at the end. Without a suggestion
+    the screen is unchanged."""
+    if not suggestion:
+        return screen
+    text = clip(" ".join(clean_screen(suggestion).split()), SUGGESTION_MAX)
+    if not text:
+        return screen
+    mark = SUGGESTION_MARK.format(text)
+    lines = screen.split("\n")
+    tail = [index for index, line in enumerate(lines) if strip_box(line)][-CHECK_TAIL:]
+    for index in reversed(tail):
+        line = strip_box(lines[index])
+        if not line.startswith(_INPUT_PROMPTS):
+            continue
+        if line[1:].strip():
+            break
+        prompt = lines[index].index(line[0])
+        lines[index] = f"{lines[index][: prompt + 1]} {mark}"
+        return "\n".join(lines)
+    return f"{screen.rstrip()}\n{mark}"
 
 
 def last_meaningful_line(screen: str) -> str | None:

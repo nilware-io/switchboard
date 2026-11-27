@@ -520,6 +520,7 @@ _NOT_DONE_KEYS: dict[str, str] = {
     "history_submit": "Not pressed: there is no menu on that screen; up or down and then enter would send an earlier prompt or command again.",
     "menu_unreadable": "Not pressed: that screen now shows a menu I cannot read. Ask me what it says.",
     "dialog_not_visible": "Not pressed: the permission question is not visible on that screen. Check it at the keyboard.",
+    "suggestion_present": "Not pressed: that input now shows a prompt Claude Code suggests, and right arrow would accept it. Tell me the message instead.",
     "bad_request": "Not pressed: switchboard-remote on {machine} refused the request. If it is older than 0.5.0, update it there.",
 }
 _NOT_DONE_CLEAR: dict[str, str] = {

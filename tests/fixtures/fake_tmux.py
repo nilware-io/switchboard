@@ -6,8 +6,8 @@ Reads the scenario JSON named by FAKE_TMUX_SCENARIO:
   {"noServer": false, "panes": [{"session_name": "fpga", "pane_id": "%1", ...}], "text": {"%1": "..."}}
 
 Pane dicts use tmux format names (`session_name`, `window_index`, `pane_pid`, ...); missing ones
-render empty. Answers `list-panes -a -F <format>` and `capture-pane -p -J -t <pane> -S -<n>` (the
-last n lines of the pane's text), and for sends `load-buffer -b <name> -` (the buffer from stdin),
+render empty. Answers `list-panes -a -F <format>` and `capture-pane -p [-e] -J -t <pane> -S -<n>` (the
+last n lines of the pane's text, which may hold SGR sequences; without -e they are removed), and for sends `load-buffer -b <name> -` (the buffer from stdin),
 `paste-buffer -p -d -b <name> -t <pane>`, `send-keys -t <pane> Enter` and `delete-buffer -b <name>`;
 `send-keys -t <pane> <key>...` records the keys in the scenario's `keys` list and applies
 its `afterKeys` once (like `afterPaste`, and its `panes` replace the pane list); `captureSequence` ({pane: [text, ...]}) makes each capture
@@ -72,6 +72,9 @@ def main() -> int:
         for raw in scenario.get("rawLines", []):
             sys.stdout.write(raw + "\n")
         return 0
+    styled = argv[:3] == ["capture-pane", "-p", "-e"]
+    if styled:
+        argv = ["capture-pane", "-p", *argv[3:]]
     if argv[:3] == ["capture-pane", "-p", "-J"] and len(argv) == 7 and argv[3] == "-t" and argv[5] == "-S":
         pane_id = argv[4]
         if pane_id not in {p.get("pane_id") for p in panes}:
@@ -83,6 +86,9 @@ def main() -> int:
             scenario.setdefault("text", {})[pane_id] = sequence.pop(0)
             _save(scenario_path, scenario)
         text = scenario.get("text", {}).get(pane_id, "")
+        if not styled:
+            # Like tmux without -e: the pane's styling (SGR sequences in the scenario text) is lost.
+            text = re.sub(r"\x1b\[[0-9;:]*m", "", text)
         sys.stdout.write("\n".join(text.split("\n")[-lines:]) + "\n")
         return 0
     if argv[:1] and argv[0] in scenario.get("failOn", []):

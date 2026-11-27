@@ -360,6 +360,116 @@ def shows_vim_normal(screen: str) -> bool:
     return any(_VIM_NORMAL_RE.search(line) for line in _screen_tail(screen))
 
 
+SUGGESTION_MAX = 300
+"""At most this many characters of a prompt suggestion are reported (`capture`'s `suggestion`)."""
+_ESCAPE_RE = re.compile(
+    r"\x1b\[([0-?]*)[ -/]*([@-~])"  # CSI, group 1 the parameters, group 2 the final byte
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC (a hyperlink), to BEL or ST
+    r"|\x1b[ -/]*[0-~]"  # any other escape sequence
+    r"|\x1b"  # a lone escape at the end
+)
+
+
+def _dim_after(params: str, dim: bool) -> bool:
+    """The dim attribute after an SGR (`ESC [ <params> m`): 2 sets it, 0, an empty parameter and 22
+    clear it; colour arguments (38, 48, 58 with 5;n or 2;r;g;b) are skipped, not read as 2 or 0."""
+    values = params.split(";")
+    index = 0
+    while index < len(values):
+        value = values[index].split(":")[0]
+        if value in ("", "0", "22"):
+            dim = False
+        elif value == "2":
+            dim = True
+        elif value in ("38", "48", "58") and ":" not in values[index] and index + 1 < len(values):
+            index += 2 if values[index + 1] == "5" else 4 if values[index + 1] == "2" else 0
+        index += 1
+    return dim
+
+
+def _styled_lines(raw: str) -> list[list[tuple[str, bool]]]:
+    """A `capture-pane -e` capture as lines of (character, dim) cells, every escape sequence removed.
+    tmux carries attributes across lines, so the state carries too."""
+    lines: list[list[tuple[str, bool]]] = [[]]
+    dim = False
+    position = 0
+    for found in _ESCAPE_RE.finditer(raw):
+        for char in raw[position : found.start()]:
+            if char == "\n":
+                lines.append([])
+            else:
+                lines[-1].append((char, dim))
+        if found.group(2) == "m":
+            dim = _dim_after(found.group(1) or "", dim)
+        position = found.end()
+    for char in raw[position:]:
+        if char == "\n":
+            lines.append([])
+        else:
+            lines[-1].append((char, dim))
+    return lines
+
+
+def _dim_input(cells: list[tuple[str, bool]]) -> tuple[int, int, str] | None:
+    """(start, end, text) of the content of an input line (the cells after its prompt, up to a closing
+    box edge) when all of it is dim and it is not the empty box's hint, else None."""
+    start = 0
+    while start < len(cells) and (cells[start][0].isspace() or cells[start][0] in _BOX_EDGES):
+        start += 1
+    if start >= len(cells) or cells[start][0] not in _INPUT_PROMPTS:
+        return None
+    start += 1
+    end = len(cells)
+    while end > start and (cells[end - 1][0].isspace() or cells[end - 1][0] in _BOX_EDGES):
+        end -= 1
+    content = cells[start:end]
+    text = "".join(char for char, _ in content).strip()
+    if not text or _PLACEHOLDER_RE.match(text):
+        return None
+    if any(not dim for char, dim in content if not char.isspace()):
+        return None
+    return start, end, text
+
+
+def split_suggestion(raw: str) -> tuple[str, str | None]:
+    """(the plain screen, Claude Code's prompt suggestion or None) from a `capture-pane -e` capture.
+
+    Claude Code (2.1.332) shows a suggested next prompt in its empty input box as dim text (SGR 2),
+    accepted with Tab or Right; nobody typed it. The input line is the one `shows_draft` reads (the
+    last line in the screen tail that starts with an input prompt). When every character after its
+    prompt (up to a closing box edge) is dim and is not the empty box's hint (`Try "..."`, also dim,
+    which stays), that text is the suggestion: it is cut from the plain screen, so `shows_draft`,
+    `draft_hash` and the menu checks see an empty input, and returned on its own, cleaned and
+    clipped to SUGGESTION_MAX characters. Older input boxes in the scrollback (a dim input line right
+    under a border line) lose their suggestion too, without reporting it. A line with any non-dim
+    character is typed text and is left whole. The plain screen is otherwise the capture without its
+    escape sequences, as a capture without -e gives it."""
+    lines = _styled_lines(raw)
+    plain = ["".join(char for char, _ in cells) for cells in lines]
+
+    def cut(index: int) -> str | None:
+        found = _dim_input(lines[index])
+        if found is None:
+            return None
+        start, end, text = found
+        kept = plain[index][:start] + " " * (end - start) + plain[index][end:]
+        plain[index] = kept.rstrip() if end == len(lines[index]) else kept
+        return text
+
+    stripped = [line.strip().strip(_BOX_EDGES).strip() for line in plain]
+    tail = [index for index, line in enumerate(stripped) if line][-CHECK_TAIL:]
+    current = next((index for index in reversed(tail) if stripped[index].startswith(_INPUT_PROMPTS)), None)
+    above: str | None = None
+    for index, line in enumerate(stripped):
+        if index != current and line.startswith(_INPUT_PROMPTS) and above is not None and _BORDER_RE.fullmatch(above):
+            cut(index)
+        if line:
+            above = line
+    text = cut(current) if current is not None else None
+    suggestion = " ".join(clean_text(text, SUGGESTION_MAX * 2).split())[:SUGGESTION_MAX] if text else None
+    return "\n".join(plain), suggestion or None
+
+
 _MENU_OPTION_RE = re.compile(r"(?:([❯>›▶])\s*)?([1-9][0-9]?)[.)]\s+(\S.*)")
 _MARKED_LINE_RE = re.compile(r"[❯>›▶]\s*(\S.*)")
 MENU_FOOTER_RE = re.compile(
@@ -620,6 +730,18 @@ def dialog_bound(screen: str, claude_pane: bool = True) -> bool:
     assert isinstance(first, int)
     assert isinstance(last, int)
     return tail[anchor] in lines[first : last + 1]
+
+
+SUGGESTION_KEYS = ("Right", "Tab")
+"""Keys that accept Claude Code's prompt suggestion into the input (2.1.332; Enter alone does not
+submit it). Tab is refused at an input anyway (`mode_keys`)."""
+
+
+def accepts_suggestion(keys: list[str]) -> bool:
+    """`keys` would accept a prompt suggestion that `split_suggestion` found: at an input without a
+    menu they are refused (`suggestion_present`), since the next Enter would submit a prompt nobody
+    typed or heard."""
+    return any(key in SUGGESTION_KEYS for key in keys)
 
 
 def keys_problem(keys: list[str], menu_bound: bool, answer: bool = False) -> str | None:
@@ -1012,6 +1134,17 @@ def _no_server(stderr: str) -> bool:
     return "no server running" in text or "error connecting to" in text or "no sessions" in text
 
 
+def capture_screen(policy: Policy, env: dict[str, str], pane_id: str, lines: int) -> tuple[int, str, str | None, str]:
+    """(exit code, plain screen, prompt suggestion, stderr) of the last `lines` lines of a pane,
+    captured with its styling (`capture-pane -p -e -J`) and split by `split_suggestion`. Every
+    check and every `capture` answer works on this plain screen."""
+    code, out, err = run_tmux(["capture-pane", "-p", "-e", "-J", "-t", pane_id, "-S", f"-{lines}"], policy, env)
+    if code != 0:
+        return code, "", None, err
+    screen, suggestion = split_suggestion(out)
+    return code, screen, suggestion, err
+
+
 def list_panes(policy: Policy, env: dict[str, str]) -> list[dict[str, str]]:
     """Every pane of the tmux server as a dict of LIST_FIELDS; empty without a tmux server."""
     code, out, err = run_tmux(["list-panes", "-a", "-F", LIST_FORMAT], policy, env)
@@ -1216,12 +1349,13 @@ def verb_capture(policy: Policy, env: dict[str, str], pane_id: str, lines: int) 
     # A pane outside the allowed sessions answers like a missing one, so names do not leak.
     if pane is None or not policy.allows(pane["session_name"]):
         raise RefusedError("gone")
-    code, out, err = run_tmux(["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{lines}"], policy, env)
+    code, out, suggestion, err = capture_screen(policy, env, pane_id, lines)
     if code != 0:
         raise RefusedError("gone" if "can't find" in err.lower() else "tmux_failed")
     data = out.encode("utf-8")
     if len(data) > MAX_CAPTURE_BYTES:
         out = data[-MAX_CAPTURE_BYTES:].decode("utf-8", "ignore")
+    extra: dict[str, object] = {"suggestion": suggestion} if suggestion is not None else {}
     return {
         "text": out,
         "paneId": pane_id,
@@ -1230,6 +1364,7 @@ def verb_capture(policy: Policy, env: dict[str, str], pane_id: str, lines: int) 
         "paneWidth": _int(pane["pane_width"]),
         "paneHeight": _int(pane["pane_height"]),
         "alternateOn": _flag(pane["alternate_on"]),
+        **extra,
     }
 
 
@@ -1254,17 +1389,18 @@ def read_send_text(stdin: object) -> str:
 
 def _send_state(
     policy: Policy, env: dict[str, str], pane_id: str
-) -> tuple[dict[str, str] | None, dict[str, object] | None, str]:
-    """(the pane if it exists in an allowed session, its registry entry, its screen) right now."""
+) -> tuple[dict[str, str] | None, dict[str, object] | None, str, str | None]:
+    """(the pane if it exists in an allowed session, its registry entry, its plain screen, its
+    prompt suggestion) right now."""
     panes = [p for p in list_panes(policy, env) if policy.allows(p["session_name"])]
     pane = next((p for p in panes if p["pane_id"] == pane_id), None)
     if pane is None:
-        return None, None, ""
+        return None, None, "", None
     entry = join_registry(panes, read_registry(claude_home(policy, env)), env).get(pane_id)
-    code, out, _ = run_tmux(["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{SEND_CHECK_LINES}"], policy, env)
+    code, out, suggestion, _ = capture_screen(policy, env, pane_id, SEND_CHECK_LINES)
     if code != 0:
         raise RefusedError("tmux_failed")
-    return pane, entry, out
+    return pane, entry, out, suggestion
 
 
 def _asks_permission(entry: dict[str, object] | None, screen: str) -> bool:
@@ -1293,7 +1429,7 @@ def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: objec
         raise RefusedError("not_allowed")
     pane_id, pane_pid, session_id, mode = args[:4]
     text = read_send_text(stdin)
-    pane, entry, screen = _send_state(policy, env, pane_id)
+    pane, entry, screen, _ = _send_state(policy, env, pane_id)
     if pane is None:
         raise RefusedError("gone")
     if pane["pane_pid"] != pane_pid:
@@ -1332,7 +1468,7 @@ def verb_send(policy: Policy, env: dict[str, str], args: list[str], stdin: objec
         return {"sent": True, "bytes": len(data), "enter": False}
     # Race guard: a dialog that opened since the first check would take the Enter as "Yes", and a
     # Claude Code restarted in the same shell is not the session the owner confirmed.
-    pane, entry, screen = _send_state(policy, env, pane_id)
+    pane, entry, screen, _ = _send_state(policy, env, pane_id)
     if (
         pane is None
         or pane["pane_pid"] != pane_pid
@@ -1374,7 +1510,7 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
     problem = keys_problem(keys, menu_bound=bound != NO_MENU, answer=mode == SEND_ANSWER)
     if problem is not None:
         raise RefusedError(problem)
-    pane, entry, screen = _send_state(policy, env, pane_id)
+    pane, entry, screen, suggestion = _send_state(policy, env, pane_id)
     if pane is None:
         raise RefusedError("gone")
     if pane["pane_pid"] != pane_pid or not _same_session(entry, session_id):
@@ -1399,6 +1535,8 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
                 raise RefusedError("draft_present")
             if shows_vim_normal(screen):
                 raise RefusedError("vim_normal")
+            if suggestion is not None and accepts_suggestion(keys):
+                raise RefusedError("suggestion_present")
     elif asks:
         raise RefusedError("permission_prompt")
     else:
@@ -1416,6 +1554,8 @@ def verb_keys(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str,
                 raise RefusedError("draft_present")
             if shows_vim_normal(screen):
                 raise RefusedError("vim_normal")
+            if suggestion is not None and accepts_suggestion(keys):
+                raise RefusedError("suggestion_present")
     code, _, _ = run_tmux(["send-keys", "-t", pane_id, *keys], policy, env)
     if code != 0:
         raise RefusedError("tmux_failed")
@@ -1583,7 +1723,7 @@ def _clear_check(policy: Policy, env: dict[str, str], args: list[str]) -> str:
     no vim normal mode, no exit hint (`exit_armed`), a draft (`nothing_to_clear`) and the one the
     owner heard (`draft_changed`)."""
     pane_id, pane_pid, session_id, draft = args
-    pane, entry, screen = _send_state(policy, env, pane_id)
+    pane, entry, screen, _ = _send_state(policy, env, pane_id)
     if pane is None:
         raise RefusedError("gone")
     if pane["pane_pid"] != pane_pid or not _same_session(entry, session_id):
@@ -1635,7 +1775,8 @@ def verb_clear(policy: Policy, env: dict[str, str], args: list[str]) -> dict[str
         # Serve mode runs mutating verbs one at a time (`send_lock`), so nothing else is typed into
         # any pane before Claude Code's exit window has closed.
         _pause(CLEAR_SETTLE_SECONDS)
-    code, screen, _ = run_tmux(["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{SEND_CHECK_LINES}"], policy, env)
+    # The prompt suggestion that Claude Code shows again in the emptied box is cut off here.
+    code, screen, _, _ = capture_screen(policy, env, pane_id, SEND_CHECK_LINES)
     if code != 0:
         return {"pressed": True, "cleared": False, "remainingLines": None, "remainingChars": None}
     left = input_draft(screen)
