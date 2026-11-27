@@ -311,7 +311,10 @@ async def test_only_confirmed_typed_text_sends_make_owner_words(ctx: Ctx) -> Non
     draft = "⏺ Done.\n╭──────────────╮\n│ > my draft   │\n╰──────────────╯\n"
     ctx.world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": draft})
     ctx.later()
-    assert (await ctx.confirm("6394"))[0] == "Not sent: something is already typed in that session's input."
+    assert (
+        (await ctx.confirm("6394"))[0]
+        == "Not sent: something is already typed in the input of fpga on dev. If it can go, say clear the input of fpga on dev first."
+    )
     ctx.world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
     await ctx.prepare("lost GreenArrays fringes")
     ctx.world.configure(verbModes={"send": "hang_after"})
@@ -594,7 +597,10 @@ async def test_dispatcher_refusals_at_send_time(ctx: Ctx) -> None:
     draft = "⏺ Done.\n╭──────────────╮\n│ > my draft   │\n╰──────────────╯\n"
     ctx.world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": draft})
     ctx.later()
-    assert await ctx.confirm("4172") == ("Not sent: something is already typed in that session's input.", True)
+    assert await ctx.confirm("4172") == (
+        "Not sent: something is already typed in the input of fpga on dev. If it can go, say clear the input of fpga on dev first.",
+        True,
+    )
     ctx.world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": EMPTY_BOX})
     await ctx.prepare("run the tests")
     ctx.world.set_panes([pane("fpga", "%1", CLAUDE_PID, command="claude")], {"%1": DIALOG})

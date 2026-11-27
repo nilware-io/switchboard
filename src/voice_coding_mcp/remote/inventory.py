@@ -127,6 +127,9 @@ class Inventory:
             if allowed(self._transports[name].machine, result.data.session):
                 if self._observe is not None:
                     self._observe(result.data.text)
+                    if result.data.suggestion:
+                        # Screen text too, even though no check reads it as typed.
+                        self._observe(result.data.suggestion)
                 return result.data
             # The pane moved (join-pane, rename) to a session only the dispatcher allows: for the
             # hub it is gone, and its text is dropped unread.

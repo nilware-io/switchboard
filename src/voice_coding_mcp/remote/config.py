@@ -300,7 +300,7 @@ def _poll(value: int) -> int:
 
 class EventsConfig(_Section):
     """Session events from the machines' `switchboard-hook` spools (docs/SWITCHBOARD.md, "Session
-    hooks"): polled with the dispatcher's `events` verb (0.11.0, `--allow-events`)."""
+    hooks"): polled with the dispatcher's `events` verb (0.12.0, `--allow-events`)."""
 
     enabled: bool = False
     poll_seconds: Annotated[Int, Field(ge=2, le=300)] = 5

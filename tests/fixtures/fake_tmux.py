@@ -6,11 +6,12 @@ Reads the scenario JSON named by FAKE_TMUX_SCENARIO:
   {"noServer": false, "panes": [{"session_name": "fpga", "pane_id": "%1", ...}], "text": {"%1": "..."}}
 
 Pane dicts use tmux format names (`session_name`, `window_index`, `pane_pid`, ...); missing ones
-render empty. Answers `list-panes -a -F <format>` and `capture-pane -p -J -t <pane> -S -<n>` (the
-last n lines of the pane's text), and for sends `load-buffer -b <name> -` (the buffer from stdin),
+render empty. Answers `list-panes -a -F <format>` and `capture-pane -p [-e] -J -t <pane> -S -<n>` (the
+last n lines of the pane's text, which may hold SGR sequences; without -e they are removed), and for sends `load-buffer -b <name> -` (the buffer from stdin),
 `paste-buffer -p -d -b <name> -t <pane>`, `send-keys -t <pane> Enter` and `delete-buffer -b <name>`;
 `send-keys -t <pane> <key>...` records the keys in the scenario's `keys` list and applies
-its `afterKeys` once (like `afterPaste`); `resize-window -t <pane> -x <n> -y <n>` records `resized`.
+its `afterKeys` once (like `afterPaste`, and its `panes` replace the pane list); `captureSequence` ({pane: [text, ...]}) makes each capture
+of that pane first take the next text from its list (a screen that changes between two checks); `resize-window -t <pane> -x <n> -y <n>` records `resized`.
 Buffers live in `<scenario>.buffers.json`. After a paste, the scenario's `afterPaste` (once) replaces
 pane texts (`text`) and writes files (`write`: {path: JSON value}), so a test can open a permission
 dialog or change the registry between the paste and the Enter. `failOn` lists subcommands that fail.
@@ -71,13 +72,23 @@ def main() -> int:
         for raw in scenario.get("rawLines", []):
             sys.stdout.write(raw + "\n")
         return 0
+    styled = argv[:3] == ["capture-pane", "-p", "-e"]
+    if styled:
+        argv = ["capture-pane", "-p", *argv[3:]]
     if argv[:3] == ["capture-pane", "-p", "-J"] and len(argv) == 7 and argv[3] == "-t" and argv[5] == "-S":
         pane_id = argv[4]
         if pane_id not in {p.get("pane_id") for p in panes}:
             sys.stderr.write(f"can't find pane: {pane_id}\n")
             return 1
         lines = int(argv[6].lstrip("-"))
+        sequence = scenario.get("captureSequence", {}).get(pane_id)
+        if sequence:
+            scenario.setdefault("text", {})[pane_id] = sequence.pop(0)
+            _save(scenario_path, scenario)
         text = scenario.get("text", {}).get(pane_id, "")
+        if not styled:
+            # Like tmux without -e: the pane's styling (SGR sequences in the scenario text) is lost.
+            text = re.sub(r"\x1b\[[0-9;:]*m", "", text)
         sys.stdout.write("\n".join(text.split("\n")[-lines:]) + "\n")
         return 0
     if argv[:1] and argv[0] in scenario.get("failOn", []):
@@ -114,6 +125,8 @@ def main() -> int:
         after = scenario.pop("afterKeys", None)
         if isinstance(after, dict):
             scenario.setdefault("text", {}).update(after.get("text", {}))
+            if "panes" in after:
+                scenario["panes"] = after["panes"]
         _save(scenario_path, scenario)
         return 0
     if argv[:2] == ["resize-window", "-t"] and len(argv) == 7 and argv[3] == "-x" and argv[5] == "-y":

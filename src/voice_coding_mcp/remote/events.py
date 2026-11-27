@@ -2,7 +2,7 @@
 
 `switchboard-hook` on a machine spools one file per event (a session waits for approval or an
 answer, finished its turn, stopped on an API error, opened a pull request, or wrote a note with
-notify_owner). The hub takes them with the dispatcher's `events` verb (0.11.0, `--allow-events`):
+notify_owner). The hub takes them with the dispatcher's `events` verb (0.12.0, `--allow-events`):
 for an agent machine that is one frame over the machine's own outbound link, so the machine still
 opens no port and makes no other connection. The ids of the events taken are named in the next
 call, which deletes them there; until then they stay in the spool, so an event is delivered at

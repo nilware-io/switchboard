@@ -66,6 +66,7 @@ def test_version_reports_verbs_and_policy(world: RemoteWorld) -> None:
             "attachments",
             "attachment",
             "health",
+            "clear",
             "events",
         ],
         "allowSend": False,
@@ -327,7 +328,7 @@ def test_capture_an_allowed_pane(world: RemoteWorld) -> None:
         "paneHeight": 24,
         "alternateOn": False,
     }
-    assert world.tmux_calls()[-1]["argv"] == ["capture-pane", "-p", "-J", "-t", "%1", "-S", "-2"]
+    assert world.tmux_calls()[-1]["argv"] == ["capture-pane", "-p", "-e", "-J", "-t", "%1", "-S", "-2"]
 
 
 def test_capture_outside_the_allow_list_answers_like_a_missing_pane(world: RemoteWorld) -> None:

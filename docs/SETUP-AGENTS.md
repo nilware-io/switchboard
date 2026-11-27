@@ -79,7 +79,7 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 1. Your own copy of the repository at a commit you checked, exactly as in [SETUP-WSL.md](SETUP-WSL.md#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root) (`git clone`, `git checkout --detach <commit>`, `git rev-parse HEAD`, `git status --porcelain`). Two files from it run as you: the dispatcher and the connector. Never copy them from the hub.
 
-2. Read both, then install them. The dispatcher is one Python file of about 4100 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 450 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
+2. Read both, then install them. The dispatcher is one Python file of about 4700 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 450 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
 
    ```sh
    cd ~/src/switchboard
@@ -157,13 +157,17 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 8. Off: `systemctl --user stop switchboard-connect` (and `disable` to keep it off after a reboot). The hub then says "laptop is not connected right now." You decide when the machine can be reached.
 
-## Updating the dispatcher (0.9.0: machine health)
+## Updating the dispatcher (0.9.0: machine health; 0.10.0: timesheet data; 0.11.0: clearing the input; 0.12.0: session hooks)
 
 Dispatcher 0.9.0 adds the read-only `health` verb (free disk space, read-only file systems, memory; on WSL also the Windows disk C:), which the hub polls for the [incident log](SWITCHBOARD.md#incident-log). It needs no new flag. On each machine, from your own copy at the new verified commit: read `git diff <old>..<new> -- deploy/remote`, then install `switchboard-remote` and `switchboard-connect` again as in part 2.2 (`sha256sum` both copies), and `systemctl --user restart switchboard-connect`. `remote-check` shows `switchboard-remote 0.9.0` with `health` among its verbs. Until a machine is updated the hub polls it with `version` instead and reports no health incidents for it. For SSH machines the same install (SETUP-WSL.md steps 5.2 and 6.1) is enough; the forced command does not change.
 
-## Updating to 0.11.0: session hooks
+Dispatcher 0.10.0 adds agent transcripts, entrypoints, work projects and prompt origins to `usage` for the [timesheet](SWITCHBOARD.md#timesheet). It needs no new flag; update it the same way. Until a machine is updated, its headless runs count as owner time, task notifications as owner prompts and its subagents are missing, and the draft timesheet notes it.
 
-Dispatcher 0.11.0 adds the `events` verb (only with the new flag `--allow-events`), which hands the hub what this machine's Claude Code hooks noted. Update `switchboard-remote` and `switchboard-connect` as above, install `switchboard-hook` (next part), add `--allow-events` to the dispatcher's flags after `--` in the unit (`nano ~/.config/systemd/user/switchboard-connect.service`, then `systemctl --user daemon-reload` and `systemctl --user restart switchboard-connect`), and set `"events": {"enabled": true}` in the hub config. `remote-check` then lists `events` among the verbs. Without the flag the dispatcher answers `not_allowed` and the hub asks again every 10 minutes; nothing else changes.
+Dispatcher 0.11.0 adds the `clear` verb (`remote_clear_input`, under the same `--allow-send`) and reports Claude Code's grey prompt suggestion apart from typed text. Update it the same way; `remote-check` then lists `clear` among its verbs. Until a machine is updated, `remote_clear_input` says its dispatcher is too old and a suggestion still counts as typed text there.
+
+## Updating to 0.12.0: session hooks
+
+Dispatcher 0.12.0 adds the `events` verb (only with the new flag `--allow-events`), which hands the hub what this machine's Claude Code hooks noted. Update `switchboard-remote` and `switchboard-connect` as above, install `switchboard-hook` (next part), add `--allow-events` to the dispatcher's flags after `--` in the unit (`nano ~/.config/systemd/user/switchboard-connect.service`, then `systemctl --user daemon-reload` and `systemctl --user restart switchboard-connect`), and set `"events": {"enabled": true}` in the hub config. `remote-check` then lists `events` among the verbs. Without the flag the dispatcher answers `not_allowed` and the hub asks again every 10 minutes; nothing else changes.
 
 ## Session hooks and notify_owner
 

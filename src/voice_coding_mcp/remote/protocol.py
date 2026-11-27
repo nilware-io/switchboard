@@ -32,6 +32,7 @@ VERBS: tuple[str, ...] = (
     "attachments",
     "attachment",
     "health",
+    "clear",
     "events",
 )
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
@@ -57,6 +58,7 @@ MAX_PANES = 512
 NAME_MAX = 64
 WAITING_MAX = 200
 CAPTURE_MAX_CHARS = 64 * 1024
+SUGGESTION_MAX_CHARS = 300
 
 
 class BadRequestError(ValueError):
@@ -142,6 +144,10 @@ class CaptureResponse(_Response):
     alternate_on: bool = Field(default=False, alias="alternateOn")
     """The pane shows its alternate screen (a full-screen program), which has no scrollback: only
     the visible rows can be captured (dispatcher 0.5.0 and newer)."""
+    suggestion: Annotated[str, _capped(SUGGESTION_MAX_CHARS)] | None = None
+    """Claude Code's prompt suggestion (dim text in its empty input box, nobody typed it), cut from
+    `text` (dispatcher 0.11.0 and newer; an older dispatcher leaves it in `text`, where it looks like
+    a draft)."""
 
 
 class VersionResponse(_Response):
@@ -198,6 +204,16 @@ class HealthResponse(_Response):
     uptime_seconds: float | None = Field(default=None, alias="uptimeSeconds", ge=0, le=1e12)
 
 
+class ClearResponse(_Response):
+    """Dispatcher 0.11.0: one Ctrl+C was pressed; `cleared` when the input box is visibly empty
+    afterwards, else what is still in it (None when the second capture failed)."""
+
+    pressed: bool
+    cleared: bool
+    remaining_lines: int | None = Field(default=None, alias="remainingLines", ge=0)
+    remaining_chars: int | None = Field(default=None, alias="remainingChars", ge=0)
+
+
 EVENT_KINDS = ("approval_needed", "question", "finished", "failed", "pr_opened", "owner_note")
 EVENT_LEVELS = ("info", "warning", "urgent")
 EVENT_ID_PATTERN = r"^[0-9]{13}-[0-9]{10}-[0-9a-f]{8}$"
@@ -205,7 +221,7 @@ MAX_EVENTS = 16
 
 
 class SessionEvent(_Response):
-    """One event of a machine's `switchboard-hook` spool (`events`, dispatcher 0.11.0). Everything in
+    """One event of a machine's `switchboard-hook` spool (`events`, dispatcher 0.12.0). Everything in
     it was written by the machine's sessions: untrusted, checked again by `remote/events.py`. A
     `machine` field, should one appear, is ignored: the machine is the link the answer came on."""
 
@@ -447,6 +463,7 @@ RESPONSE_MODELS: dict[str, type[_Response]] = {
     "resize": ResizeResponse,
     "attachments": AttachmentsResponse,
     "health": HealthResponse,
+    "clear": ClearResponse,
     "events": EventsResponse,
 }
 

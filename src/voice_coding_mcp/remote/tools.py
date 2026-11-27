@@ -1,5 +1,5 @@
 """The remote tools behind `list_remote_sessions`, `remote_status`, `pending_input`, `remote_send`,
-`remote_send_keys`, `remote_resize` and `remote_send_confirm` (docs/SWITCHBOARD.md, "Tools").
+`remote_send_keys`, `remote_resize`, `remote_clear_input` and `remote_send_confirm` (docs/SWITCHBOARD.md, "Tools").
 
 Each call has a total deadline of `tasks.syncWaitSeconds - 3` seconds for its synchronous part; a
 summary that is not ready by then continues as a `remote` task whose number is returned.
@@ -7,8 +7,9 @@ summary that is not ready by then continues as a `remote` task whose number is r
 `remote_send` only prepares: it checks everything, classifies the risk and keeps a confirmation in
 memory; `remote_send_confirm` rechecks the pane and sends through the dispatcher's `send` verb, which
 checks everything again on the machine. The text goes to the dispatcher on stdin, never in a command.
-`remote_send_keys` and `remote_resize` prepare the same way, and `remote_send_confirm` presses the keys
-(dispatcher `keys`, key names from a fixed list) or resizes the window (dispatcher `resize`).
+`remote_send_keys`, `remote_resize` and `remote_clear_input` prepare the same way, and
+`remote_send_confirm` presses the keys (dispatcher `keys`, key names from a fixed list), resizes the
+window (dispatcher `resize`) or clears the input draft (dispatcher `clear`, one Ctrl+C).
 """
 
 from __future__ import annotations
@@ -61,12 +62,19 @@ from .dispatcher import (
     SEND_CHECK_LINES,
     SEND_MESSAGE,
     RefusedError,
+    accepts_suggestion,
     bound_menu_hash,
+    clear_target,
     dialog_bound,
+    draft_hash,
+    input_draft,
     keys_problem,
     media_check,
     shows_draft,
+    shows_exit_armed,
     shows_picker,
+    shows_vim_normal,
+    shows_working,
 )
 from .events import EventPoller, EventPollerOptions
 from .health import HealthPoller, HealthPollerOptions
@@ -101,6 +109,7 @@ from .protocol import (
     AttachmentResponse,
     AttachmentsResponse,
     CaptureResponse,
+    ClearResponse,
     KeysResponse,
     PaneInfo,
     ResizeResponse,
@@ -109,6 +118,7 @@ from .protocol import (
 )
 from .redact import clean_name, clean_screen
 from .send import (
+    CLEAR,
     KEYS,
     PERMISSION_ANSWER_RE,
     RESIZE,
@@ -127,6 +137,7 @@ from .send import (
 )
 from .speech import (
     cut_note,
+    format_clear_readback,
     format_confirm_outcome,
     format_keys_readback,
     format_list,
@@ -143,7 +154,7 @@ from .speech import (
     text_refusal,
     unreachable_sentence,
 )
-from .summarize import Summarizer, SummarizerOptions, last_meaningful_line, screen_hash
+from .summarize import Summarizer, SummarizerOptions, last_meaningful_line, mark_suggestion, screen_hash
 from .targets import Resolved, resolve_target
 from .transport import Transport, make_transport
 
@@ -156,6 +167,9 @@ dispatcher's `send` reads, so both run `shows_dialog` and `dialog_hash` on the s
 (`pending.screen_ask` looks at the last 15 of them, as `pending_input`)."""
 MIN_SEND_SECONDS = 2.0
 """A send is not started with less time left: it would likely end as an unknown outcome."""
+MIN_CLEAR_SECONDS = 5.0
+"""The same for `clear`, which waits about 2.5 seconds on the machine (dispatcher
+`CLEAR_STABLE_SECONDS` and `CLEAR_SETTLE_SECONDS`)."""
 EXPIRED = "That confirmation has expired. Ask me to prepare the message again."
 EARLY = "I have not heard your answer yet. Read the message to the owner first. Nothing was sent."
 NEEDS_RISKY_OK = "This one needs an explicit yes to the risky part. Nothing was sent."
@@ -331,6 +345,9 @@ class RemoteTools:
         self.transports: dict[str, Transport] = dict(transports)
         """One per machine; `usage_report` calls the same ones."""
         self._now = options.now or now_ms
+        self._send_locks: dict[str, asyncio.Lock] = {}
+        """One per machine: confirmed sends, key presses, resizes and clears of one machine run one at a
+        time on the hub too (the dispatcher's `mutation_lock` serialises them on the machine)."""
         self.echo = ScreenEcho(self._now, known_terms(config.remote), known_names(config.remote))
         self.inventory = Inventory(config.remote, transports, self._logger, now=options.now, observe=self.echo.observe)
         send = config.remote.send
@@ -684,7 +701,7 @@ class RemoteTools:
             cut = unread and shows_picker(screen)
             if cut or (rows < RESIZE_ROWS[0] and (unread or len(screen.lstrip("\n").split("\n")) >= rows)):
                 note = cut_note(rows, found.item.allow_send and rows < RESIZE_ROWS[1], menu_cut=cut)
-        answer = await self._describe(name, pane, label, screen, deadline)
+        answer = await self._describe(name, pane, label, screen, deadline, suggestion=captured.suggestion)
         return ToolAnswer(self._with_clause(name, answer.text + note), answer.is_error)
 
     def _log_answer(self, machine: str, pane: PaneInfo, path: str, reason: str | None = None) -> None:
@@ -694,8 +711,21 @@ class RemoteTools:
             fields["reason"] = reason
         self._logger.info("remote_status answer", fields)
 
-    async def _describe(self, machine: str, pane: PaneInfo, label: str, screen: str, deadline: _Deadline) -> ToolAnswer:
+    async def _describe(
+        self,
+        machine: str,
+        pane: PaneInfo,
+        label: str,
+        screen: str,
+        deadline: _Deadline,
+        *,
+        suggestion: str | None = None,
+    ) -> ToolAnswer:
+        """The answer of `remote_status`. The heuristic reads the screen as captured (a prompt
+        suggestion cut off); the summariser gets the suggestion marked on the input line
+        (`mark_suggestion`)."""
         menu = screen_menu(screen)
+        shown = mark_suggestion(screen, suggestion)
         # A menu that cannot be read still has its question and options above the key hints.
         line = (footer_block(screen) if menu is None else None) or last_meaningful_line(screen)
 
@@ -708,7 +738,7 @@ class RemoteTools:
         if not self._summarizer.enabled:
             return ToolAnswer(heuristic("disabled"))
         key = f"{machine}:{pane.pane_id}"
-        cached = self._summarizer.cached(key, screen_hash(screen))
+        cached = self._summarizer.cached(key, screen_hash(shown))
         if cached is not None:
             self.echo.observe(cached)
             self._log_answer(machine, pane, "cached")
@@ -718,7 +748,7 @@ class RemoteTools:
         if lease is None:
             # No queueing for a status read: the heuristic answers at once.
             return ToolAnswer(heuristic("locked" if self._manager.is_locked(lock_key) else "no_slot"))
-        run = asyncio.ensure_future(self._summarizer.summarize(key, screen, lease))
+        run = asyncio.ensure_future(self._summarizer.summarize(key, shown, lease))
         self._background.add(run)
         run.add_done_callback(self._background.discard)
         budget = min(float(self._remote.summary.timeout_seconds), deadline.left() - SUMMARY_MARGIN_SECONDS)
@@ -1017,7 +1047,7 @@ class RemoteTools:
                 # dispatcher refuses the same (`draft_present`).
                 return refuse(
                     f"Something is already typed in the input of {place}, so I will not press keys there. "
-                    "Send or clear it at the keyboard first.",
+                    f"If it can go, say clear the input of {place} first.",
                     "draft_present",
                 )
             question = (menu.question if menu is not None else None) or (
@@ -1043,6 +1073,20 @@ class RemoteTools:
                     "menu_unreadable",
                 )
             problem = keys_problem(parsed, menu_bound=False)
+            if (
+                problem is None
+                and captured.suggestion is not None
+                and claude is not None
+                and accepts_suggestion(parsed)
+            ):
+                # Right (and Tab) take Claude Code's grey suggestion into the input, where a later
+                # Enter submits a prompt nobody typed. The dispatcher refuses the same
+                # (`suggestion_present`).
+                return refuse(
+                    f"The input of {place} shows a prompt that Claude Code suggests, which nobody typed; right "
+                    "arrow would accept it, so I will not press it. Tell me the message instead.",
+                    "suggestion_present",
+                )
             if problem == "mode_keys":
                 # Tab and Shift+Tab at a Claude Code input switch modes (Shift+Tab cycles the
                 # permission mode up to accept edits or bypass), a broader grant than answering one
@@ -1204,6 +1248,127 @@ class RemoteTools:
         current = (pane.width, pane.height) if pane.width is not None and pane.height is not None else None
         return ToolAnswer(format_resize_readback(item, current=current, dropped=dropped))
 
+    async def remote_clear_input(self, machine: str | None, target: str | None, caller: Caller) -> ToolAnswer:
+        """Prepares clearing what is typed in a Claude Code pane's input box: checks the screen,
+        reads back the first words of the draft, stores a confirmation bound to its hash. Sends
+        nothing."""
+        deadline = self._deadline()
+        found = resolve_machine(self.inventory.machines, machine)
+        if not isinstance(found, MatchOk):
+            return ToolAnswer(
+                format_machine_problem(
+                    machine, [m.name for m in self.inventory.machines], ambiguous=found.reason == "ambiguous"
+                ),
+                True,
+            )
+        config = found.item
+        name = config.name
+
+        def refuse(message: str, reason: str) -> ToolAnswer:
+            self._logger.info(
+                "tool call",
+                self._log_fields({"tool": "remote_clear_input", "machine": name, "refused": reason}, target=target),
+            )
+            return ToolAnswer(message, True)
+
+        if not config.allow_send:
+            return refuse(f"Sending is not enabled for {name}, and clearing an input goes with it.", "not_enabled")
+        view, lacks_clear = await asyncio.gather(
+            self.inventory.view(name, max_age_ms=15_000, budget_seconds=deadline.left()),
+            self._lacks_verb(name, "clear", deadline),
+        )
+        if not view.ok:
+            return refuse(unreachable_sentence(name, view.error, view.detail), "unreachable")
+        resolved = resolve_target(view, target)
+        if not isinstance(resolved, Resolved):
+            return refuse(format_target_problem(name, resolved), "target")
+        pane = resolved.pane
+        place = send_place(name, pane, resolved.name_window)
+        claude = pane.claude
+        if claude is None:
+            # Also with sendToAnyPane: Ctrl+C in a shell interrupts its program.
+            return refuse(
+                f"{place} is not running Claude Code. I only clear the input of a Claude Code session.", "not_claude"
+            )
+        if lacks_clear:
+            return refuse(
+                f"switchboard-remote on {name} is too old to clear an input. Update it there.", "old_dispatcher"
+            )
+        captured = await self.inventory.capture(name, pane.pane_id, SEND_CAPTURE_LINES, budget_seconds=deadline.left())
+        if not isinstance(captured, CaptureResponse):
+            if captured.detail == "gone":
+                return refuse(f"{place}: that pane is gone. Ask me to list the sessions again.", "gone")
+            return refuse(unreachable_sentence(name, captured.error, captured.detail), "unreachable")
+        screen = captured.text
+        ask = screen_ask(clean_screen(screen))
+        # The dispatcher refuses the same screens; Ctrl+C there would cancel or deny something.
+        if (
+            (claude.status == "waiting" and waits_for_permission(claude.waiting_for))
+            or (ask is not None and ask.kind == "permission")
+            or shows_dialog(screen)
+        ):
+            return refuse(
+                f"{place} is waiting for a permission decision, and Ctrl+C would deny it. Answer it first.",
+                "permission_prompt",
+            )
+        if bound_menu_hash(screen, claude_pane=True) is not None or shows_picker(screen):
+            return refuse(f"{place} shows a menu, and Ctrl+C would close it. Ask me what it says.", "menu_present")
+        if claude.status != "idle" or shows_working(screen):
+            return refuse(
+                f"{place} is working or waiting for an answer, and Ctrl+C would interrupt it. Ask me again when it is idle.",
+                "not_idle",
+            )
+        if shows_vim_normal(screen):
+            return refuse(f"The input of {place} is in vim normal mode. Clear it at the keyboard.", "vim_normal")
+        if shows_exit_armed(screen):
+            return refuse(
+                f"{place} asks to press Ctrl-C again to exit, so I will not press it now. Try again in a few seconds.",
+                "exit_armed",
+            )
+        problem = clear_target(screen)
+        if problem == "no_input_box":
+            # Only a recognised Claude Code input box is cleared: a line that merely looks like a
+            # prompt may be a shell command or an old prompt in the transcript.
+            return refuse(
+                f"I cannot see the input box of {place} on its screen, so I will not press Ctrl+C there. Clear it at the keyboard.",
+                "no_input_box",
+            )
+        draft = input_draft(screen)
+        hashed = draft_hash(screen)
+        if problem is not None or draft is None or hashed is None:
+            return refuse(f"Nothing is typed in the input of {place}.", "nothing_to_clear")
+        item, dropped = self.confirmations.add(
+            client=caller.fingerprint,
+            client_name=caller.name,
+            machine=name,
+            session=clean_name(pane.session, 64),
+            place=place,
+            pane_id=pane.pane_id,
+            pane_pid=pane.pane_pid,
+            session_id=claude.session_id,
+            text="",
+            risky=[],
+            permission_answer=False,
+            kind=CLEAR,
+            draft=hashed,
+            project=claude.cwd_name,
+        )
+        self._logger.info(
+            "tool call",
+            self._log_fields(
+                {
+                    "tool": "remote_clear_input",
+                    "machine": name,
+                    "paneId": pane.pane_id,
+                    "confirmation": item.id,
+                    "dropped": [d.id for d in dropped],
+                },
+                target=target,
+            ),
+        )
+        lines, scrolled = draft
+        return ToolAnswer(format_clear_readback(item, lines=lines, scrolled=scrolled, dropped=dropped))
+
     async def remote_send_confirm(self, confirmation_id: str, risky_ok: bool, caller: Caller) -> ToolAnswer:
         """Sends a prepared message after the owner said yes to its read-back."""
         deadline = self._deadline()
@@ -1220,7 +1385,12 @@ class RemoteTools:
             )
             return ToolAnswer(NEEDS_RISKY_OK, True)
         self.confirmations.consume(key)
-        outcome, detail = await self._send(item, deadline)
+        if item.kind == CLEAR:
+            # One clear per draft: a second prepared clear of the same pane would press another Ctrl+C.
+            self.confirmations.drop_pane(item.machine, item.pane_id, CLEAR)
+        lock = self._send_locks.setdefault(item.machine, asyncio.Lock())
+        async with lock:
+            outcome, detail = await self._send(item, deadline)
         if outcome == "sent" and item.kind == TEXT:
             # The owner heard this text read back and said yes: its new words are the owner's.
             self.echo.owner_said(item.text)
@@ -1533,7 +1703,9 @@ class RemoteTools:
         return next((m for m in self.inventory.machines if m.name == name), None)
 
     async def _send(self, item: Confirmation, deadline: _Deadline) -> tuple[str, str | None]:
-        """(audit outcome, detail): `sent`, `not_sent:<code>`, `pasted_no_enter` or `unknown`."""
+        """(audit outcome, detail): `sent`, `not_sent:<code>`, `pasted_no_enter` or `unknown`; for a
+        clear also `not_cleared` (detail: characters still in the input, if any) and `not_verified`
+        (the key was pressed, the screen could not be read afterwards)."""
         machine = self._machine(item.machine)
         if machine is None or not machine.allow_send:
             return "not_sent:not_enabled", None
@@ -1550,7 +1722,7 @@ class RemoteTools:
             return "not_sent:changed", None
         machine_config = self.inventory.transport(item.machine).machine
         left = min(float(command_timeout_seconds(self._remote, machine_config)), deadline.left())
-        if left < MIN_SEND_SECONDS:
+        if left < (MIN_CLEAR_SECONDS if item.kind == CLEAR else MIN_SEND_SECONDS):
             return "not_sent:slow", None
         verb = "send"
         stdin: bytes | None = None
@@ -1564,6 +1736,9 @@ class RemoteTools:
         elif item.kind == RESIZE and item.size is not None:
             verb = "resize"
             args = [item.pane_id, str(item.pane_pid), session, str(item.size[0]), str(item.size[1])]
+        elif item.kind == CLEAR and item.draft is not None:
+            verb = "clear"
+            args = [item.pane_id, str(item.pane_pid), session, item.draft]
         else:
             mode = [SEND_ANSWER, item.dialog or NO_DIALOG] if item.permission_answer else [SEND_MESSAGE]
             args = [item.pane_id, str(item.pane_pid), session, *mode]
@@ -1581,6 +1756,14 @@ class RemoteTools:
             },
         )
         data = result.data
+        if result.ok and isinstance(data, ClearResponse):
+            if data.cleared:
+                return "sent", None
+            if data.pressed and data.remaining_chars is None:
+                return "not_verified", None
+            if data.pressed:
+                return "not_cleared", str(data.remaining_chars) if data.remaining_chars else None
+            return "unknown", None
         if result.ok and (
             (isinstance(data, SendResponse | KeysResponse) and data.sent)
             or (isinstance(data, ResizeResponse) and data.resized)

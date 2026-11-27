@@ -73,7 +73,7 @@ def assert_fixed_shapes(world: RemoteWorld, pane_id: str = "%1") -> None:
         if argv[:1] == ["list-panes"]:
             assert argv == ["list-panes", "-a", "-F", d.LIST_FORMAT]
         elif argv[:1] == ["capture-pane"]:
-            assert argv == ["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{d.SEND_CHECK_LINES}"]
+            assert argv == ["capture-pane", "-p", "-e", "-J", "-t", pane_id, "-S", f"-{d.SEND_CHECK_LINES}"]
         elif argv[:1] == ["load-buffer"]:
             assert argv[:2] == ["load-buffer", "-b"]
             assert BUFFER_RE.fullmatch(argv[2])

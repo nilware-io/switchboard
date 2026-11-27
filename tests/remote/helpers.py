@@ -137,6 +137,9 @@ class RemoteWorld:
             "SWITCHBOARD_REMOTE_TEST_TMUX": FAKE_TMUX,
             "FAKE_TMUX_SCENARIO": self.scenario,
             "FAKE_TMUX_LOG": self.tmux_log,
+            # The dispatcher's mutation lock lives in tmux's socket directory under it (none by
+            # default: no lock); never the real /tmp/tmux-<uid> of the user running the tests.
+            "TMUX_TMPDIR": str(self.root),
         }
 
 

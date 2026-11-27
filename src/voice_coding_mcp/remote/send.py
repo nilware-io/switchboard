@@ -21,6 +21,7 @@ from .dispatcher import KEY_NAMES, MAX_KEYS, PERMISSION_ANSWER_RE, dialog_hash, 
 from .menu import ScreenMenu
 
 __all__ = [
+    "CLEAR",
     "KEYS",
     "PERMISSION_ANSWER_RE",
     "RESIZE",
@@ -101,8 +102,10 @@ _CONTEXT_SAYS = {
 TEXT = "text"
 KEYS = "keys"
 RESIZE = "resize"
+CLEAR = "clear"
 """Confirmation kinds: a message (`remote_send`), keys (`remote_send_keys`), a window size
-(`remote_resize`). All are confirmed with `remote_send_confirm`."""
+(`remote_resize`), clearing an input draft (`remote_clear_input`). All are confirmed with
+`remote_send_confirm`."""
 
 _KEY_ALIASES: dict[str, str] = {
     **{name.lower(): name for name in KEY_NAMES},
@@ -484,7 +487,7 @@ class Confirmation:
     created_ms: int
     expires_ms: int
     kind: str = TEXT
-    """TEXT, KEYS or RESIZE."""
+    """TEXT, KEYS, RESIZE or CLEAR (whose `text` is empty: the draft is never kept)."""
     keys: tuple[str, ...] = ()
     """For KEYS: the dispatcher's key names, in order."""
     menu: str | None = None
@@ -492,6 +495,9 @@ class Confirmation:
     (None: no menu was on the screen). The dispatcher presses the keys only on that screen."""
     size: tuple[int, int] | None = None
     """For RESIZE: (columns, rows)."""
+    draft: str | None = None
+    """For CLEAR: `dispatcher.draft_hash` of the draft the read-back quoted. The dispatcher clears
+    only that draft."""
     project: str | None = None
     """The project folder of the pane's Claude Code session, for the timesheet's voice activity."""
 
@@ -548,6 +554,7 @@ class ConfirmationStore:
         keys: Sequence[str] = (),
         menu: str | None = None,
         size: tuple[int, int] | None = None,
+        draft: str | None = None,
         project: str | None = None,
     ) -> tuple[Confirmation, list[Confirmation]]:
         """The new confirmation and the ones of the same client it dropped (oldest first)."""
@@ -585,6 +592,7 @@ class ConfirmationStore:
             keys=tuple(keys),
             menu=menu,
             size=size,
+            draft=draft,
             project=project,
         )
         self._items[new_id] = item
@@ -609,6 +617,20 @@ class ConfirmationStore:
     def consume(self, confirmation_id: str) -> None:
         """Single use: removed before the send starts, whatever its outcome."""
         self._items.pop(confirmation_id, None)
+
+    def drop_pane(self, machine: str, pane_id: str, kind: str) -> list[Confirmation]:
+        """Removes every pending confirmation of `kind` for that pane (of any client), oldest first."""
+        gone = sorted(
+            (
+                item
+                for item in self._items.values()
+                if (item.machine, item.pane_id, item.kind) == (machine, pane_id, kind)
+            ),
+            key=lambda item: item.created_ms,
+        )
+        for item in gone:
+            del self._items[item.id]
+        return gone
 
     def __len__(self) -> int:
         self._expire()

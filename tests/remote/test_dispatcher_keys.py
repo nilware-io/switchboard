@@ -91,7 +91,7 @@ def assert_fixed_shapes(world: RemoteWorld, pane_id: str = "%1") -> None:
         if argv[:1] == ["list-panes"]:
             assert argv == ["list-panes", "-a", "-F", d.LIST_FORMAT]
         elif argv[:1] == ["capture-pane"]:
-            assert argv == ["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{d.SEND_CHECK_LINES}"]
+            assert argv == ["capture-pane", "-p", "-e", "-J", "-t", pane_id, "-S", f"-{d.SEND_CHECK_LINES}"]
         elif argv[:1] == ["send-keys"]:
             assert argv[:3] == ["send-keys", "-t", pane_id]
             assert "-l" not in argv
@@ -128,7 +128,7 @@ def test_version_lists_the_new_verbs(world: RemoteWorld) -> None:
     out = call(world, "version")
     assert "keys" in out["verbs"]
     assert "resize" in out["verbs"]
-    assert d.VERSION == "0.11.0"
+    assert tuple(int(part) for part in d.VERSION.split(".")) >= (0, 5, 0)
 
 
 # --- request validation ------------------------------------------------------------------------

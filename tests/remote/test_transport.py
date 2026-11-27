@@ -86,6 +86,7 @@ async def test_capture_and_version(world: RemoteWorld) -> None:
         "attachments",
         "attachment",
         "health",
+        "clear",
         "events",
     ]
     gone = await t.call("capture", ["%2", "1"], timeout_seconds=10)
