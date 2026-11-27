@@ -159,6 +159,29 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 Dispatcher 0.9.0 adds the read-only `health` verb (free disk space, read-only file systems, memory; on WSL also the Windows disk C:), which the hub polls for the [incident log](SWITCHBOARD.md#incident-log). It needs no new flag. On each machine, from your own copy at the new verified commit: read `git diff <old>..<new> -- deploy/remote`, then install `switchboard-remote` and `switchboard-connect` again as in part 2.2 (`sha256sum` both copies), and `systemctl --user restart switchboard-connect`. `remote-check` shows `switchboard-remote 0.9.0` with `health` among its verbs. Until a machine is updated the hub polls it with `version` instead and reports no health incidents for it. For SSH machines the same install (SETUP-WSL.md steps 5.2 and 6.1) is enough; the forced command does not change.
 
+## Updating to 0.11.0: session hooks
+
+Dispatcher 0.11.0 adds the `events` verb (only with the new flag `--allow-events`), which hands the hub what this machine's Claude Code hooks noted. Update `switchboard-remote` and `switchboard-connect` as above, install `switchboard-hook` (next part), add `--allow-events` to the dispatcher's flags after `--` in the unit (`nano ~/.config/systemd/user/switchboard-connect.service`, then `systemctl --user daemon-reload` and `systemctl --user restart switchboard-connect`), and set `"events": {"enabled": true}` in the hub config. `remote-check` then lists `events` among the verbs. Without the flag the dispatcher answers `not_allowed` and the hub asks again every 10 minutes; nothing else changes.
+
+## Session hooks and notify_owner
+
+`switchboard-hook` is one more Python file of about 900 lines, standard library only, that runs as you on this machine. Claude Code runs it for four hooks: a permission prompt or a question (Notification), the end of a turn (Stop), a turn that ended on an API error (StopFailure) and `gh pr create` or `gh pr ready` (PostToolUse on Bash). It also serves the `notify_owner` MCP tool, which a session calls to tell you something itself. Each time it writes one small file into `~/.local/state/switchboard-hook/events` (0700, files 0600, at most 200 of at most 4 KB) and exits; it never connects anywhere. The dispatcher hands the spool to the hub over this machine's own connection when the hub asks (`--allow-events`), and deletes what the hub took. It writes no transcript, no assistant text, no tool output and no screen text: a hook's own short message (such as "Claude needs your permission to use Bash"), the error code of a failed turn, a pull request URL checked to be `https://github.com/<owner>/<repo>/pull/<n>`, the session's id and name, the project folder's name and the tmux pane.
+
+What to check when you read it (`less deploy/remote/switchboard-hook`): `run_hook` prints nothing and returns 0 whatever happens, and `main` arms a 5 s alarm that exits 0; `event_from_payload` keeps only the fields above; `write_event` writes only into the spool; `merged_settings` removes only handlers whose command ends in `switchboard-hook hook` and adds its own; `update_mcp` runs only `claude mcp remove` and `claude mcp add` for `switchboard-notify`.
+
+```sh
+cd ~/src/switchboard
+less deploy/remote/switchboard-hook                 # read it before installing
+install -D -m 755 deploy/remote/switchboard-hook ~/.local/bin/switchboard-hook
+sha256sum deploy/remote/switchboard-hook ~/.local/bin/switchboard-hook   # the two must match
+/usr/bin/python3 -I ~/.local/bin/switchboard-hook install --dry-run      # shows the change to ~/.claude/settings.json
+/usr/bin/python3 -I ~/.local/bin/switchboard-hook install
+```
+
+`install` merges four entries into `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`; `--settings FILE` for another file): it keeps every other key and hook, replaces only its own entries (so running it again changes nothing), prints the change as a diff and first copies the old file to `settings.json.switchboard-backup-<time>-<random>` (0600). Each entry runs `/usr/bin/python3 -I ~/.local/bin/switchboard-hook hook` with `"async": true` and a 10 s timeout, so Claude Code never waits for it. Then it runs `claude mcp remove --scope user switchboard-notify` and `claude mcp add --scope user switchboard-notify -- /usr/bin/python3 -I ~/.local/bin/switchboard-hook mcp` (when `claude` is not on `PATH` it prints that command for you; `--no-mcp` skips it). The paths are the Python that runs the installer and the installed file; `--python` and `--script` choose others. `--allow-tool` also adds `mcp__switchboard-notify__notify_owner` to `permissions.allow`, so sessions may call it without asking you; leave it out to approve the first call in each session yourself. `uninstall` removes exactly what `install` added (with a backup) and the MCP server. Claude Code reads the settings at the start of a session: restart running sessions, or open `/hooks` in one to check.
+
+`notify_owner(message, level?, url?)`: `level` is `info`, `warning` or `urgent`; `url` only a `https://github.com/<owner>/<repo>/...` link, so a session cannot send you to another site. At most 5 notes per session and 20 per machine in an hour. Its text is the session's own words: the hub shows it as such ("the session says: ...") and never treats it as an instruction or an approval.
+
 ## 3. Moving a machine from the ssh transport
 
 1. Set the machine up as in part 2 while its `ssh` entry still works.
@@ -177,6 +200,7 @@ Dispatcher 0.9.0 adds the read-only `health` verb (free disk space, read-only fi
 | `status`: replaced many times in the last hour | Two connectors use the same key (a second machine or a manual run next to the unit), or the key was copied. One key per machine |
 | Journal: `connection ended: auth`, and the hub's auth log says `account is locked` | `sbrelay` has a locked password (`!`) and sshd runs with `UsePAM no`: `sudo usermod -p '*' sbrelay` (part 1.1) |
 | Journal: `connection ended: closed` every few seconds, `status` shows `write_stalled` | The dispatcher stopped reading what the hub sends (a hung dispatcher, or a full channel): the hub closes such a connection after 5 s and the connector reconnects. If it repeats, check the dispatcher's stderr in the journal |
+| Nothing reaches Discord from this machine | `remote-check laptop` must list `events`; the unit's dispatcher needs `--allow-events`; `ls ~/.local/state/switchboard-hook/events` shows files waiting while the hub is away; `/hooks` in a session shows the four entries. A spool directory that others can enter is refused (`events_unsafe`): `chmod 700` it |
 | `status`: the hub is not running | `status` and `remote-check` ask the running hub over `stateDir/agents-control.sock`; start it first |
 
 ## If something is compromised

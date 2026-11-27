@@ -253,6 +253,32 @@ While it is off, the Claude app shows the connector as unreachable; tokens stay 
 - **Sending.** `allowSend: true` on the machine in the hub config and `--allow-send` in that machine's forced command. Both must agree. They also cover key presses for menus (`remote_send_keys`) and window sizes (`remote_resize`). Every send is logged in `stateDir/audit.jsonl` (`voice-coding-mcp audit` prints it).
 - **Notifications.** `notify.url` (for example an ntfy topic) and `watch.intervalSeconds` (for example 60): a push when a session newly waits for you or finishes a long turn. Pushes carry machine and tmux session names, never screen text.
 - **Usage.** `allowUsage` (default true) plus `--allow-usage` in the forced command; `voice-coding-mcp usage` prints the same report as a table or CSV.
+- **Discord.** A message in your own Discord channel when a session waits for your approval or an answer, finishes a turn, stops on an error or opens a pull request, or when a session itself tells you something (`notify_owner`): [Discord notifications](#discord-notifications) below.
+
+## Discord notifications
+
+The hub posts to one Discord channel of yours through a webhook. The session events come from Claude Code hooks on each machine (they only write a small local file; the hub takes it over the machine's existing connection), the watcher's pushes and incident pushes can go there too. Details: [SWITCHBOARD.md](SWITCHBOARD.md#discord-notifications).
+
+1. **The webhook.** In Discord, use a server of your own, or a channel only you can read: everyone who can read the channel reads the notifications. In that channel: Channel settings (the gear next to its name), Integrations, Webhooks, New Webhook; give it a name such as Switchboard, check that it posts into this channel, then Copy Webhook URL. The URL is a password: whoever has it can post into the channel. Do not paste it into a chat, a config file, a shell history or a ticket.
+
+2. **Only into the hub's environment file**, read from the terminal without echoing it (the URL never appears on the screen, in the shell history or in a command line; `printf` is a shell builtin and `tee` gets it on stdin):
+
+   ```sh
+   read -rs -p 'Discord webhook URL: ' url; echo
+   printf 'SWITCHBOARD_DISCORD_WEBHOOK_URL=%s\n' "$url" | sudo tee -a /etc/switchboard/env >/dev/null; unset url
+   sudo chown root:root /etc/switchboard/env; sudo chmod 600 /etc/switchboard/env
+   sudo grep -c '^SWITCHBOARD_DISCORD_WEBHOOK_URL=' /etc/switchboard/env     # 1 (replace an old line instead of adding a second)
+   ```
+
+   On the VPS layout the file is `/etc/voice-coding-mcp/env`. The hub reads the variable once at start, checks that it is a Discord webhook URL (`https://discord.com/api/webhooks/...`), and removes it from its environment, so no task or child process inherits it; it never logs it.
+
+3. **The hub config** (as `switchboard`, `nano ~/.config/voice-coding-mcp/config.json`): `"discord": {"enabled": true}`, and for session events `"events": {"enabled": true}`. Optional: `discord.kinds` (for example leave out `finished` if every finished turn is too much), `discord.quietHours` (`{"start": "23:00", "end": "07:00"}`: posted without a sound), `discord.coalesceSeconds`. With the hooks installed the watcher's own "needs a decision" pushes say the same thing again: either keep `watch.intervalSeconds` at 0 or leave `watch` out of `discord.kinds`. Then restart: `sb-linux off && sb-linux on` (or `sudo systemctl restart switchboard`). The journal says `Discord notifications on`; a missing or wrong variable is a warning and an incident (`voice-coding-mcp incidents`), and nothing is posted.
+
+4. **The hooks on each machine.** On machine `dev` (this computer, as yourself): install `switchboard-hook` from your own copy and run its installer, exactly as in [SETUP-AGENTS.md](SETUP-AGENTS.md#session-hooks-and-notify_owner). Then add `--allow-events` to the dispatcher's flags: for `dev` in your `~/.ssh/authorized_keys` line (step 5.3), for an agent machine in its unit. Machine `dev` is an ssh machine: the hub polls ssh machines only with `events.sshPollSeconds` (for example 30; each poll is one ssh login to localhost). Check with `remote-check`: `events` is among the verbs.
+
+5. **Try it.** In a session on `dev`, ask Claude Code to run something that needs your permission: Discord shows "Needs your approval on dev". Ask it to "use notify_owner to tell me hello": "Note from the session ... the session says: hello".
+
+The texts that come from a session (its name, a hook's message, a note) are shown as code, never as formatting, links or mentions, and nobody can be pinged (`@everyone` and the like are inert). They are the session's words, not instructions and never an approval. If the webhook leaks: delete it in the channel's Integrations (that revokes it at once), make a new one and repeat step 2.
 
 ## Your own extensions
 

@@ -1,6 +1,6 @@
 # Switchboard design
 
-Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher), M3 (`remote_send`, `remote_send_confirm`, audit), M4 (usage, `usage_report`, `voice-coding-mcp usage`) and M5 (Linux and WSL hub deploy, upstream session tools on Linux, the owner guide [SETUP-WSL.md](SETUP-WSL.md)) implemented, then the menu follow-up from the first voice test (whole menus in `remote_status`, `remote_send_keys`, `remote_resize`, see [Menus and keys](#menus-and-keys-after-the-first-voice-test)). M6, outbound agents (machines connect to the hub instead of the hub connecting to them, [Outbound agents](#outbound-agents-machines-connect-to-the-hub), owner guide [SETUP-AGENTS.md](SETUP-AGENTS.md)), is implemented too, and so is the [incident log](#incident-log) with machine health (dispatcher 0.9.0). What only the owner can verify on the real setup is listed in DESIGN.md "To verify with the real app". This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
+Status: M1 (`list_remote_sessions`, `remote_status`), M2 (`pending_input`, the notification watcher), M3 (`remote_send`, `remote_send_confirm`, audit), M4 (usage, `usage_report`, `voice-coding-mcp usage`) and M5 (Linux and WSL hub deploy, upstream session tools on Linux, the owner guide [SETUP-WSL.md](SETUP-WSL.md)) implemented, then the menu follow-up from the first voice test (whole menus in `remote_status`, `remote_send_keys`, `remote_resize`, see [Menus and keys](#menus-and-keys-after-the-first-voice-test)). M6, outbound agents (machines connect to the hub instead of the hub connecting to them, [Outbound agents](#outbound-agents-machines-connect-to-the-hub), owner guide [SETUP-AGENTS.md](SETUP-AGENTS.md)), is implemented too, and so is the [incident log](#incident-log) with machine health (dispatcher 0.9.0), then [session hooks](#session-hooks) with `notify_owner` and [Discord notifications](#discord-notifications) (dispatcher 0.11.0). What only the owner can verify on the real setup is listed in DESIGN.md "To verify with the real app". This file is the contract for the Switchboard additions of the nilware-io fork. It extends [DESIGN.md](DESIGN.md) and keeps its security model; where the two differ, DESIGN.md wins until the milestone that changes it updates DESIGN.md too. Keep this file current while implementing: each milestone updates the sections it touches, moves "planned" wording to "implemented", and records anything verified against a real machine.
 
 ## Goal
 
@@ -198,6 +198,20 @@ New top-level sections. All keys are camelCase in the file, snake_case in Python
 
 A machine named `hub` is allowed but warned about: the incident log names the server itself `hub`.
 
+### `events` and `discord`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `events.enabled` | `false` | Take the machines' session events ([Session hooks](#session-hooks)) |
+| `events.pollSeconds` | `5` | Agent and local machines, 2 to 300 |
+| `events.sshPollSeconds` | `0` | ssh machines (one login per poll): 0 is off, else 30 to 3600 |
+| `events.maxPerHour` | `120` | Per machine, 1 to 10000; beyond it events are acknowledged, dropped and counted in one `events_flood` incident |
+| `discord.enabled` | `false` | Post to the webhook in `SWITCHBOARD_DISCORD_WEBHOOK_URL` ([Discord notifications](#discord-notifications)); lets the watcher run without `notify.url` |
+| `discord.kinds` | all | `approval_needed`, `question`, `finished`, `failed`, `pr_opened`, `owner_note`, `watch`, `incident` |
+| `discord.coalesceSeconds` | `10` | One message for the items of this window, 0 to 300 |
+| `discord.quietHours` | `null` | `{"start": "HH:MM", "end": "HH:MM"}` in `incidents.timeZone`: posted silently |
+| `discord.maxPerHour` | `60` | Messages per hour, 1 to 1000 |
+
 Config validation additionally rejects: two machines with the same `name`, a machine named `local` (reserved for the hub's own sessions), more than 32 machines, more than one `local` machine, a `local` machine together with `listen.allowNonLoopback`, `host`, `user`, `identityFile`, `knownHostsFile` or an explicit `dispatcher` on a `local` machine, an `ssh` machine without `host`, `user` or `identityFile`, `allowPermissionAnswers` without `allowSend`, `sendToAnyPane` without `allowSend`, `claudeHome` on an `ssh` machine, `watch.intervalSeconds` > 0 without `notify.url` (M2), and `incidents.notify` without `notify.url`.
 
 `config.example.json` gets the `dev` machine first, then one SSH machine, both with placeholder values.
@@ -223,6 +237,9 @@ src/voice_coding_mcp/remote/
   incidents.py     stateDir/incidents.jsonl, the automatic incident tracker, spoken and printed forms
   health.py        machine health thresholds and the poll loop (also closes settled incidents)
   watcher.py       notification watcher
+  events.py        session events: the `events` poll per machine, acknowledgements, checks, log entries
+  discord.py       the Discord webhook: rendering (mentions inert, untrusted text as code), coalescing, retries
+  hook.py          byte-identical copy of deploy/remote/switchboard-hook (Claude Code hooks, notify_owner)
   speech.py        spoken-result formatting for all remote tools
   tools.py         the remote tools' logic (deadlines, summary or task), called by mcp.py
   agents.py        (M6) relay socket server, live connections, AgentTransport, control socket
@@ -243,6 +260,7 @@ src/voice_coding_mcp/usage/
 deploy/remote/switchboard-remote     byte-identical copy of remote/dispatcher.py (a test checks it)
 deploy/remote/switchboard-connect    (M6) the connector, byte-identical copy of remote/connector.py
 deploy/remote/switchboard-connect.service   (M6) example systemd --user unit
+deploy/remote/switchboard-hook       the hooks program and notify_owner MCP server, byte-identical copy of remote/hook.py
 deploy/relay/                        (M6) sshd drop-in, tmpfiles line and authorized_keys example for the relay account
 deploy/linux/sb-linux                on/off/status for Linux and WSL (Funnel), like deploy/mac/vcm-mac
 deploy/linux/switchboard.service     hardened system unit for the dedicated user
@@ -604,8 +622,8 @@ Implemented (dispatcher 0.9.0 for machine health; `remote/incidents.py`, `remote
 ```
 
 - `start` and `end` are UTC; `startLocal`, `endLocal` and spoken times are in `incidents.timeZone` (an IANA name), else the hub's local zone (`zone` then holds its abbreviation). `end` is null while open.
-- `component`: `agent_link`, `dispatcher`, `tmux`, `transport`, `relay`, `summariser`, `tool`, `hub`, `machine_health` or `other`. `code` is stable (`tmux_failed`, `link_down`, `timeout`, `low_disk_windows`, `read_only_root`, `unclean_stop`, `owner_report`, ...).
-- `source`: `auto` (the hub), `owner` (the owner's own words: `incident_note`, or the CLI with `--source owner`) or `cli`.
+- `component`: `agent_link`, `dispatcher`, `tmux`, `transport`, `relay`, `summariser`, `tool`, `hub`, `machine_health`, `session` (session events and their incidents, [Session hooks](#session-hooks)), `notify` (Discord problems) or `other`. A line with `"entry": "event"` (source `session`) records a session event, not an incident: the readers that count incidents leave it out. `code` is stable (`tmux_failed`, `link_down`, `timeout`, `low_disk_windows`, `read_only_root`, `unclean_stop`, `owner_report`, ...).
+- `source`: `auto` (the hub), `owner` (the owner's own words: `incident_note`, or the CLI with `--source owner`), `cli`, or `session` (an event a machine's session hooks reported; its texts quote the session's words).
 - Privacy: automatic texts are the hub's own fixed sentences with numbers and the machine names of the hub's config. Only the dispatcher's error code (from a fixed list) is used, never stderr, a machine's output, pane text, prompts, tokens or paths; a tool exception is recorded by its type only. The owner's words are stripped of control and format characters, redacted (`redact.py`) and clipped (what 200, why 500, effect 200, recovery 300 characters).
 
 ### Automatic incidents
@@ -645,6 +663,67 @@ The hub polls every machine every `incidents.health.intervalSeconds` (default 30
 - `incidents.notify` (needs `notify.url`): "Incident on wsl: the Windows disk C: is nearly full (57 GB free)." when an automatic incident opens and "Resolved on wsl: ..." when it closes, through the watcher's `send_text`; never the why or any text from a machine.
 
 Open questions: the drive of a moved WSL disk image (a `--host-drive` dispatcher option, or the hub config naming it); whether a laptop that sleeps (heartbeat loss every night) should open `link_down` incidents, or only after a grace time; whether health polls of ssh machines should be less frequent than those of agent machines.
+
+## Session hooks
+
+Implemented (dispatcher 0.11.0, `deploy/remote/switchboard-hook`, `remote/events.py`). Asked for by the owner on 2026-11-27: a Discord message when a session on any machine waits for an approval or a question, finishes, fails or has a pull request to merge, and a tool with which a session tells the owner itself what is worth knowing.
+
+### On the machine: `switchboard-hook`
+
+Stdlib-only Python 3.8+, one file, installed like the dispatcher (own clone, verified commit, read before installing); `voice-coding-mcp remote-hook` prints it. Three commands:
+
+- `hook`: Claude Code runs it for these hooks (checked against the hooks reference and Claude Code 2.1.332 on the dev machine):
+
+  | Hook (matcher) | Event | What is kept |
+  |---|---|---|
+  | `Notification` (`permission_prompt`) | `approval_needed` | `message` (Claude Code's own text, such as "Claude needs your permission to use Bash"), cleaned, redacted, 200 characters |
+  | `Notification` (`idle_prompt`, `elicitation_dialog`, `agent_needs_input`) | `question` | the same |
+  | `Stop` | `finished` | nothing of the turn: `last_assistant_message` is never read. Skipped while `stop_hook_active` (Claude continues because a stop hook asked) |
+  | `StopFailure` | `failed` | `error` when it is one of the documented codes (`rate_limit`, `server_error`, ...), else `unknown`; never `error_details` or the message |
+  | `PostToolUse` (`Bash`) | `pr_opened` | only for a command with `gh pr create` or `gh pr ready`: the first `https://github.com/<owner>/<repo>/pull/<n>` in the tool's stdout, or `<owner>/<repo>#<n>` (what `gh pr ready` prints) turned into that URL; anything else, no event |
+
+  Every event also has the Claude Code session id (a UUID, else null), the session's name from its registry entry `<claudeHome>/sessions/<pid>.json` (matched by session id; the session can set it, so it is the session's words), the basename of `cwd` as project, and `$TMUX_PANE` when it is a pane id. Hooks of subagents (`agent_id` set) are skipped. Other notification types (`auth_success`, ...) and other hooks write nothing.
+
+  Never blocking Claude Code: the installed entries are `"async": true` with `"timeout": 10`, and the program itself reads stdin for at most 2 s and 8 MB (more is dropped), arms a 5 s alarm that exits 0, prints nothing (stdout of some hooks is read by Claude Code as a decision or context) and returns 0 on every path, including a full disk, a broken payload or an unusable spool.
+
+- `mcp`: a stdio MCP server (newline-delimited JSON-RPC: `initialize` with version negotiation, `tools/list`, `tools/call`, `ping`) with one tool, `notify_owner(message, level?, url?)`: `message` 1 to 500 characters (cleaned, redacted), `level` `info`, `warning` or `urgent`, `url` only a `https://github.com/<owner>/<repo>/...` link (so a prompt-injected session cannot send the owner to a phishing page). The session is found from the registry entry of the parent process (or its parent). Rate limit in a flock-ed file next to the spool: 5 notes per session and 20 per machine per hour; beyond it the tool answers an error. It spools an `owner_note` event.
+
+- `install [--dry-run] [--settings FILE] [--python P] [--script S] [--no-mcp] [--allow-tool] [--claude BIN]` and `uninstall`: merge the four hook entries into `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR` honoured). Ours are the handlers whose command ends in `switchboard-hook hook`; they are removed everywhere and added again, so install is idempotent and a moved install path replaces the old entries. Every other key, group and handler is kept as it was. The change is printed as a unified diff, `--dry-run` writes and runs nothing, a real run copies the old file first (`settings.json.switchboard-backup-<time>-<random>`, 0600), writes atomically and keeps the file's mode (0600 for a new file). A settings file that is not a JSON object, or whose `hooks` is not the documented shape, is left alone with an error. Then `claude mcp remove --scope user switchboard-notify` and `claude mcp add --scope user switchboard-notify -- <python> -I <script> mcp` (argv, no shell; printed instead when `claude` is not on `PATH`). `--allow-tool` adds `mcp__switchboard-notify__notify_owner` to `permissions.allow` (off by default: adding an allow rule is the owner's decision). Refuses to run as root and paths outside `[A-Za-z0-9._/+-]`.
+
+The spool: `~/.local/state/switchboard-hook/events`, created 0700 (and its parent); a directory that is not the user's own or that others can enter is not used. One file per event, `<ms>-<pid>-<random>.json` (sortable by time), written to a temporary name and renamed, 0600, `O_EXCL` and `O_NOFOLLOW`, at most 4 KB; at 200 files the hook writes no more (the newest are lost, not the oldest: they are what the owner has not seen yet).
+
+### The dispatcher's `events` verb
+
+`events [<eventId>...]` (0.11.0), only with the new owner opt-in `--allow-events` (`not_allowed` otherwise; `allowEvents` in the policy file): deletes the named events (at most 16 ids, each `^[0-9]{13}-[0-9]{10}-[0-9a-f]{8}$`), then answers up to 16 of the rest, oldest first: `{"events": [{"id", "kind", "time", "sessionId", "sessionName", "project", "pane", "message", "url", "level", "tmuxSession"}], "more", "pending", "full", "bad"}`. Each file is read again with `O_NOFOLLOW`, must be a regular file of this user of at most 4 KB with exactly the keys above, a known kind and level, a UUID, a pane id and a GitHub URL, or it is deleted and counted in `bad` (any process of this user can write the spool). `tmuxSession` is the name of the pane's tmux session only when it is in `--sessions`. A spool directory that others can write answers `events_unsafe`. Why a verb and not a new frame: it works unchanged over ssh, local and agent transports, an older hub never sees an unknown frame (it closes the connection on one), an older dispatcher answers `bad_request`, and the policy stays on the dispatcher's own command line. Why an opt-in: the spool holds events of every Claude Code session of the user, not only of allow-listed tmux sessions (like `--allow-usage`).
+
+### On the hub: `remote/events.py`
+
+With `events.enabled`, the poller calls `events` every `events.pollSeconds` (5) on agent and local machines and every `events.sshPollSeconds` (0, off) on ssh machines, through the observed transports (so a failing call is a transport incident as for any verb). A machine that answers `bad_request`, `not_allowed` or `events_unsafe` is asked again after 10 minutes. Delivery is at least once: the ids taken are named in the next call, which follows at once (up to 8 calls a poll); until then the files stay on the machine. The ids already seen (4096) and the acknowledgements still owed are kept in `stateDir/events.json`, so a restart neither loses nor repeats an event.
+
+Each event is checked again: the machine is the configured machine whose transport answered, never a field of the event (a `machine` key is ignored by the response model and refused by the dispatcher); kinds from the fixed list; a `pr_opened` needs a valid pull request URL, other kinds only keep a GitHub URL; `failed` keeps only a known error code; texts are terminal-stripped, redacted and clipped again; a `tmuxSession` is kept only when it matches the hub's own `sessions` of that machine; a machine clock more than a day in the past or 5 minutes in the future is replaced by the hub's. At most `events.maxPerHour` (120) per machine, the rest in one `events_flood` incident. Then:
+
+- the incident log: an `event` entry (`"entry": "event"`, component `session`, source `session`, code the kind, start = end; what is the hub's sentence, "a session waits for approval"; why where it happened and the session's words quoted: `project fpgadc, session "fix tests", tmux fpga: the session says "..."`). A `failed` event is an incident instead: `session` `session_failed` of that machine, closed after the settle time without a repeat. The `incidents` tool and `voice-coding-mcp incidents` leave event entries out (`--events` shows them);
+- Discord, below.
+
+## Discord notifications
+
+Implemented (`remote/discord.py`). One notify path for what the owner is told: session events, the watcher's pushes (`watch`) and incident pushes (`incident`), each kind switchable with `discord.kinds`. `notify.url` keeps working as before; the watcher and incident pushes go to both (`incidents.notify` still decides `notify.url`; `discord.kinds` decides Discord). Fixed with this: `incidents.notify` was not wired into the running hub before (the notifier reached only the watcher).
+
+- The secret: the webhook URL comes only from `SWITCHBOARD_DISCORD_WEBHOOK_URL` in the hub's environment (the root-owned `EnvironmentFile=` of the unit), never from `config.json`. It must fully match `https://(ptb.|canary.)?discord(app)?.com/api/(v<N>/)?webhooks/<id>/<token>` (no query, no userinfo); anything else is refused and the problem names the variable, never its value. It is popped from the process environment at start, so no task, summariser or dispatcher child inherits it (tasks get an allow-listed environment anyway). It is never logged: log lines carry the HTTP status or the exception's type. `discord.enabled` without a valid variable: a warning and a `notify` `discord_not_configured` incident of the hub.
+- The post: `POST` JSON `{"content": ..., "allowed_mentions": {"parse": []}}` (plus `"flags": 4096`, suppress notifications, in `quietHours`), no redirects, 10 s timeout. `allowed_mentions` with an empty `parse` makes `@everyone`, `@here`, role and user mentions inert whatever the text says. Text that came from a machine (session and project names, a hook's message, a note, a watcher push that may quote a screen) is cleaned, redacted, clipped and shown as inline code with backticks replaced (`ˋ`) and every `@` followed by a zero-width space, so it can neither format, link, spoil nor mention. The hub's own words are escaped (`\*`, `\_`, `\[`, ...). URLs are only the validated GitHub ones, in angle brackets (no embed). A line reads `**Needs your approval** · on dev · project `fpgadc` · session `fix tests` · tmux `fpga`` then `> `Claude needs your permission to use Bash``; a note `> the session says: `...``.
+- Bursts: items within `coalesceSeconds` (10) of the first go out as one message, the same (kind, machine, session) folded with a count ("(x3)"), messages cut at 1900 characters (Discord's limit is 2000). At most `maxPerHour` (60) messages; a buffer of 100 items, the oldest dropped beyond it. Drops are counted in one `discord_dropped` incident.
+- Failures: a 429 waits `retry_after` from the body (else the `Retry-After` header, 5 s without either), clamped to 120 s; 5xx and network errors wait 2 to 6 s; up to 5 attempts, then the message is dropped and counted in a `discord_failed` incident. 400, 401, 403 and 404 (the webhook deleted or wrong) are not retried: `discord_rejected`. One worker posts one message at a time, so the hub never runs into Discord's per-webhook limit with parallel posts. At shutdown what is buffered is posted for up to 5 s.
+
+### A future Discord bot (design only, not implemented)
+
+Answering from Discord would need a bot that reads the channel. The binding rule, recorded in DESIGN.md's security model: **a reply in Discord never approves a merge, a push, a send into a session or any other action by itself.** Such an action goes through the same two-step confirmation as `remote_send_confirm`:
+
+1. The bot reads back exactly what will happen (the repository, the pull request number and title, the branch and target, or the machine, session and exact text), with a short confirmation id, bound to that action.
+2. The owner confirms in a separate, later message (not the same message, not a reaction on the notification), naming the id, within a short expiry (for example 2 minutes), single use.
+3. Both messages must come from the owner's Discord user id, configured on the hub (never learned from a message, a role or a display name), in the owner's own channel or a DM, and the bot ignores webhooks, other bots and edited messages.
+4. Risky actions (merge, push, force, delete, deploy) also need the explicit risk acknowledgement of `risky_ok`, and every confirmed action is audited like a send.
+
+Discord text, including the owner's, is untrusted input: it is parsed for these fixed forms only, never passed to a model as instructions with tools, and a message that only quotes or forwards a notification approves nothing. A bot token is another secret of the same kind as the webhook (environment file only). The webhook alone, as implemented, can only post: nothing Discord sends back reaches the hub.
 
 ## Answering permission prompts
 
@@ -1013,6 +1092,12 @@ All hermetic, as in [Test strategy](#test-strategy): no network, no real ssh (th
 | Agent transport: the relay login on the hub | Dedicated system user, key-only, forced command with `restrict`, sshd `Match` block (`DisableForwarding`, `PermitTTY no`, `PermitUserRC no`, `MaxSessions 1`), root-owned home and key file, not in the hub's group; the relay parses nothing and caps frames | sshd's pre-auth surface, which the hub already exposes for administration; an sshd or relay post-auth bug gives the `sbrelay` account (the row above) |
 | Agent transport: MITM or a fake hub | Hub host key pinned under `HostKeyAlias=switchboard-hub`, `StrictHostKeyChecking=yes`, `HostKeyAlgorithms=ssh-ed25519`, `UpdateHostKeys=no`, no global known hosts, recorded from a fingerprint read on the hub's console; `-F /dev/null`, `IdentitiesOnly`, `IdentityAgent=none`, no `SSH_AUTH_SOCK` | First pinning is a manual, checked step. A fake hub holding the real key (the hub) gets only the allowed verbs |
 | Agent transport: resource exhaustion and stuck connections | Frame caps on both sides (2 MiB to the machine, 5 MiB to the hub, enforced also by the relay), the existing response caps, 4 requests in flight per machine, connection cap and handshake timeouts on the socket, at most 2 unfinished handshakes per machine, every write bounded to 5 s (a machine that stops reading is closed as `write_stalled`), heartbeats for a silent machine plus ssh and sshd keepalives for a dead path, capped jittered backoff on the machine | A machine that floods frames is cut off and reconnects at most at its backoff rate. One machine still affects the others for a while: `list_remote_sessions` without a machine, `pending_input` and the watcher ask every machine in parallel and answer when the slowest one has (each call has its own deadline, 10 s by default, and a stalled write closes the connection within 5 s), so a hostile or hung machine can slow those answers to its deadline each time, until it is fixed or its key is removed. A machine key can also take the global connection slots that are left after the 2-per-machine handshake limit only by completing handshakes, and each completed one replaces that machine's previous connection, so it holds at most one live connection plus 2 waiting |
+| Session hooks: a session (prompt-injected) or another process of the machine user writes fake events, floods the spool, or plants a link | The spool is the machine user's own (0700, files 0600); the dispatcher re-checks every file (schema, kinds, sizes, `O_NOFOLLOW`, own uid) and deletes bad ones; at most 200 files of 4 KB; notify_owner is rate limited (5 per session, 20 per machine and hour) and takes only GitHub links; the hub checks every field again, rate limits per machine (`events.maxPerHour`) and shows session text as the session's words | A process of the machine user can still write plausible events ("needs your approval") up to the limits, as it could already rename its sessions. Nothing in an event is acted on: it is shown, never sent anywhere else |
+| Session hooks: a machine claims events for another machine | The machine is the configured machine whose transport (link) answered; the event body names none, a `machine` key is refused by the dispatcher and ignored by the hub | As for any verb: a stolen relay key poses as that one machine |
+| Session hooks: blocking or breaking Claude Code | `async` entries with a timeout; the program reads stdin at most 2 s, exits 0 within 5 s whatever happens, prints nothing; the installer keeps other hooks and writes only after a backup | A Claude Code version that changes the hook payloads makes the hook write nothing (checked in tests against the documented payloads) |
+| Discord: the webhook URL leaks (logs, config backups, task environment) | Only in the root-owned environment file; validated, popped from the hub's environment, never logged or put in an error | The hub user can read its own process memory and `/proc/<pid>/environ`: a compromised hub user can post to the channel (spam, fake notifications). It cannot read the channel. Revoke by deleting the webhook |
+| Discord: injection into the channel (mentions, links, markdown, fake headlines) from session names, messages or screens | `allowed_mentions: {"parse": []}`; untrusted text as inline code with backticks replaced and `@` broken; the hub's own words escaped; only validated GitHub URLs, without embeds; length cut | A message can still say misleading things inside its code span ("the session says: ..."); it is labelled as the session's words |
+| Discord: a future bot turns a reply into a merge or push | Design rule: never by itself; a read-back, a separate confirmation by the owner's user id with expiry, risk acknowledgement and audit, like `remote_send_confirm` ([A future Discord bot](#a-future-discord-bot-design-only-not-implemented)) | Not implemented |
 
 ## Test strategy
 
