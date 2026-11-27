@@ -184,6 +184,7 @@ Tasks wait in one queue in arrival order (FIFO); a task whose project or session
 | `GET`/`POST /authorize` | Only while a pairing window is open; rate limited per IP (30 per minute) |
 | `POST /token`, `POST /revoke` | Always open, not rate limited (all Claude connector traffic shares Anthropic's egress IPs) |
 | `GET`/`HEAD /healthz` | `{"ok":true}`, no auth and no Host check, for local monitoring |
+| `GET`/`HEAD /attachments/<token>` | A large video's one-time link (`remote_attachment`, video over 16 MiB): the hub's cleaned copy from memory, for 10 minutes, with `Range` support. No bearer token: the 256-bit token in the path is the credential. Unknown or expired tokens answer 404 and those misses are rate limited per IP like `/authorize`; the log shows only the token's fingerprint |
 
 OAuth request bodies (JSON and forms) are limited to 16 KB. Every other request must carry `Host` equal to the host of `publicUrl` (403 otherwise). A browser `Origin`, when present, must be the `publicUrl` origin, `https://claude.ai` or `https://claude.com`. Per-IP limits and the per-IP count of wrong pairing codes treat IPv6 clients by their /64 prefix.
 
