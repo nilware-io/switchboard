@@ -65,6 +65,7 @@
       "minConfirmSeconds": 4,
       "slashCommands": [],
       "riskyPatterns": [],
+      "knownTerms": [],
       "clientApproval": false
     }
   },
