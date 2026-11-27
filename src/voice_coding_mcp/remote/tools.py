@@ -49,6 +49,7 @@ from .attachments import (
 from .audit import AuditLog
 from .check import check_machine
 from .config import MachineConfig, command_timeout_seconds, known_names, known_terms
+from .discord import DiscordNotifier, combine
 from .dispatcher import (
     KEY_NAMES,
     KEYS_MENU,
@@ -75,6 +76,7 @@ from .dispatcher import (
     shows_vim_normal,
     shows_working,
 )
+from .events import EventPoller, EventPollerOptions
 from .health import HealthPoller, HealthPollerOptions
 from .incidents import (
     HUB,
@@ -265,6 +267,27 @@ class RemoteToolsOptions:
     configured (started by `start`, stopped by `stop`)."""
     notify: TextSender | None = None
     """Plain-text pushes (`HttpNotifier.send_text`), used for incidents with `incidents.notify`."""
+    discord: DiscordNotifier | None = None
+    """The owner's Discord channel (session events, incidents), when configured."""
+    discord_problem: str | None = None
+    """Why `discord.enabled` is on but Discord is not (the webhook variable is missing or invalid)."""
+
+
+DISCORD_FAILURES = {
+    "discord_failed": (
+        "Discord posts failed",
+        "posting to the Discord webhook failed again and again (network down, Discord down, or rate limited)",
+    ),
+    "discord_rejected": (
+        "Discord refused a post",
+        "the webhook answered with an error a retry cannot fix (401, 403 or 404: the webhook was deleted or the "
+        "URL is wrong)",
+    ),
+    "discord_dropped": (
+        "Discord messages were dropped",
+        "more messages than discord.maxPerHour, or more items waiting than the queue holds",
+    ),
+}
 
 
 class _Deadline:
@@ -301,9 +324,18 @@ class RemoteTools:
                 enabled=incidents.enabled,
                 logger=self._logger.child({"component": "incidents"}),
                 now=options.now,
-                notify=options.notify if incidents.notify else None,
+                notify=combine(
+                    options.notify if incidents.notify else None,
+                    options.discord.send_incident
+                    if options.discord is not None and options.discord.wants("incident")
+                    else None,
+                ),
             )
         )
+        self.discord = options.discord
+        self._discord_problem = options.discord_problem
+        if self.discord is not None:
+            self.discord.on_problem = self._discord_failed
         raw = options.transports or {
             m.name: make_transport(m, config.remote, config.state_dir, options.base_env, self.agents)
             for m in config.remote.machines
@@ -367,10 +399,34 @@ class RemoteTools:
                 now=options.now,
             )
         )
+        self.events = EventPoller(
+            EventPollerOptions(
+                remote=config.remote,
+                events=config.events,
+                transports=self.transports,
+                tracker=self.incidents,
+                log=self.incident_log,
+                state_dir=config.state_dir,
+                logger=self._logger.child({"component": "events"}),
+                discord=self.discord,
+                now=options.now,
+            )
+        )
 
     async def start(self) -> None:
-        """Starts serving agent machines and the incident loop (the app's lifespan)."""
+        """Starts serving agent machines, the incident loop and the event polls (the app's lifespan)."""
         await self.health.start()
+        if self._discord_problem is not None:
+            self.incidents.fail(
+                HUB,
+                "notify",
+                "discord_not_configured",
+                what="Discord notifications are off",
+                why=f"discord.enabled is on, but {self._discord_problem}",
+                effect="nothing was posted to Discord",
+                instant=True,
+            )
+        await self.events.start()
         if self.agents is not None:
             self.agents.check = self._agent_check
             self.agents.on_link = self._on_link
@@ -378,6 +434,7 @@ class RemoteTools:
             await self.agents.start()
 
     async def stop(self) -> None:
+        await self.events.stop()
         waiting, self._link_fetch = self._link_fetch, None
         if waiting is not None and not waiting.task.done():
             waiting.task.cancel()
@@ -399,6 +456,12 @@ class RemoteTools:
                 link_down(self.incidents, machine, reason, at_ms)
         except Exception as err:
             self._logger.error("incident observation failed", {"error": type(err).__name__})
+
+    def _discord_failed(self, code: str) -> None:
+        what, why = DISCORD_FAILURES.get(code, DISCORD_FAILURES["discord_failed"])
+        self.incidents.fail(
+            HUB, "notify", code, what=what, why=why, effect="some notifications did not reach Discord", instant=True
+        )
 
     def _on_relay_problem(self, code: str, machine: str | None) -> None:
         relay_problem(self.incidents, code, machine)
@@ -477,7 +540,8 @@ class RemoteTools:
         chosen = [
             i
             for i in incidents
-            if (wanted is None or i.machine == wanted)
+            if not i.is_event
+            and (wanted is None or i.machine == wanted)
             and (
                 (i.open and not self.incidents.recovering(i.id))
                 if open_only

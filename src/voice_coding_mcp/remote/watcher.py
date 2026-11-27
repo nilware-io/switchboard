@@ -66,6 +66,9 @@ class WatcherOptions:
     state_dir: str
     logger: Logger
     now: Clock | None = None
+    hooks_cover: Callable[[str, str], bool] | None = None
+    """(machine, wait kind): that machine's session hooks already report this wait to the owner
+    (`EventPoller.covers`), so the watcher stands down for it instead of pushing it again."""
 
 
 class Watcher:
@@ -157,6 +160,7 @@ class Watcher:
             machine = session_key.split("|", 1)[0]
             return machine in down_machines or session_key in report.unknown
 
+        covered = self._opts.hooks_cover
         current = {entry.key: entry for entry in report.entries}
         for key, entry in current.items():
             if key in self._announced:
@@ -168,6 +172,12 @@ class Watcher:
             self._seen.pop(key, None)
             self._announced.add(key)
             pushed_sessions.add(entry.session.key)
+            machine = entry.session.machine
+            if machine is not None and covered is not None and covered(machine, entry.kind):
+                self._opts.logger.info(
+                    "watch push stood down", {"event": entry.kind, "machine": machine, "reason": "session_hooks"}
+                )
+                continue
             pushes.append(entry_text(entry, self._watch.include_question))
             self._opts.logger.info(
                 "watch push", {"event": entry.kind, "machine": entry.session.machine or "local", "source": entry.source}

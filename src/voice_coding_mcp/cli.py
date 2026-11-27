@@ -1,6 +1,6 @@
 """Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher,
-remote-connector, agent-relay, audit, incidents, usage, timesheet, set-public-url (argparse; usage errors
-exit 2).
+remote-connector, remote-hook, agent-relay, audit, incidents, usage, timesheet, set-public-url (argparse; usage
+errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -20,7 +20,7 @@ import signal
 import socket
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from typing import Any, Literal, NoReturn
@@ -41,6 +41,7 @@ from .remote.agents import CONTROL_SOCKET_NAME, control_request, lint_authorized
 from .remote.audit import audit_path, format_audit_table, read_audit
 from .remote.check import check_machine
 from .remote.config import MACHINE_NAME_RE, remote_warnings
+from .remote.discord import DISCORD_WEBHOOK_ENV, DiscordNotifier, webhook_from_env
 from .remote.incidents import (
     COMPONENTS,
     MAX_RECOVERY,
@@ -186,6 +187,10 @@ def build_parser() -> argparse.ArgumentParser:
         "remote-connector",
         "print the switchboard-connect script, for installing it on a machine that connects out to the hub",
     )
+    command(
+        "remote-hook",
+        "print the switchboard-hook script (Claude Code hooks and notify_owner), for installing it on a machine",
+    )
     agent_relay = command(
         "agent-relay",
         "the relay between one machine's SSH connection and the hub (the forced command of the relay account)",
@@ -208,6 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--open", dest="open_only", action="store_true", help="only the incidents still open")
     listing.add_argument("--details", action="store_true", help="also why, effect and recovery")
     listing.add_argument("--json", dest="json_out", action="store_true", help="one JSON object per line")
+    listing.add_argument(
+        "--events", action="store_true", help="also the session events (entry event: finished, asked, pull requests)"
+    )
     add = action("add", "record an incident, for example one the owner saw")
     add.add_argument("--machine", required=True, metavar="M", help="the machine (hub for the server itself)")
     add.add_argument("--what", required=True, help="what failed")
@@ -272,6 +280,7 @@ class ParsedArgs:
     open_only: bool = False
     details: bool = False
     json_out: bool = False
+    events: bool = False
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -307,6 +316,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         open_only=getattr(ns, "open_only", False),
         details=getattr(ns, "details", False),
         json_out=getattr(ns, "json_out", False),
+        events=getattr(ns, "events", False),
     )
 
 
@@ -611,6 +621,7 @@ async def start_server(config: Config, logger: Logger, env: Mapping[str, str] | 
     except BaseException:
         await _shutdown(manager, notifier, "server failed to start")
         raise
+    discord, discord_problem = _discord(config, logger, env)
     app = create_app(
         CreateAppOptions(
             config=config,
@@ -618,6 +629,8 @@ async def start_server(config: Config, logger: Logger, env: Mapping[str, str] | 
             store=store,
             manager=manager,
             send_text=notifier.send_text if notifier is not None else None,
+            discord=discord,
+            discord_problem=discord_problem,
         )
     )
     server = _Server(
@@ -646,6 +659,27 @@ async def start_server(config: Config, logger: Logger, env: Mapping[str, str] | 
     url = f"http://{host}:{address[1]}"
     logger.info("server started", {"version": SERVER_VERSION, "listen": url, "publicUrl": config.public_url})
     return RunningServer(url=url, server=server, task=task, manager=manager, notifier=notifier, logger=logger)
+
+
+def _discord(
+    config: Config, logger: Logger, env: Mapping[str, str] | None
+) -> tuple[DiscordNotifier | None, str | None]:
+    """The Discord notifier from the webhook in the environment (removed from `os.environ`, so no
+    child process inherits it), and why it is off when `discord.enabled` asks for it."""
+    url, problem = webhook_from_env(dict(os.environ if env is None else env))
+    # The server's environment is a copy of os.environ (`CliIo.env`): remove it from both.
+    os.environ.pop(DISCORD_WEBHOOK_ENV, None)
+    if isinstance(env, MutableMapping):
+        env.pop(DISCORD_WEBHOOK_ENV, None)
+    if not config.discord.enabled:
+        if url is not None:
+            logger.warn(f"{DISCORD_WEBHOOK_ENV} is set but discord.enabled is false; nothing is posted to Discord")
+        return None, None
+    if url is None:
+        logger.warn("Discord notifications are off", {"problem": problem})
+        return None, problem
+    logger.info("Discord notifications on")
+    return DiscordNotifier(url, config.discord, logger, tz=zone_of(config.incidents)), None
 
 
 PID_FILE_RETRY_SECONDS = 1.0
@@ -866,6 +900,8 @@ def _cmd_incidents(config: Config, args: ParsedArgs, io: CliIo) -> int:
         incidents = [i for i in incidents if i.machine == args.machine]
     if args.open_only:
         incidents = [i for i in incidents if i.open]
+    if not args.events:
+        incidents = [i for i in incidents if not i.is_event]
     if args.since:
         try:
             period = parse_period(args.since, now_ms(), tz)
@@ -1050,6 +1086,18 @@ def _cmd_remote_connector(io: CliIo) -> int:
     return EXIT_OK
 
 
+HOOK_PATH = os.path.join(os.path.dirname(DISPATCHER_PATH), "hook.py")
+
+
+def _cmd_remote_hook(io: CliIo) -> int:
+    with open(HOOK_PATH, encoding="utf-8") as handle:
+        io.out(handle.read())
+    return EXIT_OK
+
+
+BUNDLED_SCRIPTS = {"remote-dispatcher": DISPATCHER_PATH, "remote-connector": CONNECTOR_PATH, "remote-hook": HOOK_PATH}
+
+
 async def main(argv: Sequence[str], io: CliIo) -> int:
     """Runs one CLI invocation and returns the exit code."""
     try:
@@ -1061,10 +1109,14 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
         io.err(f"{err.usage}{err.prog}: error: {err}\n")
         return EXIT_USAGE
 
-    if args.command in ("remote-dispatcher", "remote-connector"):
+    if args.command in BUNDLED_SCRIPTS:
         # Needs no config: it prints the bundled script.
         try:
-            return _cmd_remote_dispatcher(io) if args.command == "remote-dispatcher" else _cmd_remote_connector(io)
+            if args.command == "remote-dispatcher":
+                return _cmd_remote_dispatcher(io)
+            if args.command == "remote-connector":
+                return _cmd_remote_connector(io)
+            return _cmd_remote_hook(io)
         except OSError as err:
             io.err(f"Error: {err}\n")
             return EXIT_ERROR

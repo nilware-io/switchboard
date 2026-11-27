@@ -211,6 +211,7 @@ def test_the_guide_installs_what_runs_as_the_owner_only_from_the_owners_copy_aft
     assert sorted(installs) == [
         "deploy/remote/switchboard-connect",
         "deploy/remote/switchboard-connect.service",
+        "deploy/remote/switchboard-hook",
         "deploy/remote/switchboard-remote",
     ]
     text = GUIDE.read_text(encoding="utf-8")
@@ -223,6 +224,7 @@ def test_the_guide_states_the_real_size_of_the_files_to_read() -> None:
     for path, claim in (
         (REPO / "deploy" / "remote" / "switchboard-remote", r"The dispatcher is one Python file of about (\d+) lines"),
         (REPO / "deploy" / "remote" / "switchboard-connect", r"one Python file of about (\d+) lines with only"),
+        (REPO / "deploy" / "remote" / "switchboard-hook", r"is one more Python file of about (\d+) lines"),
     ):
         match = re.search(claim, text)
         assert match, claim

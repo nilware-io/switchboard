@@ -16,7 +16,7 @@ import stat
 import sys
 import zoneinfo
 from collections.abc import Callable, Iterable
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -290,6 +290,63 @@ class IncidentsConfig(_Section):
     notify: bool = False
     """Push automatic incidents (opened and closed) through `notify.url`."""
     health: HealthConfig = Field(default_factory=HealthConfig)
+
+
+def _poll(value: int) -> int:
+    if value != 0 and not 30 <= value <= 3600:
+        raise ValueError("must be 0 (off) or 30 to 3600")
+    return value
+
+
+class EventsConfig(_Section):
+    """Session events from the machines' `switchboard-hook` spools (docs/SWITCHBOARD.md, "Session
+    hooks"): polled with the dispatcher's `events` verb (0.12.0, `--allow-events`)."""
+
+    enabled: bool = False
+    poll_seconds: Annotated[Int, Field(ge=2, le=300)] = 5
+    """Agent and local machines: one frame over the machine's own link (or one local process)."""
+    ssh_poll_seconds: Annotated[Int, AfterValidator(_poll)] = 0
+    """ssh machines: each poll is one ssh login, so 0 (off) by default."""
+    max_per_hour: Annotated[Int, Field(ge=1, le=10_000)] = 120
+    """Events taken from one machine per hour; the rest are dropped and counted in one incident."""
+
+
+DISCORD_KINDS = (
+    "approval_needed",
+    "question",
+    "finished",
+    "failed",
+    "pr_opened",
+    "owner_note",
+    "watch",
+    "incident",
+)
+"""What Discord gets: the six session event kinds, the watcher's pushes and incident pushes."""
+DiscordKind = Literal[
+    "approval_needed", "question", "finished", "failed", "pr_opened", "owner_note", "watch", "incident"
+]
+CLOCK_RE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
+
+
+class QuietHoursConfig(_Section):
+    start: Annotated[str, AfterValidator(_matching(CLOCK_RE, "HH:MM, 00:00 to 23:59"))]
+    end: Annotated[str, AfterValidator(_matching(CLOCK_RE, "HH:MM, 00:00 to 23:59"))]
+
+
+class DiscordConfig(_Section):
+    """Posts to the owner's Discord channel (docs/SWITCHBOARD.md, "Discord notifications"). The
+    webhook URL is a secret: only in the hub's environment (DISCORD_WEBHOOK_ENV), never here."""
+
+    enabled: bool = False
+    kinds: Annotated[list[DiscordKind], Field(min_length=1, max_length=len(DISCORD_KINDS))] = Field(
+        default_factory=lambda: cast("list[DiscordKind]", list(DISCORD_KINDS))
+    )
+    coalesce_seconds: Annotated[Int, Field(ge=0, le=300)] = 10
+    """Items within this long after the first one go out as one message; repeats are counted."""
+    quiet_hours: QuietHoursConfig | None = None
+    """Between start and end (incidents.timeZone) messages are posted silently (no push)."""
+    max_per_hour: Annotated[Int, Field(ge=1, le=1000)] = 60
+    """Messages per hour; beyond it items are dropped and counted in one incident."""
 
 
 def check_remote(

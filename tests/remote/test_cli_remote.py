@@ -60,8 +60,8 @@ async def test_remote_check_reports_each_machine(tmp_path: Path) -> None:
     assert code == 1, io.stderr
     assert io.stdout == (
         "dev (ssh owner@localhost:22)\n"
-        "  switchboard-remote 0.11.0, verbs version, list, capture, send, usage, keys, resize, attachments, attachment, "
-        "health, clear, send off, usage off, attachments off\n"
+        "  switchboard-remote 0.12.0, verbs version, list, capture, send, usage, keys, resize, attachments, attachment, "
+        "health, clear, events, send off, usage off, attachments off\n"
         "  dev: 2 sessions. fpga, Claude Code idle. notes, no Claude Code.\n"
         "buildbox (ssh bot@example-host:22)\n"
         "  warning: remote machine buildbox: sessions allows every tmux session (*); list the session names instead\n"
