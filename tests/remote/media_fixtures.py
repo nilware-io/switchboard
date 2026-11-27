@@ -431,3 +431,27 @@ def png_sized(width: int, height: int) -> bytes:
 def ebml_short(element: bytes, data: bytes) -> bytes:
     """An EBML element with a one-byte size (at most 126 bytes of data)."""
     return element + bytes([0x80 | len(data)]) + data
+
+
+def mkv_head(block_bytes: int = 0) -> bytes:
+    """The start of a live MKV (unknown-size segment and cluster) up to a SimpleBlock header for
+    `block_bytes` of frame data: the file is valid once that many bytes (zeros, say) follow. Large
+    test files are made from it as sparse files instead of fixtures."""
+    head = mkv(live=True, cluster=el(0xE7, b"\x00"))
+    return head + b"\xa3\x01" + (4 + block_bytes).to_bytes(7, "big") + b"\x81\x00\x00\x80"
+
+
+def mkv_sized(total: int) -> bytes:
+    """A valid live MKV of exactly `total` bytes (one SimpleBlock of zeros)."""
+    head = mkv_head(0)
+    head = mkv_head(total - len(head))
+    return head + bytes(total - len(head))
+
+
+def write_sparse_mkv(path: str, total: int) -> None:
+    """A valid MKV of exactly `total` bytes as a sparse file (the frame data is a hole)."""
+    head = mkv_head(0)
+    head = mkv_head(total - len(head))
+    with open(path, "wb") as handle:
+        handle.write(head)
+        handle.truncate(total)

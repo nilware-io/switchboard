@@ -15,9 +15,16 @@ import pytest
 
 from tests.remote.agent_helpers import ServeSession
 from tests.remote.helpers import RemoteWorld
-from tests.remote.media_fixtures import GPS, SVG, exif_segment, jpeg, mp4, png, wav
+from tests.remote.media_fixtures import GPS, SVG, exif_segment, jpeg, mp4, png, wav, write_sparse_mkv
 from voice_coding_mcp.remote import dispatcher as d
-from voice_coding_mcp.remote.protocol import AttachmentResponse, AttachmentsResponse, ResponseError, parse_response
+from voice_coding_mcp.remote.protocol import (
+    MAX_ATTACHMENT_CHUNKS,
+    AttachmentResponse,
+    AttachmentsResponse,
+    AttachmentStream,
+    ResponseError,
+    parse_response,
+)
 
 FORCED = ["--sessions", "fpga", "--allow-attachments"]
 
@@ -221,6 +228,47 @@ def test_oversize_files_are_refused_before_reading(world: RemoteWorld) -> None:
     put(world, "big.png", png() + bytes(d.ATTACHMENT_CAPS["image"]), 1_764_000_000)
     assert first(world, FORCED, "switchboard-remote attachment big.png")["error"] == "too_large"
     assert first(world, FORCED, "switchboard-remote attachments")["skipped"] == 1
+
+
+def test_the_video_cap_is_250_mb_to_the_byte(world: RemoteWorld) -> None:
+    """250,000,000 bytes pass, one more is refused from its size alone (sparse files: the walk
+    reads the frame data of the one at the cap, the one over it is never read)."""
+    cap = d.ATTACHMENT_CAPS["video"]
+    assert cap == 250_000_000
+    box = outbox(world)
+    write_sparse_mkv(str(box / "at.mkv"), cap)
+    write_sparse_mkv(str(box / "over.mkv"), cap + 1)
+    listed = first(world, FORCED, "switchboard-remote attachments")
+    assert [a["name"] for a in listed["attachments"]] == ["at.mkv"]
+    assert listed["skipped"] == 1
+    assert first(world, FORCED, "switchboard-remote attachment over.mkv")["error"] == "too_large"
+    env = {**world.tmux_env(), "SSH_CONNECTION": "127.0.0.1 1 127.0.0.1 22"}
+    docs = d.respond(FORCED, {**env, "SSH_ORIGINAL_COMMAND": "switchboard-remote attachment at.mkv"})
+    stream = AttachmentStream()
+    count = 0
+    for doc in docs:
+        stream.feed(doc)
+        count += 1
+    parsed = stream.result()
+    assert isinstance(parsed, AttachmentResponse)
+    assert len(parsed.data) == cap
+    assert count == MAX_ATTACHMENT_CHUNKS + 2
+
+
+def test_the_hub_refuses_an_announced_size_over_the_cap() -> None:
+    cap = d.ATTACHMENT_CAPS["video"]
+    head = {**_answer(b"x")[0], "name": "big.mkv", "kind": "video", "mime": "video/x-matroska"}
+    for size, ok in ((cap, True), (cap + 1, False)):
+        stream = AttachmentStream()
+        announced = {**head, "size": size, "chunks": -(-size // d.ATTACHMENT_CHUNK_BYTES)}
+        if ok:
+            stream.feed(announced)
+        else:
+            with pytest.raises(ResponseError):
+                stream.feed(announced)
+            # Every later document is refused too.
+            with pytest.raises(ResponseError):
+                stream.feed({"done": True})
 
 
 def test_serve_mode_streams_and_cancels(world: RemoteWorld) -> None:
