@@ -14,7 +14,7 @@ from voice_coding_mcp.remote.audit import AuditLog
 from voice_coding_mcp.remote.send import ConfirmationStore
 
 
-def write_config(root: Path, world: RemoteWorld, machines: list[dict[str, Any]]) -> str:
+def write_config(root: Path, world: RemoteWorld, machines: list[dict[str, Any]], **remote: Any) -> str:
     projects = root / "projects"
     (projects / "alpha-app").mkdir(parents=True, exist_ok=True)
     claude_home = root / "claude-home"
@@ -25,7 +25,7 @@ def write_config(root: Path, world: RemoteWorld, machines: list[dict[str, Any]])
         "stateDir": str(root / "state"),
         "projectRoots": [str(projects)],
         "claude": {"bin": claude.bin, "env": dict(claude.env), "configDir": str(claude_home)},
-        "remote": {"machines": machines, "ssh": {"bin": world.ssh}},
+        "remote": {"machines": machines, "ssh": {"bin": world.ssh}, **remote},
     }
     path = root / "config.json"
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -60,8 +60,8 @@ async def test_remote_check_reports_each_machine(tmp_path: Path) -> None:
     assert code == 1, io.stderr
     assert io.stdout == (
         "dev (ssh owner@localhost:22)\n"
-        "  switchboard-remote 0.12.0, verbs version, list, capture, send, usage, keys, resize, attachments, attachment, "
-        "health, clear, events, send off, usage off, attachments off\n"
+        "  switchboard-remote 0.13.0, verbs version, list, capture, send, usage, keys, resize, attachments, attachment, "
+        "health, clear, events, update, send off, usage off, attachments off, self-update off\n"
         "  dev: 2 sessions. fpga, Claude Code idle. notes, no Claude Code.\n"
         "buildbox (ssh bot@example-host:22)\n"
         "  warning: remote machine buildbox: sessions allows every tmux session (*); list the session names instead\n"

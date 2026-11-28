@@ -16,7 +16,9 @@ the dispatcher's stdout to ssh's stdin. The hub only sends requests down that co
 dispatcher's policy is its own command line after `--`, here on the machine. When either process
 ends, the other is stopped and the connection is opened again after a capped, jittered backoff.
 The hub's host key is pinned in the known-hosts file under the alias `switchboard-hub`; this
-program never writes that file.
+program never writes that file. When the dispatcher exits with 77 (it installed a signed update,
+0.13.0) the connector connects again at once, and re-executes itself first when its own file was
+replaced. `switchboard-connect --version` prints the version.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 HOST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 HOST_IPV6_RE = re.compile(r"[0-9A-Fa-f:]{2,39}")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
@@ -58,6 +60,10 @@ EXIT_REPLACED = 75
 """The dispatcher's exit code after the hub replaced this connection with a newer one."""
 EXIT_REFUSED = 76
 """The dispatcher's exit code after the hub refused this connection (unknown machine, protocol)."""
+EXIT_UPDATED = 77
+"""The dispatcher's exit code after it installed a signed update (0.13.0): connect again at once
+with the new dispatcher, and when this file was replaced too, run it (`os.execv`)."""
+UPDATED_DELAY = 1.0
 LONG_WAIT_REASONS = ("replaced", "refused_by_hub", "auth", "host_key")
 """Retried after the maximum delay: repeating them sooner changes nothing."""
 SSH_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL")
@@ -267,11 +273,21 @@ def take_lock(path: str) -> int | None:
     return fd
 
 
+def file_identity(path: str) -> tuple[int, int, int, int] | None:
+    """(device, inode, size, mtime) of a file, None when it cannot be read: an update renames a
+    new file over the old one, so the inode changes."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
 class Outcome:
     def __init__(self, reason: str, seconds: float, detail: str = "") -> None:
         self.reason = reason
-        """`closed`, `replaced`, `refused_by_hub`, `host_key`, `auth`, `refused`, `timeout`, `other`,
-        `no_ssh`, `no_dispatcher` or `stopped`."""
+        """`closed`, `replaced`, `refused_by_hub`, `updated`, `host_key`, `auth`, `refused`, `timeout`,
+        `other`, `no_ssh`, `no_dispatcher` or `stopped`."""
         self.seconds = seconds
         self.detail = detail
 
@@ -304,8 +320,13 @@ class Connector:
         uniform: Callable[[float, float], float] = random.uniform,
         monotonic: Callable[[], float] = time.monotonic,
         wait: Callable[[float], bool] | None = None,
+        script: str | None = None,
     ) -> None:
         self.options = options
+        self.script = script
+        """This program's own file: after an update that replaced it, `run` ends with `reexec` set."""
+        self.script_identity = file_identity(script) if script else None
+        self.reexec = False
         self.env = env
         self.log = log if log is not None else sys.stderr
         self.uniform = uniform
@@ -394,6 +415,8 @@ class Connector:
             return Outcome("replaced", seconds)
         if dispatcher.returncode == EXIT_REFUSED:
             return Outcome("refused_by_hub", seconds, _clean(first))
+        if dispatcher.returncode == EXIT_UPDATED:
+            return Outcome("updated", seconds)
         if ssh.returncode == 255:
             return Outcome(map_ssh_failure(stderr), seconds, _clean(first))
         return Outcome("closed", seconds, _clean(first))
@@ -409,6 +432,16 @@ class Connector:
                 break
             if outcome.seconds >= RESET_AFTER_SECONDS:
                 delay = INITIAL_DELAY
+            if outcome.reason == "updated":
+                if self.script and file_identity(self.script) != self.script_identity:
+                    self.say("updated: starting the new switchboard-connect")
+                    self.reexec = True
+                    break
+                self.say("updated: connecting again with the new dispatcher")
+                last = outcome.reason
+                if self.wait(UPDATED_DELAY):
+                    break
+                continue
             if outcome.reason in LONG_WAIT_REASONS:
                 base = float(self.options.max_backoff)
             else:
@@ -426,8 +459,11 @@ class Connector:
         return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, execv: Callable[[str, list[str]], object] = os.execv) -> int:
     args = sys.argv[1:] if argv is None else argv
+    if args == ["--version"]:
+        sys.stdout.write(f"switchboard-connect {VERSION}\n")
+        return 0
     if os.geteuid() == 0:
         sys.stderr.write("switchboard-connect: refusing to run as root\n")
         return 2
@@ -441,7 +477,8 @@ def main(argv: list[str] | None = None) -> int:
     if lock is None:
         sys.stderr.write("switchboard-connect: another switchboard-connect of this user is running\n")
         return 1
-    connector = Connector(options, env)
+    script = os.path.abspath(sys.argv[0]) if argv is None else None
+    connector = Connector(options, env, script=script)
 
     def on_signal(_sig: int, _frame: object) -> None:
         connector.stop()
@@ -449,9 +486,14 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     try:
-        return connector.run()
+        code = connector.run()
     finally:
         os.close(lock)
+    if connector.reexec and script is not None:
+        # The update replaced this file: the same command line runs the new one (same process, so
+        # systemd keeps tracking it). The lock is taken again by the new program.
+        execv(sys.executable, [sys.executable, "-I", script, *args])
+    return code
 
 
 if __name__ == "__main__":

@@ -88,6 +88,7 @@ async def test_capture_and_version(world: RemoteWorld) -> None:
         "health",
         "clear",
         "events",
+        "update",
     ]
     gone = await t.call("capture", ["%2", "1"], timeout_seconds=10)
     assert (gone.ok, gone.error, gone.detail) == (False, "refused_by_policy", "gone")

@@ -438,6 +438,9 @@ class AgentHub:
         """Why the relay socket is not served (shown by `status` and `remote-check`)."""
         self.check: Callable[[str], Awaitable[tuple[list[str], bool]]] | None = None
         """`check <machine>` of the control socket (set by RemoteTools: version and list, formatted)."""
+        self.update: Callable[[str, str], Awaitable[dict[str, object]]] | None = None
+        """`update <machine> <sha256>` of the control socket (set by RemoteTools): installs the newest
+        published release, only when its bundle has that SHA-256 (`remote-update --yes`)."""
         self.on_link: Callable[[str, bool, str | None, int], None] | None = None
         """Called with (machine, up, close reason, time) when a connection is accepted and when one
         closes that was not replaced and not closed by the hub's own stop (the incident log)."""
@@ -764,6 +767,17 @@ class AgentHub:
             ):
                 lines, ok = await self.check(request["machine"])
                 answer = {"ok": ok, "lines": lines}
+            elif (
+                request is not None
+                and set(request) == {"t", "machine", "sha256"}
+                and request["t"] == "update"
+                and isinstance(request["machine"], str)
+                and request["machine"] in self.machines
+                and isinstance(request["sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", request["sha256"]) is not None
+                and self.update is not None
+            ):
+                answer = dict(await self.update(request["machine"], request["sha256"]))
             else:
                 answer = {"ok": False, "error": "bad_request"}
             with contextlib.suppress(ConnectionError, OSError, RuntimeError):

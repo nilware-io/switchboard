@@ -79,7 +79,7 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 1. Your own copy of the repository at a commit you checked, exactly as in [SETUP-WSL.md](SETUP-WSL.md#your-own-copy-the-only-source-for-what-runs-as-you-or-as-root) (`git clone`, `git checkout --detach <commit>`, `git rev-parse HEAD`, `git status --porcelain`). Two files from it run as you: the dispatcher and the connector. Never copy them from the hub.
 
-2. Read both, then install them. The dispatcher is one Python file of about 4700 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 450 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
+2. Read both, then install them. The dispatcher is one Python file of about 5600 lines (what to check: SETUP-WSL.md step 5.2; serve mode, `serve` and `Server`, reads only its stdin and writes only its stdout). The connector, `switchboard-connect`, is one Python file of about 500 lines with only the standard library: check that it runs `ssh` with `-F /dev/null`, `BatchMode`, `IdentitiesOnly`, `IdentityAgent=none`, no forwarding and `StrictHostKeyChecking=yes` against your known-hosts file (`ssh_argv`), that it never writes that file, and that it starts only the command you give it after `--`.
 
    ```sh
    cd ~/src/switchboard
@@ -157,7 +157,7 @@ By hand, with the files from the hub's install (`/opt/voice-coding-mcp`, root-ow
 
 8. Off: `systemctl --user stop switchboard-connect` (and `disable` to keep it off after a reboot). The hub then says "laptop is not connected right now." You decide when the machine can be reached.
 
-## Updating the dispatcher (0.9.0: machine health; 0.10.0: timesheet data; 0.11.0: clearing the input; 0.12.0: session hooks)
+## Updating the dispatcher (0.9.0: machine health; 0.10.0: timesheet data; 0.11.0: clearing the input; 0.12.0: session hooks; 0.13.0: signed self-update)
 
 Dispatcher 0.9.0 adds the read-only `health` verb (free disk space, read-only file systems, memory; on WSL also the Windows disk C:), which the hub polls for the [incident log](SWITCHBOARD.md#incident-log). It needs no new flag. On each machine, from your own copy at the new verified commit: read `git diff <old>..<new> -- deploy/remote`, then install `switchboard-remote` and `switchboard-connect` again as in part 2.2 (`sha256sum` both copies), and `systemctl --user restart switchboard-connect`. `remote-check` shows `switchboard-remote 0.9.0` with `health` among its verbs. Until a machine is updated the hub polls it with `version` instead and reports no health incidents for it. For SSH machines the same install (SETUP-WSL.md steps 5.2 and 6.1) is enough; the forced command does not change.
 
@@ -168,6 +168,59 @@ Dispatcher 0.11.0 adds the `clear` verb (`remote_clear_input`, under the same `-
 ## Updating to 0.12.0: session hooks
 
 Dispatcher 0.12.0 adds the `events` verb (only with the new flag `--allow-events`), which hands the hub what this machine's Claude Code hooks noted. Update `switchboard-remote` and `switchboard-connect` as above, install `switchboard-hook` (next part), add `--allow-events` to the dispatcher's flags after `--` in the unit (`nano ~/.config/systemd/user/switchboard-connect.service`, then `systemctl --user daemon-reload` and `systemctl --user restart switchboard-connect`), and set `"events": {"enabled": true}` in the hub config. `remote-check` then lists `events` among the verbs. Without the flag the dispatcher answers `not_allowed` and the hub asks again every 10 minutes; nothing else changes.
+
+## Updating to 0.13.0: signed self-update
+
+Dispatcher and connector 0.13.0 can update themselves: the hub offers a release you built and signed on your own computer with your release key ([SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates)), and the machine installs it only after its own `ssh-keygen` verified the signature against the key you pin here. The design and every check are in [SWITCHBOARD.md](SWITCHBOARD.md#self-update). A dispatcher older than 0.13.0 (for example one still at 0.6.0) has no `update` verb, so each machine needs this one manual step; every later update then goes by voice ("update laptop") or with `voice-coding-mcp remote-update laptop --yes` on the hub.
+
+It needs OpenSSH 8.1 or newer on the machine (`ssh -V`; Ubuntu 20.04 and newer, Debian 11 and newer, macOS 10.15.4 and newer have it) at `/usr/bin/ssh-keygen`, and the three programs installed under their own names in one directory that only you can write (the default `~/.local/bin`).
+
+On the machine, as yourself (here `laptop`, an agent machine):
+
+1. Install 0.13.0 from your own verified copy, as in part 2.2 (read `git diff <old>..<new> -- deploy/remote` first; from 0.6.0 that is a long read: at least the `update` verb, `install_update` and `check_bundle` in the dispatcher, and `run` and `main` in the connector):
+
+   ```sh
+   cd ~/src/switchboard
+   git fetch
+   git checkout --detach <commit>                      # the commit or release tag you checked, 0.13.0 or newer
+   git rev-parse HEAD && git status --porcelain        # exactly that commit, nothing else
+   less deploy/remote/switchboard-remote deploy/remote/switchboard-connect deploy/remote/switchboard-hook
+   install -D -m 755 deploy/remote/switchboard-remote ~/.local/bin/switchboard-remote
+   install -D -m 755 deploy/remote/switchboard-connect ~/.local/bin/switchboard-connect
+   install -D -m 755 deploy/remote/switchboard-hook ~/.local/bin/switchboard-hook    # only if you use the session hooks
+   sha256sum deploy/remote/switchboard-* ~/.local/bin/switchboard-*                 # each pair must match
+   ```
+
+   An update replaces only the programs it finds installed next to the dispatcher: install the hook here if you want updates to keep it current.
+
+2. Pin your release key. Copy the public line of `~/.ssh/switchboard_release.pub` from your computer (by hand or over a channel you trust, never from the hub) and compare its fingerprint with the one `ssh-keygen -lf ~/.ssh/switchboard_release.pub` prints there:
+
+   ```sh
+   install -d -m 700 ~/.config/switchboard-remote
+   printf 'switchboard-release namespaces="switchboard-release" %s\n' 'ssh-ed25519 AAAA...' > ~/.config/switchboard-remote/release_signers
+   chmod 644 ~/.config/switchboard-remote/release_signers
+   awk '{print $3" "$4}' ~/.config/switchboard-remote/release_signers | ssh-keygen -lf -    # must print your key's fingerprint
+   ```
+
+   `HOME`, `~/.config` and `~/.config/switchboard-remote` must not be writable by group or others (`chmod go-w`), or every update is refused (`signers_unsafe`).
+
+3. Allow it. In the unit, add `--allow-self-update` to the dispatcher's flags after `--` (for example `... switchboard-remote --serve --sessions fpga,notes --allow-events --allow-self-update`), then:
+
+   ```sh
+   nano ~/.config/systemd/user/switchboard-connect.service
+   systemctl --user daemon-reload
+   systemctl --user restart switchboard-connect
+   ```
+
+   On an ssh machine add it to the forced command in `~/.ssh/authorized_keys` instead (`command="/usr/bin/python3 -I /home/USER/.local/bin/switchboard-remote --sessions 'fpga' --allow-self-update"`); the next call uses it.
+
+4. On the hub, `sudo voice-coding-mcp remote-check laptop` now shows `switchboard-remote 0.13.0`, `update` among the verbs and `self-update allowed`.
+
+From then on: publish a release on the hub ([SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates)) and say "update laptop". The hub verifies the published bundle against its own pinned key (`/etc/voice-coding-mcp/release_signers`, required for publishing) and reads back "Ready to update switchboard-remote on laptop from 0.13.0 to 0.13.1, signed by the release key SHA256:..., verified on the hub"; check that fingerprint, then say yes. laptop checks the signature, starts the new dispatcher once, replaces the files (keeping `switchboard-remote.prev` and the others) and its connector restarts onto the new code within a few seconds. Every attempt is in the incident log (`voice-coding-mcp incidents --events --machine laptop`).
+
+To go back: `python3 -I ~/.local/bin/switchboard-remote --rollback` on the machine, then `systemctl --user restart switchboard-connect`. The machine keeps refusing the version you left, so the next release you sign must be newer.
+
+To stop updates on a machine: remove `--allow-self-update` (or the key line). To change the release key: replace the line in `release_signers` on every machine and on the hub.
 
 ## Session hooks and notify_owner
 
@@ -207,9 +260,11 @@ sha256sum deploy/remote/switchboard-hook ~/.local/bin/switchboard-hook   # the t
 | Journal: `connection ended: auth`, and the hub's auth log says `account is locked` | `sbrelay` has a locked password (`!`) and sshd runs with `UsePAM no`: `sudo usermod -p '*' sbrelay` (part 1.1) |
 | Journal: `connection ended: closed` every few seconds, `status` shows `write_stalled` | The dispatcher stopped reading what the hub sends (a hung dispatcher, or a full channel): the hub closes such a connection after 5 s and the connector reconnects. If it repeats, check the dispatcher's stderr in the journal |
 | Nothing reaches Discord from this machine | `remote-check laptop` must list `events`; the unit's dispatcher needs `--allow-events`; `ls ~/.local/state/switchboard-hook/events` shows files waiting while the hub is away; `/hooks` in a session shows the four entries. A spool directory that others can enter is refused (`events_unsafe`): `chmod 700` it |
+| `remote_update` says "Not updated: ..." | The sentence names the machine's refusal: `signers_unsafe` (the signers file or a directory above it is writable by group or others, or a symlink: `chmod go-w`), `no_signers` (no key line), `bad_signature` (the release was signed by another key than the one pinned, or the line lacks `namespaces="switchboard-release"`), `not_newer` (that version or a newer one was installed before; sign a newer one), `install_unsafe` (`~/.local/bin` or a program in it is writable by others or a symlink), `self_test_failed` (the new dispatcher did not start on this machine's Python; nothing was changed), `old_openssh` (OpenSSH older than 8.1). `voice-coding-mcp incidents --events --machine laptop` lists every attempt |
 | `status`: the hub is not running | `status` and `remote-check` ask the running hub over `stateDir/agents-control.sock`; start it first |
 
 ## If something is compromised
 
 - A machine's relay key (`~/.ssh/switchboard_relay`) leaked: delete its line from `/etc/ssh/switchboard-relay/authorized_keys` on the hub, check `audit.jsonl` and `status` (replacements, addresses), then make a new key on the machine (part 2.3 and 2.5). Whoever held the key could pose as that machine and receive what the hub sent to it, including the text of confirmed sends.
+- The release key (`~/.ssh/switchboard_release` on your computer) or its passphrase leaked: replace the key line in `~/.config/switchboard-remote/release_signers` on every machine (or remove `--allow-self-update`) and in `/etc/voice-coding-mcp/release_signers` on the hub, make a new key, delete the published bundles on the hub (`stateDir/releases`) and check `voice-coding-mcp incidents --events` for updates you did not ask for. Until the line is replaced, whoever holds the key and the hub can install code on every machine that allows self-update.
 - The hub: stop the units on the machines (`systemctl --user disable --now switchboard-connect`), then follow the hub's own steps ([DEPLOY.md](DEPLOY.md)). The machines hold no key that the hub could misuse, and the hub holds none that opens a machine; but while connected, a compromised hub can do on each machine what its dispatcher allows. If the hub's host key may have leaked, make a new one and pin it again on every machine.

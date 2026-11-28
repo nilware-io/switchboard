@@ -233,6 +233,10 @@ class RemoteConfig(_Section):
     summary: SummaryConfig = Field(default_factory=SummaryConfig)
     send: SendConfig = Field(default_factory=SendConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    release_signers_file: RemotePath = "/etc/voice-coding-mcp/release_signers"
+    """The hub's own pinned allowed-signers file for release bundles (docs/SWITCHBOARD.md,
+    "Self-update"): root-owned, not writable by group or others. `release publish` and
+    `remote_update` verify every bundle against it; without it nothing is published."""
 
 
 def _interval(value: int) -> int:

@@ -125,7 +125,7 @@ async def ctx(real_tmp: Path, request: pytest.FixtureRequest) -> AsyncIterator[C
 # --- tool list ------------------------------------------------------------------------------------
 
 
-async def test_has_the_twenty_four_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
+async def test_has_the_twenty_five_tools_with_the_design_annotations_and_server_instructions(ctx: Ctx) -> None:
     tools = (await ctx.client.list_tools()).tools
     by_name = {t.name: t for t in tools}
     assert sorted(by_name) == [
@@ -145,6 +145,7 @@ async def test_has_the_twenty_four_tools_with_the_design_annotations_and_server_
         "remote_send_confirm",
         "remote_send_keys",
         "remote_status",
+        "remote_update",
         "resume_task_in_remote_control",
         "run_task",
         "run_tasks_parallel",
@@ -171,6 +172,7 @@ async def test_has_the_twenty_four_tools_with_the_design_annotations_and_server_
         "remote_send_keys",
         "remote_resize",
         "remote_clear_input",
+        "remote_update",
         "usage_report",
         "timesheet_summary",
         "timesheet_approve",

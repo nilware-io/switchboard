@@ -1,6 +1,6 @@
 """Entry point: serve, pair, unpair, status, revoke-all, remote-check, remote-dispatcher,
-remote-connector, remote-hook, agent-relay, audit, incidents, usage, timesheet, set-public-url (argparse; usage
-errors exit 2).
+remote-connector, remote-hook, agent-relay, audit, incidents, usage, timesheet, release, remote-update,
+set-public-url (argparse; usage errors exit 2).
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
@@ -36,7 +36,7 @@ from .json_file import ensure_dir, loads_json, write_json_atomic
 from .log import Logger, as_log_level, create_logger, silent_logger
 from .mcp import SERVER_VERSION
 from .notify import HttpNotifier, create_notifier
-from .remote import relay
+from .remote import relay, release_cli
 from .remote.agents import CONTROL_SOCKET_NAME, control_request, lint_authorized_keys
 from .remote.audit import audit_path, format_audit_table, read_audit
 from .remote.check import check_machine
@@ -242,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--csv", action="store_true", help="CSV with a header row instead of a table")
     usage.add_argument("--cached", action="store_true", help="use the cached records, do not read the machines")
     timesheet_cli.add_parser(command)
+    release_cli.add_parsers(command)
     public_url = command(
         "set-public-url", "set publicUrl in the config file (deploy/linux/sb-linux on calls it); restart to apply"
     )
@@ -266,6 +267,7 @@ class ParsedArgs:
     url: str | None = None
     socket: str | None = None
     timesheet: timesheet_cli.TimesheetArgs | None = None
+    release: release_cli.ReleaseArgs | None = None
     action: str | None = None
     incident_id: str | None = None
     what: str = ""
@@ -302,6 +304,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         url=getattr(ns, "url", None),
         socket=getattr(ns, "socket", None),
         timesheet=timesheet_cli.args_of(ns) if ns.command == "timesheet" else None,
+        release=release_cli.args_of(ns) if ns.command in ("release", "remote-update") else None,
         action=getattr(ns, "action", None),
         incident_id=getattr(ns, "incident_id", None),
         what=getattr(ns, "what", ""),
@@ -1125,6 +1128,10 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
         relay_argv = ["--machine", args.machine or ""] + (["--socket", args.socket] if args.socket else [])
         return relay.run(relay_argv, dict(io.env))
 
+    if args.release is not None and args.release.action in release_cli.OFFLINE_ACTIONS:
+        # Runs on the owner's own computer, where the release key is: no config, no hub.
+        return release_cli.run_offline(args.release, io.out, io.err)
+
     config_path = args.config or io.env.get("VCM_CONFIG") or DEFAULT_CONFIG_PATH
     try:
         config = load_config(config_path)
@@ -1158,6 +1165,12 @@ async def main(argv: Sequence[str], io: CliIo) -> int:
             case "timesheet":
                 assert args.timesheet is not None
                 return await timesheet_cli.run(config, args.timesheet, io.out, io.err, io.env)
+            case "release":
+                assert args.release is not None
+                return release_cli.run_hub(config, args.release, io.out, io.err)
+            case "remote-update":
+                assert args.release is not None
+                return await release_cli.run_remote_update(config, args.release, io.env, io.out, io.err)
             case "set-public-url":
                 return _cmd_set_public_url(config_path, config, args.url or "", io)
     except Exception as err:

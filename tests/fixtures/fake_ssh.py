@@ -13,6 +13,7 @@ JSON file named by FAKE_SSH_CONFIG, which a per-test wrapper script sets (tests/
   home        HOME of the remote user (its .claude registry lives there)
   scenario    fake tmux scenario file; tmuxLog: fake tmux log file
   sleep       seconds to sleep before answering in mode "slow"
+  dispatcherPath  run this dispatcher file instead of the package's (an installed copy, for update)
 
 The argv must carry every hardening option of docs/SWITCHBOARD.md "SSH" with the expected value and
 no other `-o`; otherwise it exits 255 like a refused connection, so a dropped flag fails the tests.
@@ -164,7 +165,7 @@ def main() -> None:
         env["SSH_ORIGINAL_COMMAND"] = command
         dispatcher_argv = list(config.get("forced", []))
     done = subprocess.run(
-        [sys.executable, "-I", os.path.normpath(DISPATCHER), *dispatcher_argv],
+        [sys.executable, "-I", os.path.normpath(config.get("dispatcherPath") or DISPATCHER), *dispatcher_argv],
         env=env,
         input=stdin,
         capture_output=True,

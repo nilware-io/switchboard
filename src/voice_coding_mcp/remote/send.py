@@ -27,10 +27,12 @@ __all__ = [
     "RESIZE",
     "RISKY",
     "TEXT",
+    "UPDATE",
     "Confirmation",
     "ConfirmationStore",
     "RiskClassifier",
     "ScreenEcho",
+    "UpdateOffer",
     "chosen_option",
     "dialog_hash",
     "key_words",
@@ -103,9 +105,25 @@ TEXT = "text"
 KEYS = "keys"
 RESIZE = "resize"
 CLEAR = "clear"
+UPDATE = "update"
 """Confirmation kinds: a message (`remote_send`), keys (`remote_send_keys`), a window size
-(`remote_resize`), clearing an input draft (`remote_clear_input`). All are confirmed with
-`remote_send_confirm`."""
+(`remote_resize`), clearing an input draft (`remote_clear_input`), installing a signed release on a
+machine (`remote_update`). All are confirmed with `remote_send_confirm`."""
+UPDATE_RISK = "update"
+"""The risk code of every update: it changes the code that runs on a machine, so it needs risky_ok."""
+
+
+@dataclass(frozen=True)
+class UpdateOffer:
+    """The release an UPDATE confirmation read back: only exactly this bundle is sent."""
+
+    from_version: str
+    to_version: str
+    fingerprint: str
+    sha256: str
+    """Of the bundle file (`release.Release.sha256`)."""
+    path: str
+
 
 _KEY_ALIASES: dict[str, str] = {
     **{name.lower(): name for name in KEY_NAMES},
@@ -500,6 +518,8 @@ class Confirmation:
     only that draft."""
     project: str | None = None
     """The project folder of the pane's Claude Code session, for the timesheet's voice activity."""
+    offer: UpdateOffer | None = None
+    """For UPDATE: the release read back (the pane fields are empty: an update is per machine)."""
 
 
 LookupProblem = Literal["unknown", "expired", "mismatch", "early"]
@@ -556,6 +576,7 @@ class ConfirmationStore:
         size: tuple[int, int] | None = None,
         draft: str | None = None,
         project: str | None = None,
+        offer: UpdateOffer | None = None,
     ) -> tuple[Confirmation, list[Confirmation]]:
         """The new confirmation and the ones of the same client it dropped (oldest first)."""
         self._expire()
@@ -594,6 +615,7 @@ class ConfirmationStore:
             size=size,
             draft=draft,
             project=project,
+            offer=offer,
         )
         self._items[new_id] = item
         return item, dropped

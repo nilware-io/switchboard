@@ -34,6 +34,7 @@ VERBS: tuple[str, ...] = (
     "health",
     "clear",
     "events",
+    "update",
 )
 ARG_RE = re.compile(r"[A-Za-z0-9%_.-]{1,64}", re.ASCII)
 PANE_ID_RE = re.compile(r"%[0-9]{1,6}", re.ASCII)
@@ -157,6 +158,8 @@ class VersionResponse(_Response):
     allow_usage: bool = Field(default=False, alias="allowUsage")
     allow_attachments: bool = Field(default=False, alias="allowAttachments")
     """Dispatcher 0.7.0 and newer."""
+    allow_self_update: bool = Field(default=False, alias="allowSelfUpdate")
+    """Dispatcher 0.13.0 and newer: started with `--allow-self-update`."""
 
 
 class SendResponse(_Response):
@@ -212,6 +215,17 @@ class ClearResponse(_Response):
     cleared: bool
     remaining_lines: int | None = Field(default=None, alias="remainingLines", ge=0)
     remaining_chars: int | None = Field(default=None, alias="remainingChars", ge=0)
+
+
+class UpdateResponse(_Response):
+    """Dispatcher 0.13.0: a signed release was installed (`update`)."""
+
+    updated: bool
+    from_version: Name = Field(alias="from")
+    to_version: Name = Field(alias="to")
+    files: Annotated[list[Name], Field(max_length=8)] = Field(default_factory=list)
+    skipped: Annotated[list[Name], Field(max_length=8)] = Field(default_factory=list)
+    signer: Annotated[str, Field(max_length=80)] = ""
 
 
 EVENT_KINDS = ("approval_needed", "question", "finished", "failed", "pr_opened", "owner_note")
@@ -465,6 +479,7 @@ RESPONSE_MODELS: dict[str, type[_Response]] = {
     "health": HealthResponse,
     "clear": ClearResponse,
     "events": EventsResponse,
+    "update": UpdateResponse,
 }
 
 

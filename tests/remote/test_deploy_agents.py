@@ -208,7 +208,8 @@ def test_the_guide_installs_what_runs_as_the_owner_only_from_the_owners_copy_aft
                 installs.append(match.group(1))
                 assert cwd == OWNER_COPY, line
                 assert match.group(1) in read, f"{match.group(1)} is installed before it is read"
-    assert sorted(installs) == [
+    # The 0.13.0 one-time step installs the three programs again.
+    assert sorted(set(installs)) == [
         "deploy/remote/switchboard-connect",
         "deploy/remote/switchboard-connect.service",
         "deploy/remote/switchboard-hook",
