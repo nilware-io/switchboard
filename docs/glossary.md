@@ -11,7 +11,19 @@ The shared English-Greek glossary of the nilware.io repositories.
 | English | Ελληνικά |
 |---|---|
 | agent | πράκτορας |
-| session | σύνοδος |
+| session (agent, Claude Code) | σύνοδος |
+| session (login session) | συνεδρία σύνδεσης |
+| log in / logon | σύνδεση |
+| logged in (session) | συνδεδεμένη συνεδρία |
+| session token | διακριτικό συνεδρίας |
+| session expiry | λήξη συνεδρίας |
+| credentials | διαπιστευτήρια |
+| authentication | ταυτοποίηση |
+| authorization | εξουσιοδότηση |
+| log out / logoff | αποσύνδεση |
+| timeout (event) | υπέρβαση χρονικού ορίου |
+| timeout (setting) | χρονικό όριο |
+| idle timeout | όριο αδράνειας |
 | merge | συγχώνευση |
 | pull request (PR) | αίτημα συγχώνευσης |
 | branch | κλάδος |
@@ -21,6 +33,12 @@ The shared English-Greek glossary of the nilware.io repositories.
 | milestone | ορόσημο |
 | reminder | υπενθύμιση |
 | token | λεκτική μονάδα |
+
+### Distinctions / Διακρίσεις
+
+- **Σύνοδος** είναι η σύνοδος πράκτορα (agent session, όπως μια σύνοδος του Claude Code). **Συνεδρία σύνδεσης** είναι η σύνδεση (login session) που μένει ανοιχτή όσο γίνονται πράξεις.
+- «Συνδεδεμένη συνεδρία», όχι «συνδεδεμένος χρήστης»: δεν υπάρχει πάντα χρήστης.
+- Το timeout δεν είναι λήξη: **υπέρβαση χρονικού ορίου** είναι το γεγονός, **χρονικό όριο** η ρύθμιση· **λήξη συνεδρίας** είναι κάτι άλλο (session expiry).
 
 ## Proposed terms, pending approval / Προτεινόμενοι όροι, προς έγκριση
 
