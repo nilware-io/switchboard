@@ -240,7 +240,7 @@ Ubuntu installs security updates automatically (unattended-upgrades). Reboot whe
 
 ### Signed updates of the hub
 
-Instead of `git pull`, the hub can move only to release tags signed with the owner's release key ([SWITCHBOARD.md](SWITCHBOARD.md#self-update); the key itself: [SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates)). Once, as root, pin the key's public line with the `git` namespace (the owner copies it from their computer and compares the fingerprint):
+Instead of `git pull`, the hub can move only to release tags signed with the owner's release key ([SWITCHBOARD.md](SWITCHBOARD.md#self-update); the key itself: [SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates)). Once, as root, pin the key's public line (the owner copies it from their computer and compares the fingerprint). The same file is `remote.releaseSignersFile`, which `release publish` and `remote_update` require to verify the machines' release bundles on the hub: without it nothing is published. `git` in `namespaces` is only for `hub-update`:
 
 ```sh
 sudo install -d -o root -g root -m 755 /etc/voice-coding-mcp

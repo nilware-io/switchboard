@@ -216,7 +216,7 @@ On the machine, as yourself (here `laptop`, an agent machine):
 
 4. On the hub, `sudo voice-coding-mcp remote-check laptop` now shows `switchboard-remote 0.13.0`, `update` among the verbs and `self-update allowed`.
 
-From then on: publish a release on the hub ([SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates)) and say "update laptop". The hub reads back "Ready to update switchboard-remote on laptop from 0.13.0 to 0.13.1, signed by the release key SHA256:..."; check that fingerprint, then say yes. laptop checks the signature, starts the new dispatcher once, replaces the files (keeping `switchboard-remote.prev` and the others) and its connector restarts onto the new code within a few seconds. Every attempt is in the incident log (`voice-coding-mcp incidents --events --machine laptop`).
+From then on: publish a release on the hub ([SETUP-WSL.md](SETUP-WSL.md#release-key-and-signed-updates)) and say "update laptop". The hub verifies the published bundle against its own pinned key (`/etc/voice-coding-mcp/release_signers`, required for publishing) and reads back "Ready to update switchboard-remote on laptop from 0.13.0 to 0.13.1, signed by the release key SHA256:..., verified on the hub"; check that fingerprint, then say yes. laptop checks the signature, starts the new dispatcher once, replaces the files (keeping `switchboard-remote.prev` and the others) and its connector restarts onto the new code within a few seconds. Every attempt is in the incident log (`voice-coding-mcp incidents --events --machine laptop`).
 
 To go back: `python3 -I ~/.local/bin/switchboard-remote --rollback` on the machine, then `systemctl --user restart switchboard-connect`. The machine keeps refusing the version you left, so the next release you sign must be newer.
 

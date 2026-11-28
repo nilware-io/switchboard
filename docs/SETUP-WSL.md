@@ -317,7 +317,13 @@ Machines with dispatcher 0.13.0 and `--allow-self-update` take updates from the 
 
    Use it for nothing else (not as a login key, not in an agent you forward). Back up the private key encrypted; without it you can still update machines by hand, and pin a new key.
 
-2. Pin it on each machine: `~/.config/switchboard-remote/release_signers` with the line `switchboard-release namespaces="switchboard-release" ssh-ed25519 AAAA...` ([SETUP-AGENTS.md](SETUP-AGENTS.md#updating-to-0130-signed-self-update) has the commands and the one-time install of 0.13.0). For the hub's own signed updates the hub has its own copy in `/etc/voice-coding-mcp/release_signers` with `namespaces="switchboard-release,git"` ([DEPLOY.md](DEPLOY.md#signed-updates-of-the-hub)).
+2. Pin it on each machine: `~/.config/switchboard-remote/release_signers` with the line `switchboard-release namespaces="switchboard-release" ssh-ed25519 AAAA...` ([SETUP-AGENTS.md](SETUP-AGENTS.md#updating-to-0130-signed-self-update) has the commands and the one-time install of 0.13.0). The hub needs its own copy too, root-owned, before it publishes anything: it verifies every bundle against it on publish and before each read-back (`remote.releaseSignersFile`, default `/etc/voice-coding-mcp/release_signers`; add `,git` to `namespaces` for the hub's own signed tags, [DEPLOY.md](DEPLOY.md#signed-updates-of-the-hub)):
+
+   ```sh
+   sudo install -d -o root -g root -m 755 /etc/voice-coding-mcp
+   printf 'switchboard-release namespaces="switchboard-release" %s\n' "$(cut -d' ' -f1,2 ~/.ssh/switchboard_release.pub)" | sudo tee /etc/voice-coding-mcp/release_signers >/dev/null
+   sudo chmod 644 /etc/voice-coding-mcp/release_signers
+   ```
 
 3. Build and sign a release. Take the programs from your own verified copy (step 3), at the commit you checked; the commands run from a checkout of this repository that you trust as yourself (your development checkout, for example; they only read files and run `ssh-keygen`):
 
@@ -332,7 +338,7 @@ Machines with dispatcher 0.13.0 and `--allow-self-update` take updates from the 
 
    `release sign` lets `ssh-keygen` ask for the passphrase on your terminal and writes `switchboard-remote-0.13.1.bundle` next to the directory. You can check the signature without Switchboard's code too: `ssh-keygen -Y verify -f <your signers file> -I switchboard-release -n switchboard-release -s manifest.json.sig < manifest.json` in that directory. `release verify --signers <file> <bundle>` runs the machines' whole check.
 
-4. Publish it on the hub. A bundle is not secret (it holds the programs and a signature), so copy it where the hub user can read it, then publish as the hub user:
+4. Publish it on the hub (it verifies the signature against the hub's signers file of step 2 and refuses anything that does not verify). A bundle is not secret (it holds the programs and a signature), so copy it where the hub user can read it, then publish as the hub user:
 
    ```sh
    install -m 644 ~/switchboard-releases/switchboard-remote-0.13.1.bundle /tmp/
@@ -341,7 +347,7 @@ Machines with dispatcher 0.13.0 and `--allow-self-update` take updates from the 
 
    For a server hub: `scp` it there and run `sudo voice-coding-mcp release publish <file>` (the file readable by the service user).
 
-5. Update a machine by voice: "update laptop". The read-back names both versions and the key's fingerprint; compare it with step 1, then say yes. Or on the hub: `voice-coding-mcp remote-update laptop` (shows the plan) and `remote-update laptop --yes`. `list_remote_sessions` says when a machine's dispatcher is older than the published release. Machine `dev` (`transport: "local"`) runs the hub's own copy and updates with the hub; when `dev` is reached over ssh (step 5), its `~/.local/bin/switchboard-remote` updates like any machine.
+5. Update a machine by voice: "update laptop". The read-back names both versions and the fingerprint the hub verified ("verified on the hub"); compare it with step 1, then say yes. Or on the hub: `voice-coding-mcp remote-update laptop` (shows the plan) and `remote-update laptop --yes`. `list_remote_sessions` says when a machine's dispatcher is older than the published release. Machine `dev` (`transport: "local"`) runs the hub's own copy and updates with the hub; when `dev` is reached over ssh (step 5), its `~/.local/bin/switchboard-remote` updates like any machine.
 
 6. The hub itself: tag the release commit with the same key and push the tag:
 
@@ -350,7 +356,7 @@ Machines with dispatcher 0.13.0 and `--allow-self-update` take updates from the 
    git push origin v0.13.1
    ```
 
-   A server hub then runs `deploy/hub-update v0.13.1` ([DEPLOY.md](DEPLOY.md#signed-updates-of-the-hub)). On this WSL layout the hub's checkout belongs to the hub user, so run it as that user with a root-owned signers file and restart the unit yourself: `sudo install -d -m 755 /etc/switchboard && sudo install -m 644 <signers file> /etc/switchboard/release_signers`, then `sudo -H -u switchboard /usr/bin/python3 -I /home/switchboard/switchboard/deploy/hub-update --repo /home/switchboard/switchboard --signers /etc/switchboard/release_signers --no-restart v0.13.1` and `sudo systemctl restart switchboard`. Here it protects against a tampered origin, not against a compromised hub user (that user owns the checkout); your own copy stays the source of what runs as you or as root.
+   A server hub then runs `deploy/hub-update v0.13.1` ([DEPLOY.md](DEPLOY.md#signed-updates-of-the-hub)). On this WSL layout the hub's checkout belongs to the hub user, so run it as that user with the signers file of step 2 (its line with `namespaces="switchboard-release,git"`) and restart the unit yourself: `sudo -H -u switchboard /usr/bin/python3 -I /home/switchboard/switchboard/deploy/hub-update --repo /home/switchboard/switchboard --no-restart v0.13.1` and `sudo systemctl restart switchboard`. Here it protects against a tampered origin, not against a compromised hub user (that user owns the checkout); your own copy stays the source of what runs as you or as root.
 
 If the key or its passphrase leaks: replace the line in every `release_signers` (machines and hub), create a new key, and remove the published bundles from `stateDir/releases` on the hub.
 
