@@ -444,6 +444,18 @@ def update_event(*, machine: str, code: str, what: str, why: str, at_ms: int) ->
     )
 
 
+def release_refused(code: str, where: str, at_ms: int) -> Incident:
+    """A release bundle the hub refused to store or to offer (`release publish`, a read-back of
+    `remote_update`): an event of the hub, with the fixed refusal code."""
+    return update_event(
+        machine=HUB,
+        code="release_refused",
+        what=f"{where} refused a release bundle",
+        why=f"{code}: it did not verify against the hub's pinned release key, or its files do not match",
+        at_ms=at_ms,
+    )
+
+
 Key = tuple[str, str, str]
 
 

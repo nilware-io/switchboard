@@ -14,7 +14,7 @@ from voice_coding_mcp.remote.audit import AuditLog
 from voice_coding_mcp.remote.send import ConfirmationStore
 
 
-def write_config(root: Path, world: RemoteWorld, machines: list[dict[str, Any]]) -> str:
+def write_config(root: Path, world: RemoteWorld, machines: list[dict[str, Any]], **remote: Any) -> str:
     projects = root / "projects"
     (projects / "alpha-app").mkdir(parents=True, exist_ok=True)
     claude_home = root / "claude-home"
@@ -25,7 +25,7 @@ def write_config(root: Path, world: RemoteWorld, machines: list[dict[str, Any]])
         "stateDir": str(root / "state"),
         "projectRoots": [str(projects)],
         "claude": {"bin": claude.bin, "env": dict(claude.env), "configDir": str(claude_home)},
-        "remote": {"machines": machines, "ssh": {"bin": world.ssh}},
+        "remote": {"machines": machines, "ssh": {"bin": world.ssh}, **remote},
     }
     path = root / "config.json"
     path.write_text(json.dumps(data), encoding="utf-8")

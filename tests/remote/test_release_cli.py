@@ -9,8 +9,23 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
+
 from tests.remote.helpers import RemoteWorld, machine
-from tests.remote.release_helpers import fingerprint, install_machine, needs_openssh, new_key, signers_line
+from tests.remote.release_helpers import (
+    bundle as make_bundle,
+)
+from tests.remote.release_helpers import (
+    fingerprint,
+    hub_signers,
+    install_machine,
+    needs_openssh,
+    new_key,
+    programs,
+    sign,
+    signers_line,
+    trust_own_uid,
+)
 from tests.remote.test_cli_remote import write_config
 from tests.test_cli import run_cli
 from voice_coding_mcp.remote import dispatcher as d
@@ -18,6 +33,11 @@ from voice_coding_mcp.remote import release as r
 from voice_coding_mcp.remote.audit import read_audit
 
 pytestmark = needs_openssh
+
+
+@pytest.fixture(autouse=True)
+def _trusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    trust_own_uid(monkeypatch)
 
 
 def _source(tmp: Path, version: str) -> Path:
@@ -61,7 +81,9 @@ async def test_build_sign_verify_publish_list(tmp_path: Path) -> None:
     assert code == 1
     assert "not valid for these signers" in io.stderr
     world = RemoteWorld.create(tmp_path)
-    config = write_config(tmp_path, world, [machine("dev", world=world)])
+    config = write_config(
+        tmp_path, world, [machine("dev", world=world)], releaseSignersFile=str(hub_signers(tmp_path, key))
+    )
     code, io = await run_cli("release", "list", "--config", config)
     assert (code, io.stdout) == (0, "No release is published.\n")
     code, io = await run_cli("release", "publish", str(bundle), "--config", config)
@@ -95,7 +117,12 @@ async def test_remote_update_shows_then_installs_with_yes(tmp_path: Path) -> Non
     ssh_key = tmp_path / "ssh-key"
     ssh_key.write_text("k")
     ssh_key.chmod(0o600)
-    config = write_config(tmp_path, world, [machine("dev", world=world, identity=str(ssh_key))])
+    config = write_config(
+        tmp_path,
+        world,
+        [machine("dev", world=world, identity=str(ssh_key))],
+        releaseSignersFile=str(hub_signers(tmp_path, key)),
+    )
     source = _source(tmp_path, "0.13.1")
     files = r.source_files(str(source))
     built = r.write_build(str(tmp_path), files, r.build_manifest(files, created=r.utc_now()))
@@ -123,3 +150,93 @@ async def test_remote_update_shows_then_installs_with_yes(tmp_path: Path) -> Non
 
 def _quiet_sign(argv: Sequence[str]) -> int:
     return subprocess.run(list(argv), capture_output=True, check=False, stdin=subprocess.DEVNULL).returncode
+
+
+class Hub:
+    """A hub config with its own pinned signers file, and bundles to publish."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.key = new_key(root, "release")
+        self.signers = hub_signers(root, self.key)
+        world = RemoteWorld.create(root)
+        self.config = write_config(root, world, [machine("dev", world=world)], releaseSignersFile=str(self.signers))
+
+    def write(self, name: str, data: bytes) -> str:
+        path = self.root / name
+        path.write_bytes(data)
+        return str(path)
+
+    def releases(self) -> list[str]:
+        directory = self.root / "state" / "releases"
+        return sorted(p.name for p in directory.iterdir()) if directory.exists() else []
+
+    def events(self) -> str:
+        path = self.root / "state" / "incidents.jsonl"
+        return path.read_text() if path.exists() else ""
+
+
+@pytest.fixture
+def hub(tmp_path: Path) -> Hub:
+    return Hub(tmp_path)
+
+
+async def test_publish_verifies_on_the_hub(hub: Hub) -> None:
+    good = hub.write("good.bundle", make_bundle(hub.key, hub.root / "work"))
+    code, io = await run_cli("release", "publish", good, "--config", hub.config)
+    assert code == 0, io.stderr
+    assert io.stdout.rstrip().endswith(", verified on the hub")
+    assert fingerprint(hub.key) in io.stdout
+    assert hub.releases() == ["switchboard-remote-0.13.1.bundle"]
+
+
+def _cases(hub: Hub) -> dict[str, tuple[bytes, str]]:
+    work = hub.root / "work"
+    files = programs("0.13.1")
+    manifest = r.build_manifest(files, created=r.utc_now())
+    signature = sign(manifest, hub.key, work)
+    forged = manifest.replace(b'"minVersion": "0.13.0"', b'"minVersion": "0.13.1"')
+    tampered = dict(files)
+    tampered["switchboard-hook"] = files["switchboard-hook"] + b"\n# extra\n"
+    return {
+        "tampered manifest": (r.bundle_bytes(forged, signature, files), "not valid for these signers"),
+        "tampered file": (r.bundle_bytes(manifest, signature, tampered), "does not match its size or SHA-256"),
+        "wrong key": (make_bundle(new_key(hub.root, "intruder"), work), "not valid for these signers"),
+        "wrong namespace": (make_bundle(hub.key, work, namespace="git"), "namespace is not switchboard-release"),
+    }
+
+
+async def test_publish_refuses_what_does_not_verify(hub: Hub) -> None:
+    for name, (data, why) in _cases(hub).items():
+        code, io = await run_cli("release", "publish", hub.write(f"{name}.bundle", data), "--config", hub.config)
+        assert code == 1, name
+        assert why in io.stderr, (name, io.stderr)
+    assert hub.releases() == []
+    assert hub.events().count('"code":"release_refused"') == 4
+
+
+async def test_publish_needs_a_trusted_signers_file(hub: Hub, monkeypatch: pytest.MonkeyPatch) -> None:
+    good = hub.write("good.bundle", make_bundle(hub.key, hub.root / "work"))
+    _chmod(hub.signers, 0o664)
+    code, io = await run_cli("release", "publish", good, "--config", hub.config)
+    assert (code, "owned by root and not writable by group or others" in io.stderr) == (1, True)
+    _chmod(hub.signers, 0o644)
+    _chmod(hub.signers.parent, 0o775)
+    assert (await run_cli("release", "publish", good, "--config", hub.config))[0] == 1
+    _chmod(hub.signers.parent, 0o755)
+    monkeypatch.setattr(r, "SIGNERS_OWNERS", (0,))
+    code, io = await run_cli("release", "publish", good, "--config", hub.config)
+    assert (code, "owned by root" in io.stderr) == (1, True)
+    trust_own_uid(monkeypatch)
+    _unlink(hub.signers)
+    code, io = await run_cli("release", "publish", good, "--config", hub.config)
+    assert (code, "does not exist" in io.stderr) == (1, True)
+    assert hub.releases() == []
+
+
+def _chmod(path: Path, mode: int) -> None:
+    path.chmod(mode)
+
+
+def _unlink(path: Path) -> None:
+    path.unlink()

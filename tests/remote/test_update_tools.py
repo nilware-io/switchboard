@@ -17,7 +17,16 @@ import pytest
 
 from tests.helpers import FakeClock, LogCapture, claude_config
 from tests.remote.helpers import RemoteWorld, machine
-from tests.remote.release_helpers import bundle, fingerprint, install_machine, needs_openssh, new_key, programs
+from tests.remote.release_helpers import (
+    bundle,
+    fingerprint,
+    hub_signers,
+    install_machine,
+    needs_openssh,
+    new_key,
+    programs,
+    trust_own_uid,
+)
 from tests.remote.test_send_tools import OWNER, T0
 from voice_coding_mcp.config import Config, parse_config
 from voice_coding_mcp.log import silent_logger
@@ -88,7 +97,7 @@ class Ctx:
         data = bundle(self.key, self.root / "work", version=version)
         path = self.root / f"out-{version}.bundle"
         path.write_bytes(data)
-        return r.publish(str(path), self.config.state_dir)
+        return r.publish(str(path), self.config.state_dir, self.config.remote.release_signers_file)
 
     def events(self) -> list[dict[str, Any]]:
         path = Path(self.config.state_dir) / "incidents.jsonl"
@@ -103,6 +112,7 @@ async def build(root: Path, stubs: dict[str, Any] | None = None) -> Ctx:
     home = Path(world.home)
     dispatcher = install_machine(home, key)
     world.configure(dispatcherPath=str(dispatcher))
+    signers = hub_signers(root, key)
     projects = root / "projects"
     projects.mkdir(exist_ok=True)
     claude = claude_config(str(root / "record.jsonl"))
@@ -121,6 +131,7 @@ async def build(root: Path, stubs: dict[str, Any] | None = None) -> Ctx:
                 ],
                 "ssh": {"bin": world.ssh, "commandTimeoutSeconds": 20},
                 "summary": {"enabled": False},
+                "releaseSignersFile": str(signers),
             },
         },
         home_dir="/nonexistent-home-dir",
@@ -156,6 +167,11 @@ async def build(root: Path, stubs: dict[str, Any] | None = None) -> Ctx:
     return Ctx(root, world, tools, config, clock, key, manager, home)
 
 
+@pytest.fixture(autouse=True)
+def _trusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    trust_own_uid(monkeypatch)
+
+
 @pytest.fixture
 async def ctx(tmp_path: Path) -> AsyncIterator[Ctx]:
     built = await build(tmp_path)
@@ -188,7 +204,7 @@ async def test_update_over_ssh_reads_back_confirms_installs_and_records(ctx: Ctx
     assert not error
     assert text == (
         f"Ready to update switchboard-remote on dev from {d.VERSION} to 0.13.1, signed by the release key "
-        f"{fingerprint(ctx.key)}. Careful, this replaces the programs that run on dev. dev checks the signature "
+        f"{fingerprint(ctx.key)}, verified on the hub. Careful, this replaces the programs that run on dev. dev checks the signature "
         "with its own pinned key before it installs anything. Say yes, update it. "
         "(confirmation 4172, do not read this number aloud)"
     )
@@ -294,3 +310,46 @@ async def test_an_unknown_outcome_is_recorded_as_such(stubbed: Ctx) -> None:
     assert text.startswith("I do not know whether dev installed the update")
     assert [e["code"] for e in stubbed.events() if e["component"] == "update"] == ["update_unknown"]
     assert read_audit(stubbed.config.state_dir)[0][-1]["outcome"] == "unknown"
+
+
+def remove(path: str) -> None:
+    os.unlink(path)
+
+
+def swap(path: str, data: bytes) -> None:
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
+async def test_a_bundle_swapped_on_disk_after_publish_is_not_offered(stubbed: Ctx) -> None:
+    release = stubbed.publish()
+    intruder = new_key(stubbed.root, "intruder")
+    # The same version, valid form and hashes, but signed by another key: only the signature differs.
+    swap(release.path, bundle(intruder, stubbed.root / "work", version="0.13.1"))
+    text, error = await stubbed.prepare()
+    assert error
+    assert text.startswith("The published release 0.13.1 does not verify on the hub (bad_signature)")
+    assert stub(stubbed).received == []
+    events = [e for e in stubbed.events() if e["code"] == "release_refused"]
+    assert [(e["machine"], e["component"]) for e in events] == [("hub", "update")]
+
+
+async def test_a_bundle_swapped_after_the_read_back_is_not_sent(stubbed: Ctx) -> None:
+    release = stubbed.publish()
+    text, _ = await stubbed.prepare()
+    assert "verified on the hub" in text
+    # Validly signed too, but other bytes than the ones verified and read back.
+    swap(release.path, bundle(stubbed.key, stubbed.root / "work", version="0.13.1", min_version="0.1.0"))
+    stubbed.later()
+    text, error = await stubbed.confirm("4172")
+    assert error
+    assert text == "Not updated: the published release changed since I read it to you. Ask me again."
+    assert stub(stubbed).received == []
+
+
+async def test_without_a_pinned_key_on_the_hub_nothing_is_offered(stubbed: Ctx) -> None:
+    stubbed.publish()
+    remove(stubbed.config.remote.release_signers_file)
+    text, error = await stubbed.prepare()
+    assert error
+    assert "does not verify on the hub (no_signers)" in text

@@ -495,14 +495,14 @@ def format_clear_readback(
 
 
 def format_update_readback(item: Confirmation, *, dropped: Sequence[Confirmation]) -> str:
-    """What `remote_update` returns: the machine, the two versions, the key that signed the
-    release, that this changes code there, the yes phrase, then the confirmation id for the model."""
+    """What `remote_update` returns: the machine, the two versions, the key whose signature the hub
+    verified, that this changes code there, the yes phrase, then the confirmation id for the model."""
     offer = item.offer
     assert offer is not None
     parts: list[str] = [dropped_words(dropped)] if dropped else []
     parts.append(
         f"Ready to update switchboard-remote on {item.machine} from {offer.from_version} to "
-        f"{offer.to_version}, signed by the release key {offer.fingerprint}."
+        f"{offer.to_version}, signed by the release key {offer.fingerprint}, verified on the hub."
     )
     parts.append(
         f"Careful, this replaces the programs that run on {item.machine}. {item.machine} checks the "

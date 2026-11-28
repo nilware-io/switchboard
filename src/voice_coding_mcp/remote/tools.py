@@ -91,6 +91,7 @@ from .incidents import (
     open_clause,
     owner_incident,
     relay_problem,
+    release_refused,
     update_event,
     zone_of,
 )
@@ -119,7 +120,7 @@ from .protocol import (
     VersionResponse,
 )
 from .redact import clean_name, clean_screen
-from .release import Release, ReleaseError, latest, load_bundle, newer
+from .release import Release, ReleaseError, latest, load_bundle, newer, verify_published
 from .send import (
     CLEAR,
     KEYS,
@@ -1504,6 +1505,18 @@ class RemoteTools:
         self._release_cache = (stamp, found)
         return found
 
+    def _verify_release(self, release: Release, where: str) -> Release | ReleaseError:
+        """The stored bundle verified again against the hub's pinned signers file (a bundle swapped
+        on disk after publish fails); a failure is an event of the hub in the incident log."""
+        try:
+            return verify_published(release, self._remote.release_signers_file)
+        except ReleaseError as error:
+            try:
+                self.incident_log.write(release_refused(error.code, where, self._now()))
+            except Exception as err:
+                self._logger.error("incident observation failed", {"error": type(err).__name__})
+            return error
+
     def known_version(self, name: str) -> str | None:
         """The machine's dispatcher version as last seen: an agent machine's hello, else the last
         `version` answer."""
@@ -1576,6 +1589,14 @@ class RemoteTools:
                 f"{release.version}.",
                 "up_to_date",
             )
+        verified = self._verify_release(release, "remote_update")
+        if isinstance(verified, ReleaseError):
+            return refuse(
+                f"The published release {release.version} does not verify on the hub ({verified.code}), so I will "
+                "not offer it. Publish a bundle signed with your release key again.",
+                "not_verified",
+            )
+        release = verified
         offer = UpdateOffer(
             from_version=data.version,
             to_version=release.version,
@@ -1687,6 +1708,9 @@ class RemoteTools:
         command line showed (`sha256`) and the machine is older."""
         release = self._latest_release()
         if release is None or release.sha256 != sha256:
+            return {"ok": False, "outcome": "not_sent:changed"}
+        verified = self._verify_release(release, "remote-update")
+        if isinstance(verified, ReleaseError) or verified.sha256 != sha256:
             return {"ok": False, "outcome": "not_sent:changed"}
         version = self.known_version(name)
         if version is None or not newer(release, version):

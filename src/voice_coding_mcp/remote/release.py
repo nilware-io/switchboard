@@ -4,9 +4,10 @@ A release bundle carries `switchboard-remote`, `switchboard-connect` and `switch
 manifest (version, minimum installed version, creation time, and per file its size and SHA-256)
 signed by the owner's OpenSSH release key (`ssh-keygen -Y sign`, namespace `switchboard-release`).
 The owner builds and signs it on their own computer (`release build`, `release sign`), then
-publishes it into the hub's state directory (`release publish`); the hub only stores it and hands
-it to a machine's dispatcher (`update`), which checks everything again against its own pinned
-signers file. The hub never signs and never runs anything of a bundle.
+publishes it into the hub's state directory (`release publish`). The hub verifies the signature
+against its own pinned signers file when it stores a bundle and again before each read-back, and
+hands it to a machine's dispatcher (`update`), which checks everything again against its own pinned
+signers file (the real gate). The hub never signs and never runs anything of a bundle.
 
 The bundle format and every check are the dispatcher's own (`dispatcher.read_bundle`,
 `parse_manifest`, `parse_signature`, `verify_signature`), so hub, CLI and machines read a bundle the
@@ -61,8 +62,10 @@ class ReleaseError(Exception):
 
 @dataclass(frozen=True)
 class Release:
-    """A bundle as read on the hub. Its signature is not verified here (the hub cannot make the
-    machines trust anything); `fingerprint` is the key that signed it, for the read-back."""
+    """A bundle as read on the hub. `read_release` checks its form and hashes only; `publish` and
+    `verify_published` also verify its signature against the hub's pinned signers file (a second,
+    independent check: the machines verify again with their own). `fingerprint` is the signing
+    key's, for the read-back."""
 
     path: str
     version: str
@@ -150,6 +153,8 @@ REFUSALS: dict[str, str] = {
     "bad_bundle": "this is not a release bundle (or it is cut or altered)",
     "unknown_target": "the bundle names a file that is none of switchboard-remote, switchboard-connect, switchboard-hook",
     "bad_signature": "the signature is not valid for these signers",
+    "no_signers": "no release key is pinned",
+    "signers_unsafe": "the signers file is not trusted",
     "wrong_namespace": "the signature was made for another purpose (namespace is not switchboard-release)",
     "no_openssh": "ssh-keygen was not found",
     "old_openssh": "ssh-keygen is older than OpenSSH 8.1 (no -Y verify)",
@@ -217,14 +222,56 @@ def verify_release(path: str, signers: str, *, keygen: str = d.SSH_KEYGEN) -> Re
     """`read_release` plus the machines' own signature check (`ssh-keygen -Y verify` against the
     allowed-signers file `signers`, principal and namespace `switchboard-release`)."""
     data = _read_file(path, d.MAX_UPDATE_INPUT_BYTES)
+    return verify_bundle(path, data, _read_file(signers, d.MAX_SIGNERS_BYTES), keygen=keygen)
+
+
+SIGNERS_OWNERS: tuple[int, ...] = (0,)
+"""Who may own the hub's signers file and its directory: root only, never the hub user (a
+compromised hub could otherwise pin its own key). Tests widen it to their own uid."""
+
+
+def hub_signers(path: str) -> bytes:
+    """The hub's pinned signers file (`remote.releaseSignersFile`): a regular file (no symlink) in a
+    directory, both owned by root and not writable by group or others, at most 64 KB, with a key
+    line. Raises ReleaseError (`no_signers`, `signers_unsafe`)."""
+    for target, want_dir in ((os.path.dirname(path), True), (path, False)):
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            raise ReleaseError("no_signers", f"{target} does not exist: pin the release key there first") from None
+        except OSError as err:
+            raise ReleaseError("signers_unsafe", f"{target}: {err.strerror or err}") from None
+        kind_ok = stat.S_ISDIR(info.st_mode) if want_dir else stat.S_ISREG(info.st_mode)
+        if not kind_ok or info.st_uid not in SIGNERS_OWNERS or info.st_mode & 0o022:
+            raise ReleaseError(
+                "signers_unsafe",
+                f"{target} must be a {'directory' if want_dir else 'regular file'} owned by root and not "
+                "writable by group or others",
+            )
+    data = _read_file(path, d.MAX_SIGNERS_BYTES)
+    if not any(line.strip() and not line.lstrip().startswith(b"#") for line in data.split(b"\n")):
+        raise ReleaseError("no_signers", f"{path} has no key line")
+    return data
+
+
+def verify_bundle(path: str, data: bytes, signers: bytes, *, keygen: str = d.SSH_KEYGEN) -> Release:
+    """`_release_of` (form, namespace, manifest, every file's size and SHA-256) plus the signature,
+    checked with the dispatcher's own `ssh-keygen -Y verify` against `signers`."""
     release = _release_of(path, data)
-    signers_bytes = _read_file(signers, d.MAX_SIGNERS_BYTES)
     manifest_raw, signature, _ = _check(lambda: d.read_bundle(data))
     problem = d.openssh_problem(keygen)
     if problem is not None:
         raise ReleaseError(problem, REFUSALS[problem])
-    _check(lambda: d.verify_signature(keygen, signers_bytes, manifest_raw, signature))
+    _check(lambda: d.verify_signature(keygen, signers, manifest_raw, signature))
     return release
+
+
+def verify_published(release: Release, signers_file: str, *, keygen: str = d.SSH_KEYGEN) -> Release:
+    """A stored release verified again on the hub (a bundle swapped on disk after publish fails),
+    with its SHA-256 as it is now: a confirmation is bound to exactly the verified bytes."""
+    signers = hub_signers(signers_file)
+    data = _read_file(release.path, d.MAX_UPDATE_INPUT_BYTES)
+    return verify_bundle(release.path, data, signers, keygen=keygen)
 
 
 def write_build(out_dir: str, files: Mapping[str, bytes], manifest: bytes) -> str:
@@ -306,11 +353,14 @@ def releases_dir(state_dir: str) -> str:
     return os.path.join(state_dir, RELEASES_DIR)
 
 
-def publish(path: str, state_dir: str) -> Release:
+def publish(path: str, state_dir: str, signers_file: str, *, keygen: str = d.SSH_KEYGEN) -> Release:
     """Copies a signed bundle into `stateDir/releases/switchboard-remote-<version>.bundle` (0600)
-    after `read_release`. A version already published with other bytes is refused."""
+    after verifying it as a machine would (`verify_bundle`) against the hub's own pinned signers
+    file; nothing unverified is ever stored. A version already published with other bytes is
+    refused."""
+    signers = hub_signers(signers_file)
     data = _read_file(path, d.MAX_UPDATE_INPUT_BYTES)
-    release = _release_of(path, data)
+    release = verify_bundle(path, data, signers, keygen=keygen)
     directory = releases_dir(state_dir)
     os.makedirs(directory, mode=0o700, exist_ok=True)
     target = os.path.join(directory, f"{d.UPDATE_PRODUCT}-{release.version}{BUNDLE_SUFFIX}")

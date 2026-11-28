@@ -21,7 +21,7 @@ from . import dispatcher as d
 from .agents import CONTROL_SOCKET_NAME, control_request
 from .audit import AuditLog
 from .config import command_timeout_seconds
-from .incidents import IncidentLog, zone_of
+from .incidents import IncidentLog, release_refused, zone_of
 from .inventory import Inventory
 from .protocol import VersionResponse
 from .release import (
@@ -37,6 +37,7 @@ from .release import (
     sign_build,
     source_files,
     utc_now,
+    verify_published,
     verify_release,
     write_build,
 )
@@ -158,8 +159,12 @@ def run_hub(config: Config, args: ReleaseArgs, out: Out, err: Out) -> int:
     try:
         if args.action == "publish":
             assert args.path is not None
-            release = publish(args.path, config.state_dir)
-            out(f"Published {describe(release)}\n")
+            try:
+                release = publish(args.path, config.state_dir, config.remote.release_signers_file)
+            except ReleaseError as error:
+                _publish_refused(config, error)
+                raise
+            out(f"Published {describe(release)}, verified on the hub\n")
             return 0
         releases, problems = published(config.state_dir)
         for release in releases:
@@ -172,6 +177,17 @@ def run_hub(config: Config, args: ReleaseArgs, out: Out, err: Out) -> int:
     except ReleaseError as error:
         err(f"Error: {error}\n")
         return 1
+
+
+def _publish_refused(config: Config, error: ReleaseError) -> None:
+    """A refused publish is an event of the hub in the incident log (its fixed code only)."""
+    log = IncidentLog(
+        config.state_dir,
+        max_bytes=config.incidents.max_kilobytes * 1024,
+        keep_files=config.incidents.keep_files,
+        tz=zone_of(config.incidents),
+    )
+    log.write(release_refused(error.code, "release publish", now_ms()))
 
 
 async def run_remote_update(config: Config, args: ReleaseArgs, env: Mapping[str, str], out: Out, err: Out) -> int:
@@ -188,6 +204,12 @@ async def run_remote_update(config: Config, args: ReleaseArgs, env: Mapping[str,
     release = latest(config.state_dir)
     if release is None:
         err("No release is published (voice-coding-mcp release publish <bundle>).\n")
+        return 1
+    try:
+        release = verify_published(release, config.remote.release_signers_file)
+    except ReleaseError as error:
+        _publish_refused(config, error)
+        err(f"The published release does not verify on the hub: {error}\n")
         return 1
     control = f"{config.state_dir}/{CONTROL_SOCKET_NAME}"
     if machine.transport == "agent":

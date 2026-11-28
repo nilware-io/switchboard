@@ -122,3 +122,19 @@ def allowed() -> d.Policy:
     policy.sessions = ["fpga"]
     policy.allow_self_update = True
     return policy
+
+
+def hub_signers(root: Path, *keys: Path, namespaces: str = "switchboard-release") -> Path:
+    """The hub's pinned signers file under `root/etc` (0755 directory, 0644 file). Root ownership
+    is required in production; tests add their own uid with `trust_own_uid`."""
+    etc = root / "etc-vcm"
+    etc.mkdir(mode=0o755, exist_ok=True)
+    etc.chmod(0o755)
+    path = etc / "release_signers"
+    path.write_text("".join(signers_line(key, namespaces) for key in keys), encoding="ascii")
+    path.chmod(0o644)
+    return path
+
+
+def trust_own_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(r, "SIGNERS_OWNERS", (0, os.getuid()))

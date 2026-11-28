@@ -20,7 +20,15 @@ from tests.helpers import FakeClock, LogCapture, claude_config
 from tests.remote.agent_helpers import MachineLink, agent_machine, agents_section, socket_dir, wait_until
 from tests.remote.helpers import SESSION_A, SESSION_B, RemoteWorld, pane
 from tests.remote.menu_fixtures import capture, menu_lines
-from tests.remote.release_helpers import OPENSSH, bundle, install_machine, new_key, programs
+from tests.remote.release_helpers import (
+    OPENSSH,
+    bundle,
+    hub_signers,
+    install_machine,
+    new_key,
+    programs,
+    trust_own_uid,
+)
 from tests.test_cli import run_cli
 from tests.usage.helpers import S1, assistant, user, write_transcript
 from voice_coding_mcp.config import Config, parse_config
@@ -108,6 +116,7 @@ async def ctx(tmp_path: Path) -> AsyncIterator[Ctx]:
                 "machines": [agent_machine("laptop", allowSend=True)],
                 "agents": agents_section(directory),
                 "summary": {"enabled": False},
+                "releaseSignersFile": str(tmp_path / "etc-vcm" / "release_signers"),
             },
             "watch": {"intervalSeconds": 60, "notifyUnreachable": True},
             "notify": {"url": "https://ntfy.example.com/topic"},
@@ -334,10 +343,14 @@ async def test_status_and_remote_check_without_a_running_hub(ctx: Ctx) -> None:
     assert "  not checked: the hub is not running (only the hub holds agent connections)" in io.stdout
 
 
-async def test_self_update_over_the_agent_transport_and_through_the_control_socket(ctx: Ctx, tmp_path: Path) -> None:
+async def test_self_update_over_the_agent_transport_and_through_the_control_socket(
+    ctx: Ctx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if OPENSSH is None or OPENSSH < d.MIN_OPENSSH:
         pytest.skip(f"needs OpenSSH 8.1 or newer at {d.SSH_KEYGEN}")
     key = new_key(tmp_path, "release")
+    trust_own_uid(monkeypatch)
+    signers = str(hub_signers(tmp_path, key))
     installed = install_machine(Path(ctx.world.home), key)
     policy = [*POLICY, "--allow-self-update"]
     link = MachineLink(ctx.world, ctx.socket, "laptop", policy, dispatcher=str(installed))
@@ -348,7 +361,7 @@ async def test_self_update_over_the_agent_transport_and_through_the_control_sock
         path = tmp_path / f"{version}.bundle"
         path.write_bytes(bundle(key, tmp_path / "work", version=version))
         if version == "0.13.1":
-            r.publish(str(path), ctx.config.state_dir)
+            r.publish(str(path), ctx.config.state_dir, signers)
     readback = await ctx.tools.remote_update("laptop", OWNER)
     assert readback.text.startswith(f"Ready to update switchboard-remote on laptop from {d.VERSION} to 0.13.1"), (
         readback
@@ -370,7 +383,7 @@ async def test_self_update_over_the_agent_transport_and_through_the_control_sock
     assert live is not None
     assert live.hello.version == "0.13.1"
     # The command line: through the running hub's control socket.
-    r.publish(str(tmp_path / "0.13.2.bundle"), ctx.config.state_dir)
+    r.publish(str(tmp_path / "0.13.2.bundle"), ctx.config.state_dir, signers)
     code, io = await run_cli("remote-update", "laptop", "--config", ctx.config_path)
     assert code == 0, io.stderr
     assert io.stdout.startswith("laptop: switchboard-remote 0.13.1 -> switchboard-remote 0.13.2")
